@@ -46,7 +46,7 @@ def sha256_file(path):
 def read_version(path):
     contents = path.read_bytes()
     if path.name == "Cargo.toml":
-        matches = re.findall(rb'(?m)^version = "([^"]+)"$', contents)
+        matches = re.findall(rb'(?m)^version = "([^"]+)"\r?$', contents)
         if len(matches) != 1:
             fail("Cargo.toml must contain exactly one package version")
         candidate = matches[0]

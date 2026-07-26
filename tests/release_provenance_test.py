@@ -70,6 +70,23 @@ def main() -> None:
         require(document["version"] == "0.1.0", "Cargo version was not canonical")
         require(document["source_commit"] == COMMIT, "commit mismatch")
 
+        crlf_directory = root / "crlf"
+        crlf_directory.mkdir()
+        crlf_version = crlf_directory / "Cargo.toml"
+        version_bytes = (source_path / "Cargo.toml").read_bytes().replace(b"\r\n", b"\n")
+        crlf_version.write_bytes(version_bytes.replace(b"\n", b"\r\n"))
+        crlf_fragment = fragments / "crlf.json"
+        crlf_command = base.copy()
+        crlf_command[crlf_command.index(str(source_path / "Cargo.toml"))] = str(
+            crlf_version
+        )
+        crlf_command[crlf_command.index(str(fragment))] = str(crlf_fragment)
+        invoke(crlf_command)
+        require(
+            json.loads(crlf_fragment.read_text())["version"] == "0.1.0",
+            "CRLF Cargo version was not canonical",
+        )
+
         bad_commit = base.copy()
         bad_commit[bad_commit.index(COMMIT)] = "not-a-commit"
         invoke(bad_commit, success=False)

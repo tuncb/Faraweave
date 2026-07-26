@@ -33,3 +33,26 @@ records; help and REPL use their deliberately generic stdout error. Windows PE
 metadata/long-path tests,
 Linux ELF compatibility inspection, and macOS arm64 execution run only on
 their target hosts and must never be reported as passing elsewhere.
+
+## 2026-07-26 CI repair validation
+
+The Unix permission-literal and Windows CRLF provenance repairs use these
+focused commands:
+
+```sh
+cargo test --test cli_contracts
+python tests/release_provenance_test.py python tools/release/provenance.py . target/release/faraweave.exe windows-x64
+```
+
+The review and full tiers use every canonical command listed above. Final
+Windows `tier.qa` uses a clean local clone of `HEAD` with the working diff
+applied, every canonical command listed above, and:
+
+```sh
+python tools/validation/contracts.py package windows-x64
+```
+
+The Windows host cannot execute the `#[cfg(unix)]` unreadable-file journey,
+Linux `/dev/full` and sanitizer journeys, Linux ELF inspection, or macOS arm64
+execution. The exact Unix clippy diagnostic is covered structurally by the
+octal permission literal and must be re-executed by Linux and macOS CI.

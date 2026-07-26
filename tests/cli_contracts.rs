@@ -357,7 +357,7 @@ fn cli_unix_unreadable_source_contract() {
     fs::create_dir_all(&directory).expect("mkdir");
     let source = directory.join("unreadable.faraweave");
     fs::write(&source, "1\n").expect("source");
-    fs::set_permissions(&source, fs::Permissions::from_mode(0)).expect("permissions");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o0)).expect("permissions");
     let result = Command::new(binary())
         .arg("run")
         .arg(&source)
