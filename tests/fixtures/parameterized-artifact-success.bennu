@@ -1,0 +1,7 @@
+parameters[count Int ratio Double enabled Bool]
+count
+ratio
+enabled
+iota[count]
+add[ratio count]
+not[enabled]

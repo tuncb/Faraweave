@@ -1,0 +1,375 @@
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_faraweave"))
+}
+
+fn unique(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!("faraweave-{name}-{nonce}"))
+}
+
+#[test]
+fn cli_help_version_and_unknown_contracts() {
+    let absent = Command::new(binary()).output().expect("no arguments");
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert_eq!(absent.stderr, b"error: expected a subcommand or --help\n");
+
+    let version = Command::new(binary())
+        .arg("--version")
+        .output()
+        .expect("version");
+    assert!(version.status.success());
+    assert_eq!(version.stdout, b"faraweave 0.1.0\n");
+    assert!(version.stderr.is_empty());
+
+    let help = Command::new(binary()).arg("--help").output().expect("help");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("utf8");
+    assert!(help.contains("Usage: faraweave"));
+    assert!(help.contains("interactive Faraweave session"));
+
+    let unknown = Command::new(binary())
+        .arg("unknown")
+        .output()
+        .expect("unknown");
+    assert!(!unknown.status.success());
+    assert!(unknown.stdout.is_empty());
+    assert_eq!(unknown.stderr, b"error: unknown subcommand 'unknown'\n");
+
+    let option = Command::new(binary())
+        .arg("--unknown")
+        .output()
+        .expect("unknown option");
+    assert!(!option.status.success());
+    assert_eq!(option.stderr, b"error: unknown option '--unknown'\n");
+}
+
+#[test]
+fn cli_repl_transcript_recovers_resets_and_rejects_program_headers() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut input = child.stdin.take().expect("REPL stdin");
+    input
+        .write_all(b"\ninc 5\nadd[1]\ninc 6\nparameters[x Int]\n")
+        .expect("REPL transcript");
+    drop(input);
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > 6\n> > 7\n> > ");
+    let stderr = String::from_utf8(result.stderr).expect("REPL stderr UTF-8");
+    assert!(stderr.contains("<repl>:1:1: ArityError:"));
+    assert!(stderr.contains("invalid parameter header"));
+}
+
+#[test]
+fn cli_run_is_extension_agnostic_and_transactional() {
+    let directory = unique("run");
+    fs::create_dir_all(&directory).expect("mkdir");
+    for extension in ["faraweave", "bennu", "anything"] {
+        let source = directory.join(format!("program.{extension}"));
+        fs::write(&source, "1\ninc[2]\n").expect("source");
+        let output = Command::new(binary())
+            .arg("run")
+            .arg(&source)
+            .output()
+            .expect("run");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"1\n3\n");
+    }
+    let failure = directory.join("failure.faraweave");
+    fs::write(&failure, "1\ninc[9223372036854775807]\n").expect("failure");
+    let output = Command::new(binary())
+        .arg("run")
+        .arg(&failure)
+        .output()
+        .expect("run failure");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn cli_parameters_and_diagnostics_contract() {
+    let directory = unique("parameters");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("args.faraweave");
+    fs::write(
+        &source,
+        "parameters[n Int scale Double enabled Bool]\nn\nscale\nenabled\n",
+    )
+    .expect("source");
+    let success = Command::new(binary())
+        .args(["run"])
+        .arg(&source)
+        .args(["--", "-5", "2.5", "true"])
+        .output()
+        .expect("run");
+    assert!(success.status.success());
+    assert_eq!(success.stdout, b"-5\n2.5\ntrue\n");
+    let missing = Command::new(binary())
+        .args(["run"])
+        .arg(&source)
+        .args(["--", "-5"])
+        .output()
+        .expect("missing");
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(
+        missing
+            .stderr
+            .starts_with(b"faraweave_argument_error reason=missing")
+    );
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn cli_emit_c_is_deterministic_and_alias_safe() {
+    let directory = unique("emit");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("input.faraweave");
+    let left = directory.join("left.c");
+    let right = directory.join("right.c");
+    fs::write(&source, "add[1 iota[3]]\n").expect("source");
+    for output in [&left, &right] {
+        let result = Command::new(binary())
+            .arg("emit-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(output)
+            .output()
+            .expect("emit");
+        assert!(result.status.success(), "{:?}", result.stderr);
+    }
+    assert_eq!(
+        fs::read(&left).expect("left"),
+        fs::read(&right).expect("right")
+    );
+    let original = fs::read(&source).expect("original");
+    let alias = Command::new(binary())
+        .arg("emit-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&source)
+        .output()
+        .expect("alias");
+    assert!(!alias.status.success());
+    assert_eq!(fs::read(&source).expect("preserved"), original);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn cli_deep_tuple_journeys_do_not_depend_on_host_recursion() {
+    let directory = unique("deep-tuple");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source_path = directory.join("deep.faraweave");
+    let emitted_path = directory.join("deep.c");
+    let depth = 512;
+    let source = format!("{}1{}\n", "[".repeat(depth), "]".repeat(depth));
+    fs::write(&source_path, &source).expect("deep source");
+
+    let evaluated = Command::new(binary())
+        .arg("run")
+        .arg(&source_path)
+        .output()
+        .expect("deep evaluator process");
+    assert!(evaluated.status.success(), "{:?}", evaluated.stderr);
+    assert_eq!(evaluated.stdout, source.as_bytes());
+    assert!(evaluated.stderr.is_empty());
+
+    let emitted = Command::new(binary())
+        .arg("emit-c")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&emitted_path)
+        .output()
+        .expect("deep emitter process");
+    assert!(emitted.status.success(), "{:?}", emitted.stderr);
+    assert!(emitted.stdout.is_empty());
+    assert!(emitted.stderr.is_empty());
+    let c_source = fs::read_to_string(&emitted_path).expect("emitted C");
+    assert!(c_source.contains(&"[".repeat(depth)));
+    assert!(c_source.contains(&"]".repeat(depth)));
+
+    fs::write(
+        &source_path,
+        format!("{}1{}", "[".repeat(depth), "]".repeat(depth - 1)),
+    )
+    .expect("invalid deep source");
+    let invalid = Command::new(binary())
+        .arg("run")
+        .arg(&source_path)
+        .output()
+        .expect("deep invalid process");
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert!(
+        invalid
+            .stderr
+            .ends_with(b"SyntaxError: missing closing delimiter\n")
+    );
+
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn cli_unicode_space_paths_lexical_aliases_and_failure_cleanup() {
+    let directory = unique("unicode-space").join("nested path ü");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("program source.faraweave");
+    let emitted = directory.join("generated output.c");
+    fs::write(&source, "add[1 2]\n").expect("source");
+
+    let run = Command::new(binary())
+        .arg("run")
+        .arg(&source)
+        .output()
+        .expect("unicode run");
+    assert!(run.status.success(), "{:?}", run.stderr);
+    assert_eq!(run.stdout, b"3\n");
+
+    let emit = Command::new(binary())
+        .arg("emit-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&emitted)
+        .output()
+        .expect("unicode emit");
+    assert!(emit.status.success(), "{:?}", emit.stderr);
+    assert!(emitted.exists());
+
+    let lexical_alias = directory
+        .join("child")
+        .join("..")
+        .join("program source.faraweave");
+    let original = fs::read(&source).expect("original source");
+    let alias = Command::new(binary())
+        .arg("emit-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&lexical_alias)
+        .output()
+        .expect("lexical alias");
+    assert!(!alias.status.success());
+    assert_eq!(fs::read(&source).expect("preserved source"), original);
+
+    let native = directory.join(if cfg!(windows) {
+        "existing native.exe"
+    } else {
+        "existing native"
+    });
+    fs::write(&native, b"preserve-me").expect("native sentinel");
+    let failed = Command::new(binary())
+        .arg("build")
+        .arg(&source)
+        .arg("-o")
+        .arg(&native)
+        .arg("--cc")
+        .arg("faraweave-compiler-that-does-not-exist")
+        .env_remove("CC")
+        .output()
+        .expect("failed native build");
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    assert_eq!(fs::read(&native).expect("preserved native"), b"preserve-me");
+    let leftovers: Vec<_> = fs::read_dir(&directory)
+        .expect("directory listing")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".existing native")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files escaped: {leftovers:?}"
+    );
+
+    let missing = Command::new(binary())
+        .arg("run")
+        .arg(directory.join("missing.faraweave"))
+        .output()
+        .expect("missing source");
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(
+        missing
+            .stderr
+            .ends_with(b"file error: unable to read source\n")
+    );
+
+    let directory_output = Command::new(binary())
+        .arg("emit-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&directory)
+        .output()
+        .expect("directory output");
+    assert!(!directory_output.status.success());
+    assert!(directory_output.stdout.is_empty());
+    assert!(directory.is_dir());
+
+    fs::remove_dir_all(directory.parent().expect("test parent")).expect("cleanup");
+}
+
+#[cfg(windows)]
+#[test]
+fn cli_windows_long_path_journey() {
+    let base = unique("long-path");
+    let mut directory = base.clone();
+    while directory.as_os_str().len() < 300 {
+        directory.push("segment-0123456789abcdef");
+    }
+    fs::create_dir_all(&directory).expect("long directory");
+    let source = directory.join("program.faraweave");
+    fs::write(&source, "inc[41]\n").expect("long source");
+    let result = Command::new(binary())
+        .arg("run")
+        .arg(&source)
+        .output()
+        .expect("long-path process");
+    assert!(result.status.success(), "{:?}", result.stderr);
+    assert_eq!(result.stdout, b"42\n");
+    fs::remove_dir_all(base).expect("long-path cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_unix_unreadable_source_contract() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = unique("unreadable");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("unreadable.faraweave");
+    fs::write(&source, "1\n").expect("source");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0)).expect("permissions");
+    let result = Command::new(binary())
+        .arg("run")
+        .arg(&source)
+        .output()
+        .expect("unreadable process");
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(
+        result
+            .stderr
+            .ends_with(b"file error: unable to read source\n")
+    );
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("restore");
+    fs::remove_dir_all(directory).expect("cleanup");
+}

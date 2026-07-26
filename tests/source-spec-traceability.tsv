@@ -1,0 +1,155 @@
+# normative requirement|source containing the automated test identifier|test identifier
+BENNU-SPEC-0001 sections 4 and 14|src/value.cpp|canonical scalar and vector formatting is byte exact
+BENNU-SPEC-0001 sections 5 and 7|src/primitive.cpp|overload selection is Cartesian deterministic and exact-first
+BENNU-SPEC-0001 sections 8 through 11|tests/application_section16_conformance.cpp|S16-16 type validation precedes shape validation for every dyadic primitive
+BENNU-SPEC-0001 sections 12 and 13|src/resources.cpp|profile refusal precedence is vector then live then work
+BENNU-SPEC-0001 section 15|src/rewrite.cpp|rewrite evaluator matches the tracked Section 15 and 16 corpus
+BENNU-SPEC-0001 section 16|tests/application_section16_conformance.cpp|S16-00 matrix enumerates every Level 2 elementwise primitive
+BENNU-SPEC-0001 section 16 cross-backend|tests/c_emission_contract.cmake|PUBLIC-SUCCESS-CROSS-PATH-BYTES
+BENNU-SPEC-0001 section 17|tests/application_section16_conformance.cpp|S16-22 every primitive is pointwise-consistent across deterministic small shapes and boundaries
+BENNU-SPEC-0001 section 18|src/rewrite.cpp|rewrite parser builds postorder generic calls and contiguous arenas
+BENNU-SPEC-0002 sections 3 and 11|src/rewrite.cpp|rewrite tokenizer uses generic categories and one-based byte spans
+BENNU-SPEC-0002 sections 4 and 5|src/rewrite.cpp|rewrite parser applies logical-record and line-ending rules
+BENNU-SPEC-0002 sections 6 and 7|src/rewrite.cpp|rewrite parser builds postorder generic calls and contiguous arenas
+BENNU-SPEC-0002 section 8|src/rewrite.cpp|rewrite tokenizer enforces canonical and complete numeric literals
+BENNU-SPEC-0002 section 9|src/rewrite.cpp|rewrite parser retains typed homogeneous vector payloads and spans
+BENNU-SPEC-0002 sections 10 through 12|src/rewrite.cpp|rewrite parser rejects normative invalid syntax at exact spans
+BENNU-SPEC-0002 sections 13 and 14|tests/public_cutover_conformance.cpp|CUTOVER-02 public evaluator exposes exactly the rewrite primitives
+BENNU-SPEC-0003 sections 4 and 5|src/primitive.cpp|integer scalar kernels cover every boundary and structured overflow
+BENNU-SPEC-0003 sections 4 and 5 checked arithmetic evaluator structured overflow|src/primitive.cpp|checked Int arithmetic kernels cover boundaries without partial arithmetic
+BENNU-SPEC-0003 sections 6 through 9|src/primitive.cpp|Double inc and add kernels match every normative binary64 vector
+BENNU-SPEC-0003 sections 6 through 9 checked arithmetic evaluator exact binary64 bits|src/primitive.cpp|checked Double arithmetic preserves exact binary64 semantics and the host environment
+BENNU-SPEC-0003 section 10|src/primitive.cpp|scalar projection conversion covers every type pair and Int64 bits
+BENNU-SPEC-0003 section 11|src/primitive.cpp|equals and not kernels cover Bool Int and Double domains
+BENNU-SPEC-0003 sections 12 and 13|tests/public_cutover_conformance.cpp|CUTOVER-03 public APIs preserve structured located rewrite errors
+BENNU-SPEC-0003 sections 14 and 15|tests/c_emission_contract.cmake|PUBLIC-SUCCESS-CORPUS
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic formatted public surface|tests/c_emission_contract.cmake|CHECKED-ARITHMETIC-FORMATTED-CROSS-PATH-BYTES
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic emitted and native exact binary64 bits|tests/public_resource_contract.cmake|CHECKED-ARITHMETIC-GENERATED-NATIVE-EXACT-BITS
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic hostile environment trap containment and exact restoration|tests/public_resource_contract.cmake|CHECKED-ARITHMETIC-HOSTILE-FP-TRAP-RESTORATION
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic standard C ambient rounding emitted isolation|tests/c_emission_contract.cmake|CHECKED-ARITHMETIC-STANDARD-FENV-EMITTED
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic standard C ambient rounding native isolation|tests/public_resource_contract.cmake|CHECKED-ARITHMETIC-STANDARD-FENV-NATIVE
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic generated and native structured overflow|tests/public_resource_contract.cmake|CHECKED-ARITHMETIC-GENERATED-NATIVE-STRUCTURED-OVERFLOW
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic generated and native resource cleanup|tests/public_resource_contract.cmake|CHECKED-ARITHMETIC-GENERATED-NATIVE-RESOURCE-MATRIX
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic direct evaluator resource refusal|tests/public_resource_contract.cmake|CHECKED-ARITHMETIC-DIRECT-RESOURCE-MATRIX
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic public dynamic failures|tests/public_path_error_matrix.cmake|CHECKED-ARITHMETIC-PUBLIC-ERROR-MATRIX
+BENNU-SPEC-0003 sections 14 and 15 checked arithmetic evaluator structured errors|tests/public_cutover_conformance.cpp|checked arithmetic evaluator errors preserve every structured overflow field
+BENNU-SPEC-0004 sections 3 and 4|src/resources.cpp|trusted profile omits policy limits but retains mandatory safety
+BENNU-SPEC-0004 sections 5 through 7|src/resources.cpp|each profile limit honors zero one exact and one-past semantics
+BENNU-SPEC-0004 section 8|src/error.cpp|errors retain semantic context independently of presentation text
+BENNU-SPEC-0004 section 9|tests/public_resource_contract.cmake|PUBLIC-RESOURCE-BOUNDED-REFUSAL
+BENNU-SPEC-0004 section 9 bounded identity|tests/public_resource_contract.cmake|PUBLIC-RESOURCE-BOUNDED-REFUSAL
+BENNU-SPEC-0004 section 10|tests/public_resource_contract.cmake|PUBLIC-RESOURCE-ALLOCATION
+BENNU-SPEC-0004 section 10.2 bounded backends|tests/public_resource_contract.cmake|PUBLIC-RESOURCE-BOUNDED-REFUSAL
+BENNU-SPEC-0004 section 10.3|tests/public_resource_contract.cmake|PUBLIC-RESOURCE-RESET
+WP10 public evaluator and errors|tests/public_cutover_conformance.cpp|CUTOVER-01 public evaluator accepts rewrite syntax and rejects the removed constructor spelling
+WP10 comprehensive direct evaluator corpus|tests/public_resource_contract.cmake|PUBLIC-DIRECT-SUCCESS-CORPUS
+WP10 direct evaluator error categories|tests/public_resource_contract.cmake|PUBLIC-DIRECT-ERROR-MATRIX
+WP10 transactional runner and exact error categories|tests/public_path_error_matrix.cmake|PUBLIC-ERROR-CLI-MATRIX
+WP10 REPL primitives errors recovery and reset|tests/public_path_error_matrix.cmake|PUBLIC-ERROR-CLI-MATRIX
+WP10 typed C backend|tests/c_emission_contract.cmake|PUBLIC-SUCCESS-CROSS-PATH-BYTES
+WP10 native backend|tests/c_emission_contract.cmake|PUBLIC-SUCCESS-NATIVE
+WP10 comprehensive public success corpus|tests/c_emission_contract.cmake|PUBLIC-SUCCESS-CORPUS
+WP10 trusted CLI profile|tests/public_cutover_conformance.cpp|CUTOVER-06 trusted local public evaluation omits arbitrary policy caps
+WP10 public CLI error and resource atomicity|tests/public_path_error_matrix.cmake|PUBLIC-ERROR-CLI-MATRIX
+WP10 documentation|tests/documentation_smoke.cmake|DOCS-SMOKE
+Issue 55 public primitive and deliberate Anka-difference documentation|tests/documentation_smoke.cmake|CHECKED-ARITHMETIC-DOCS-CONTRACT
+WP10 obsolete-surface deletion|tests/obsolete_surface_contract.cmake|OBSOLETE-SURFACE
+BENNU-SPEC-0005 sections 6.1 and 6.2|src/rewrite.cpp|typed lowering applies whole-program phase precedence
+BENNU-SPEC-0005 section 6.2|src/rewrite.cpp|typed lowering checks type errors before static shape errors across roots
+BENNU-SPEC-0005 section 6.3|src/rewrite.cpp|typed lowering is value independent and retains dynamic shape data
+BENNU-SPEC-0005 sections 6.3 and 11.1 dynamic-shape agreement|src/rewrite.cpp|typed runtime shape checks honor static anchors and first mismatch order
+BENNU-SPEC-0005 sections 6.4 and 12.1 emitter acceptance|tests/public_cutover_conformance.cpp|LOWERING-01 emission defers value-dependent failures to runtime
+BENNU-SPEC-0005 sections 11.1 dynamic failure order and 12.2 source-bound diagnostics|tests/public_path_error_matrix.cmake|LOWERING-ARTIFACT-DYNAMIC-DIAGNOSTICS
+BENNU-SPEC-0005 sections 11.1 resource failure order and 12.2 generated/native resource diagnostics|tests/public_resource_contract.cmake|PARG-012-RESOURCE-DIAGNOSTICS
+BENNU-SPEC-0005 section 11.1 dynamic precedence pair conflicts|tests/public_path_error_matrix.cmake|PUBLIC-DYNAMIC-PRECEDENCE-PAIR-MATRIX
+BENNU-SPEC-0005 section 12.2 generated structured domain, shape, and resource contexts|tests/public_resource_contract.cmake|GENERATED-RUNTIME-STRUCTURED-CONTEXT
+BENNU-SPEC-0005 section 12.2 transactional cleanup and reset after generated failure|tests/public_resource_contract.cmake|GENERATED-RUNTIME-SAME-PROCESS-RESET
+BENNU-SPEC-0005 section 12.2 bounded-v1 limit diagnostic contexts|tests/public_resource_contract.cmake|PUBLIC-PROFILE-LIMIT-DIAGNOSTIC-MATRIX
+BENNU-SPEC-0005 section 17 evaluator, generated, and native diagnostic equivalence|tests/public_path_error_matrix.cmake|PUBLIC-EVALUATOR-GENERATED-NATIVE-DIAGNOSTIC-EQUIVALENCE
+BENNU-SPEC-0005 sections 3 and 5 parameter header grammar, placement, and exact diagnostics|tests/public_cutover_conformance.cpp|PARG-001-HEADER
+BENNU-SPEC-0005 section 4 declaration and reference names|tests/public_cutover_conformance.cpp|PARG-001-NAMES
+BENNU-SPEC-0001 section 5.4 reserved parameter-header primitive name|src/primitive.cpp|PARG-001-RESERVED-PRIMITIVE-DESCRIPTOR
+BENNU-SPEC-0005 section 6.2 whole-program static phase order before binding|tests/public_cutover_conformance.cpp|PARG-002-STATIC-ORDER
+BENNU-SPEC-0005 section 6.3 static and dynamic shape analysis|tests/public_cutover_conformance.cpp|PARG-003-SHAPE-ANALYSIS
+BENNU-SPEC-0005 sections 7 and 13.1 ordered typed API and borrowed scalar ownership|tests/public_cutover_conformance.cpp|PARG-004-TYPED-API
+BENNU-SPEC-0005 sections 5, 6.1, and 12.1 parameter-reference lowering metadata|src/rewrite.cpp|PARG-004-PARAMETER-LOWERING-METADATA
+BENNU-SPEC-0005 section 8 structured typed argument failures and lowest position|tests/public_cutover_conformance.cpp|PARG-005-ARGUMENT-ERROR
+BENNU-SPEC-0005 section 9 portable runner scalar text grammar and range|tests/runner_arguments_contract.cmake|PARG-006-TEXT-GRAMMAR
+BENNU-SPEC-0005 section 10 runner separator and command-shape precedence|tests/runner_arguments_contract.cmake|PARG-007-RUNNER-SEPARATOR
+BENNU-SPEC-0005 sections 3.3 and 3.4 empty header and zero-root binding|tests/public_cutover_conformance.cpp|PARG-008-ZERO-ROOTS
+BENNU-SPEC-0005 sections 6.3 and 11.4 parameter-driven iota and dynamic shape|tests/public_cutover_conformance.cpp|PARG-009-DYNAMIC-IOTA-SHAPE
+BENNU-SPEC-0005 section 11.1 multi-root and postorder dynamic failure order|tests/public_cutover_conformance.cpp|PARG-010-RUNTIME-ORDER
+BENNU-SPEC-0005 section 13.1 unchanged profile accounting for scalar binding|tests/public_cutover_conformance.cpp|PARG-011-PROFILES
+BENNU-SPEC-0005 sections 8.4 and 12.2 runner argument records and raw-text omission|tests/runner_arguments_contract.cmake|PARG-014-DIAGNOSTICS
+BENNU-SPEC-0005 sections 11.2 and 12.3 runner transactional stdout|tests/runner_arguments_contract.cmake|PARG-015-ATOMIC-STDOUT
+BENNU-SPEC-0005 sections 4.2 and 15 zero-input compatibility and program-only rejection|tests/public_cutover_conformance.cpp|PARG-017-REGRESSION
+BENNU-SPEC-0005 section 17 target-native runner argument boundary matrix|tests/runner_arguments_contract.cmake|PARG-018-PLATFORMS
+BENNU-SPEC-0005 sections 8 and 9 emitted C11 count-first argument records and portable scalar decoding|tests/parameterized_c_artifacts.cmake|PARG-005-ARGUMENT-ERROR
+BENNU-SPEC-0005 section 9 exact emitted and native Bool Int and binary64 text corpus|tests/parameterized_c_artifacts.cmake|PARG-006-TEXT-GRAMMAR
+BENNU-SPEC-0005 sections 3.3 3.4 and 11.2 empty declarations and declared-but-unreferenced zero-root artifact binding|tests/parameterized_c_artifacts.cmake|PARG-008-ZERO-ROOTS
+BENNU-SPEC-0005 sections 6.3 and 11.4 emitted parameter-driven iota and dynamic shape|tests/parameterized_c_artifacts.cmake|PARG-009-DYNAMIC-IOTA-SHAPE
+BENNU-SPEC-0005 section 11.1 generated and native parameter-driven dynamic failure order|tests/parameterized_c_artifacts.cmake|PARG-010-RUNTIME-ORDER
+BENNU-SPEC-0005 sections 11 and 12 deterministic value-independent strict-C11 parameter lowering|tests/parameterized_c_artifacts.cmake|PARG-012-EMIT-C
+BENNU-SPEC-0005 section 12.1 native direct-argv equivalence|tests/parameterized_c_artifacts.cmake|PARG-013-NATIVE
+BENNU-SPEC-0005 sections 8.4 and 12.2 generated raw-text-free argument diagnostics|tests/parameterized_c_artifacts.cmake|PARG-014-DIAGNOSTICS
+BENNU-SPEC-0005 sections 11.2 and 12.3 generated and native transactional stdout|tests/parameterized_c_artifacts.cmake|PARG-015-ATOMIC-STDOUT
+BENNU-SPEC-0005 sections 11.3 and 13.2 hosted argc boundary conversion including zero negative and maximum int counts|tests/parameterized_c_artifacts.cmake|PARG-016-REPRESENTABILITY
+BENNU-SPEC-0005 sections 6.2 and 13.2 allocation-free parameter count index span literal and generated table representability preflight|src/rewrite.cpp|PARG-016-REPRESENTABILITY
+BENNU-SPEC-0005 section 15 header-absent and empty-header generated and native artifact regression including extra-argument rejection|tests/parameterized_c_artifacts.cmake|PARG-017-REGRESSION
+BENNU-SPEC-0005 section 17 target-native strict-C11 and native-build argument matrix|tests/parameterized_c_artifacts.cmake|PARG-018-PLATFORMS
+BENNU-SPEC-0006 section 4 structural type arena equality ownership notation and overflow|tests/tuple_foundation_conformance.cpp|TUP-002-TYPES
+BENNU-SPEC-0006 sections 5.1 5.4 and 5.6 flat values validation and queries|tests/tuple_foundation_conformance.cpp|TUP-003-VALUES
+BENNU-SPEC-0006 sections 5.2 5.3 and 5.5 unique transfer borrow lifetime detachment and reverse cleanup|tests/tuple_foundation_conformance.cpp|TUP-004-MOVE-CLEANUP
+BENNU-SPEC-0006 sections 4.1 7.3 and 10 iterative canonical formatting|tests/tuple_foundation_conformance.cpp|TUP-005-FORMAT
+BENNU-SPEC-0006 section 6.1 profile-v2 identities and v1 refusal|tests/tuple_foundation_conformance.cpp|TUP-006-PROFILE-IDENTITY
+BENNU-SPEC-0006 sections 6.2 through 6.4 canonical tuple-table accounting|tests/tuple_foundation_conformance.cpp|TUP-007-TABLE-CHARGE
+BENNU-SPEC-0006 section 6.5 allocation-failure ordinals|tests/tuple_foundation_conformance.cpp|TUP-008-ALLOCATION-ORDINAL
+BENNU-SPEC-0006 section 7 construction sequencing admission and failure cleanup|tests/tuple_foundation_conformance.cpp|TUP-009-CONSTRUCTION
+BENNU-SPEC-0006 section 8.3 public direct tuple preservation|tests/tuple_foundation_conformance.cpp|TUP-012-DIRECT-PRESERVATION
+BENNU-SPEC-0006 section 10 deep reduced-stack traversal failure cleanup and overflow|tests/tuple_foundation_conformance.cpp|TUP-016-DEEP-NESTING
+BENNU-SPEC-0006 section 13 CLI emitted native profile and platform regression|tests/public_resource_contract.cmake|TUP-018-REGRESSION-PLATFORMS
+BENNU-SPEC-0006 sections 3 9.1 and 11.1 tuple grammar flat arenas and exact provenance|src/rewrite.cpp|TUP-001-GRAMMAR
+BENNU-SPEC-0006 sections 4 6.1 6.2 and 7.3 literal types canonical values and profile-v2|src/rewrite.cpp|TUP-050-EVALUATOR-FORMAT-PROFILE
+BENNU-SPEC-0006 sections 6.5 7.1 7.2 and 7.3 literal allocation failure cleanup|src/rewrite.cpp|TUP-050-FAULT-TRANSACTION
+BENNU-SPEC-0006 section 8.3 source direct calls preserve one tuple argument|src/rewrite.cpp|TUP-050-DIRECT-PRESERVATION
+BENNU-SPEC-0006 sections 5 6 7 10 and 13 deterministic strict C11 and native tuple agreement|tests/tuple_literal_contract.cmake|TUP-017-STRICT-C-NATIVE
+BENNU-SPEC-0006 sections 8.1 8.2 and 8.4 static one-level prefix expansion and ordering|src/rewrite.cpp|TUP-010-STATIC-SPREAD
+BENNU-SPEC-0006 sections 8.2 and 7.3 borrowed spread execution and transactional release|src/rewrite.cpp|TUP-011-SPREAD-RUNTIME
+BENNU-SPEC-0006 section 9 semantic argument provenance for literal and computed tuple elements|src/rewrite.cpp|TUP-013-PROVENANCE
+BENNU-SPEC-0006 sections 8 through 10 evaluator strict C11 and native prefix-spread agreement|tests/tuple_literal_contract.cmake|TUP-051-STRICT-C-NATIVE
+Issue #54 all nine identities stable IDs and all fifteen signatures|tests/issue54_primitives.cpp|ISSUE54-REGISTRY covers all nine identities and fifteen signatures
+Issue #54 Boolean truth tables|tests/issue54_primitives.cpp|ISSUE54-BOOLEAN and and or use ordinary pointwise truth tables
+Issue #54 inequality complement across Bool Int Double and promotion|tests/issue54_primitives.cpp|ISSUE54-NOT-EQUALS is the exact complement of selected equals
+Issue #54 negative parity and Int64 extrema|tests/issue54_primitives.cpp|ISSUE54-PARITY handles negative values and Int64 extrema without overflow
+Issue #54 sign boundaries zeros infinities and NaN normalization|tests/issue54_primitives.cpp|ISSUE54-SIGN handles extrema zeros infinities NaN and raw NaN normalization
+Issue #54 written order promotion and IEEE strict ordering|tests/issue54_primitives.cpp|ISSUE54-ORDERING preserves written operands and IEEE unordered cases
+Issue #54 scalar vector vector-vector empty singleton promotion and pointwise lifting|tests/issue54_primitives.cpp|ISSUE54-LIFTING covers the complete shared elementwise matrix
+Issue #54 arity type shape empty mismatch and type-before-shape validation|tests/issue54_primitives.cpp|ISSUE54-VALIDATION covers arity type shape and precedence matrix
+Issue #54 exact scalar vector empty work charges and no partial preflight result|tests/issue54_primitives.cpp|ISSUE54-WORK-CHARGE observes kernels work and transactional results
+Issue #54 evaluator strict-C11 and native work refusal allocation failure and same-process cleanup|tests/public_resource_contract.cmake|ISSUE54-RESOURCE-CROSS-BACKEND
+Issue #54 all fifteen implementations evaluator runner REPL strict-C11 and native value agreement|tests/c_emission_contract.cmake|PUBLIC-SUCCESS-CROSS-PATH-BYTES
+Issue #54 static and dynamic error parity|tests/public_path_error_matrix.cmake|PUBLIC-EVALUATOR-GENERATED-NATIVE-DIAGNOSTIC-EQUIVALENCE
+BENNU-SPEC-0007 sections 3 and 14 explicit fanout grammar and structural diagnostics|src/rewrite.cpp|FAN-001-GRAMMAR
+BENNU-SPEC-0007 section 4 placeholder scope count and owned-position rejection|src/rewrite.cpp|FAN-002-PLACEHOLDER
+BENNU-SPEC-0007 section 6 complete static validation before execution|src/rewrite.cpp|FAN-003-STATIC-ALL-BRANCHES
+BENNU-SPEC-0007 sections 5 and 6 operand-dependent type and branch order|src/rewrite.cpp|FAN-004-STATIC-TYPE-ORDER
+BENNU-SPEC-0007 sections 7 and 9 one operand owner and immutable borrows|src/rewrite.cpp|FAN-005-OPERAND-ONCE
+BENNU-SPEC-0007 sections 7.1 and 10 result table before branch work|src/rewrite.cpp|FAN-006-TABLE-BEFORE-BRANCH
+BENNU-SPEC-0007 section 7.2 sequential first dynamic failure|src/rewrite.cpp|FAN-007-SEQUENTIAL-FIRST-FAILURE
+BENNU-SPEC-0007 section 8 transactional transfer and cleanup|src/rewrite.cpp|FAN-008-TRANSFER-CLEANUP
+BENNU-SPEC-0007 sections 7.3 and 9 operand kinds and nested shape|src/rewrite.cpp|FAN-009-OPERAND-KINDS
+BENNU-SPEC-0007 section 9 one-level prefix spread and direct preservation|src/rewrite.cpp|FAN-010-SPREAD-DIRECT
+BENNU-SPEC-0007 section 10 deterministic profile-v2 events|src/rewrite.cpp|FAN-011-PROFILE-EVENTS
+BENNU-SPEC-0007 section 10.4 deterministic allocation ordinals|src/rewrite.cpp|FAN-012-ALLOCATION-ORDINALS
+BENNU-SPEC-0007 section 5 fanout branch and placeholder provenance|src/rewrite.cpp|FAN-013-PROVENANCE
+BENNU-SPEC-0007 section 12 lexical nesting boundary|src/rewrite.cpp|FAN-014-NESTING-BOUNDARY
+BENNU-SPEC-0007 section 11 atomic program publication|src/rewrite.cpp|FAN-015-ATOMIC-OUTPUT
+BENNU-SPEC-0007 section 15 strict C11 and native backend agreement|tests/fanout_contract.cmake|FAN-016-STRICT-C-NATIVE
+BENNU-SPEC-0007 section 13 unchanged ordinary scalar vector tuple calls|src/rewrite.cpp|FAN-017-REGRESSION-PLATFORMS
+BENNU-SPEC-0007 section 17 public CLI strict C11 and native journeys|tests/fanout_contract.cmake|FAN-016-STRICT-C-NATIVE
+BENNU-SPEC-0007 section 6 run emit-c and build static winner atomicity|tests/fanout_contract.cmake|FAN-003-STATIC-ALL-BRANCHES-CLI
+BENNU-SPEC-0007 sections 7 and 9 generated C same-address operand borrows|tests/fanout_contract.cmake|FAN-005-OPERAND-IDENTITY-C
+BENNU-SPEC-0007 section 8 emitted C and native reverse prefix cleanup|tests/fanout_contract.cmake|FAN-008-TRANSFER-CLEANUP-NATIVE
+BENNU-SPEC-0007 section 10 generated C exact work live and reservation snapshots|tests/fanout_contract.cmake|FAN-011-PROFILE-EVENTS-C
+BENNU-SPEC-0007 section 10.4 generated C operand table and each branch allocation fault|tests/fanout_contract.cmake|FAN-012-ALLOCATION-ORDINALS-C
+BENNU-SPEC-0007 section 11 evaluator emitted C and native later-root zero stdout|tests/fanout_contract.cmake|FAN-015-ATOMIC-OUTPUT-NATIVE

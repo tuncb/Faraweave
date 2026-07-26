@@ -1,0 +1,32 @@
+name: Faraweave initial v0.1.0 release
+
+on:
+  push:
+    tags: [v0.1.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0, persist-credentials: false}
+      - run: |
+          test "${GITHUB_REF_NAME}" = v0.1.0
+          test "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = 0.1.0
+          test "$(git cat-file -t refs/tags/v0.1.0)" = tag
+          test "$(git rev-parse refs/tags/v0.1.0^{commit})" = "$GITHUB_SHA"
+          ! gh release view v0.1.0
+        env: {GH_TOKEN: "${{ github.token }}"}
+  publish:
+    needs: gate
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/future-release.yml
+    with: {source_ref: "${{ github.sha }}", publish: true}
+    secrets: inherit

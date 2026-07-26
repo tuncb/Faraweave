@@ -1,0 +1,3 @@
+parameters[value Int]
+1
+inc[value]

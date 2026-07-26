@@ -1,0 +1,28 @@
+[package]
+name = "faraweave"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+rust-version = "1.97.1"
+description = "A data-oriented scalar and vector language"
+license = "MIT"
+repository = "https://github.com/tuncb/faraweave"
+
+[lib]
+name = "faraweave"
+path = "src/lib.rs"
+
+[[bin]]
+name = "faraweave"
+path = "src/main.rs"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,2 @@
+parameters[count Int]
+add[iota[count] (1 2)]

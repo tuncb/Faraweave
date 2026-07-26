@@ -1,0 +1,130 @@
+name: Future release candidate and publish
+
+on:
+  workflow_call:
+    inputs:
+      source_ref: {required: true, type: string}
+      publish: {required: true, type: boolean}
+  workflow_dispatch:
+    inputs:
+      source_ref: {required: true, type: string}
+      publish: {required: true, type: boolean, default: false}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: "${{ inputs.source_ref }}"
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable publish state before mutations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: "${{ inputs.publish }}"
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          test "$(git rev-parse "${{ inputs.source_ref }}^{commit}")" = "${source_commit}"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "${version}"
+          if test "${PUBLISH}" = true; then
+            tag="v${version}"
+            test "$(git cat-file -t "refs/tags/${tag}")" = tag
+            test "$(git rev-parse "refs/tags/${tag}^{commit}")" = "${source_commit}"
+            ! gh release view "${tag}"
+          fi
+
+  package:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: linux-x64, os: ubuntu-24.04, archive: tar.gz}
+          - {target: windows-x64, os: windows-2022, archive: zip}
+          - {target: macos-arm64, os: macos-15, archive: tar.gz}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {ref: "${{ inputs.source_ref }}", persist-credentials: false}
+      - name: Verify host and pinned Rust
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            linux-x64) expected_os=Linux; expected_arch=x86_64 ;;
+            windows-x64) expected_os=Windows; expected_arch=AMD64 ;;
+            macos-arm64) expected_os=Darwin; expected_arch=arm64 ;;
+          esac
+          python -c 'import platform; assert platform.system() == "'"${expected_os}"'"; assert platform.machine() == "'"${expected_arch}"'"'
+          test "$(rustc --version | cut -d' ' -f2)" = "1.97.1"
+      - run: cargo test --workspace --all-targets --all-features --release
+      - run: cargo build --workspace --all-targets --all-features --release
+      - shell: bash
+        run: python tools/validation/contracts.py full
+      - shell: bash
+        run: python tools/validation/contracts.py package "${{ matrix.target }}"
+      - name: Create target provenance fragment
+        shell: bash
+        run: |
+          executable=faraweave
+          test "${{ matrix.target }}" != windows-x64 || executable=faraweave.exe
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag_args=()
+          if test "${{ inputs.publish }}" = true; then tag_args=(--tag "v${version}"); fi
+          python tools/release/provenance.py fragment \
+            --version-file Cargo.toml \
+            --target "${{ matrix.target }}" \
+            --source-commit "$(git rev-parse HEAD)" \
+            --archive "artifacts/faraweave-v${version}-${{ matrix.target }}.${{ matrix.archive }}" \
+            --executable-path "$executable" \
+            --repository "${{ github.repository }}" \
+            --workflow .github/workflows/future-release.yml \
+            "${tag_args[@]}" \
+            --output "artifacts/${{ matrix.target }}.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    if: inputs.publish
+    needs: [gate, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {ref: "${{ inputs.source_ref }}", fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with: {path: artifacts, merge-multiple: true}
+      - name: Merge and independently verify release provenance
+        run: |
+          python tools/release/provenance.py merge \
+            --fragment artifacts/linux-x64.json \
+            --fragment artifacts/windows-x64.json \
+            --fragment artifacts/macos-arm64.json \
+            --asset-dir artifacts --output artifacts/release-manifest.json
+          python tools/release/provenance.py verify \
+            --manifest artifacts/release-manifest.json \
+            --fragment-dir artifacts --asset-dir artifacts \
+            --expected-repository "${{ github.repository }}" \
+            --expected-workflow .github/workflows/future-release.yml \
+            --expected-source-commit "$(git rev-parse HEAD)"
+          rm artifacts/linux-x64.json artifacts/windows-x64.json artifacts/macos-arm64.json
+          python tools/validation/contracts.py release-state
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with: {subject-path: "artifacts/*"}
+      - name: Create draft, verify remote bytes, publish last
+        run: bash tools/release/publish.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ github.sha }}

@@ -1,0 +1,6 @@
+{
+  "file": "bennu: ELF 64-bit LSB pie executable, x86-64, dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0",
+  "ldd": "linux-vdso.so.1 (0x00007fff)\nlibstdc++.so.6 => /lib/x86_64-linux-gnu/libstdc++.so.6 (0x0001)\nlibgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x0002)\nlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x0003)\nlibm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x0004)\n/lib64/ld-linux-x86-64.so.2 (0x0005)",
+  "version_info": "Name: GLIBCXX_3.4\nName: GLIBCXX_3.4.32\nName: GLIBC_2.2.5\nName: GLIBC_2.36",
+  "dynamic": "0x0000000000000001 (NEEDED) Shared library: [libstdc++.so.6]\n0x0000000000000001 (NEEDED) Shared library: [libgcc_s.so.1]\n0x0000000000000001 (NEEDED) Shared library: [libc.so.6]"
+}
