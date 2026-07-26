@@ -158,6 +158,11 @@ fn cli_emit_c_is_deterministic_and_alias_safe() {
         fs::read(&left).expect("left"),
         fs::read(&right).expect("right")
     );
+    assert!(
+        fs::read_to_string(&left)
+            .expect("emitted source")
+            .contains("setvbuf(stdout, NULL, _IONBF, 0)")
+    );
     let original = fs::read(&source).expect("original");
     let alias = Command::new(binary())
         .arg("emit-c")

@@ -257,10 +257,9 @@ def main() -> None:
                 )
             if index == 0 and Path("/dev/full").exists():
                 expected_failure = (
-                    b"faraweave_output_error reason=flush_failed "
+                    b"faraweave_output_error reason=write_failed "
                     + f"pending_byte_count={len(expected)} ".encode()
-                    + f"accepted_byte_count={len(expected)} ".encode()
-                    + f"output_position={len(expected)}\n".encode()
+                    + b"accepted_byte_count=0 output_position=0\n"
                 )
                 with Path("/dev/full").open("wb") as full:
                     evaluator_failure = subprocess.run(

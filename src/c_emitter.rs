@@ -78,6 +78,7 @@ fn emit_constant_program(result: &ProgramResult) -> Result<CEmissionResult, Erro
              #ifdef _WIN32\n\
              \x20 if (_setmode(_fileno(stdout), _O_BINARY) == -1 || _setmode(_fileno(stderr), _O_BINARY) == -1) return 1;\n\
              #endif\n\
+             \x20 if (setvbuf(stdout, NULL, _IONBF, 0) != 0) return 1;\n\
              \x20 if (argc != 1) {{\n\
              \x20   (void)fprintf(stderr, \"faraweave_argument_error reason=extra required_count=0 supplied_count=%d position=1 parameter_name=- expected_type=- declaration_span=- actual_container=- actual_type=- invalid_value_invariant=-\\n\", argc - 1);\n\
              \x20   return 1;\n\
@@ -384,7 +385,7 @@ impl CGenerator {
                 for (index, child) in child_ids.iter().enumerate() {
                     writeln!(
                         self.definitions,
-                        "  if (!fw_expr_{child}(hole, &args[{index}U])) goto cleanup; initialized = {next}U;",
+                        "  if (!fw_expr_{child}(hole, &args[{index}U])) goto cleanup;\n  initialized = {next}U;",
                         next = index + 1
                     )
                     .map_err(|_| emission_error())?;
@@ -422,14 +423,14 @@ impl CGenerator {
                     .map_err(|_| emission_error())?;
                 }
                 self.definitions.push_str(
-                    "  while (initialized != 0U) fw_free(&args[--initialized]); return ok;\ncleanup:\n  while (initialized != 0U) fw_free(&args[--initialized]); return 0;\n",
+                    "  while (initialized != 0U) fw_free(&args[--initialized]);\n  return ok;\ncleanup:\n  while (initialized != 0U) fw_free(&args[--initialized]);\n  return 0;\n",
                 );
             }
             ExprKind::Fanout { branches, .. } => {
                 let operand_id = child_ids[0];
                 writeln!(
                     self.definitions,
-                    "  FWV operand = {{0}}; size_t initialized = 0U; if (!fw_expr_{operand_id}(hole, &operand)) return 0; if (!fw_make_tuple(out, {}U, \"fanout\", {}U, {}U)) {{ fw_free(&operand); return 0; }}",
+                    "  FWV operand = {{0}}; size_t initialized = 0U;\n  if (!fw_expr_{operand_id}(hole, &operand)) return 0;\n  if (!fw_make_tuple(out, {}U, \"fanout\", {}U, {}U)) {{ fw_free(&operand); return 0; }}",
                     branches.len(),
                     expression.span.begin.line,
                     expression.span.begin.column
@@ -438,7 +439,7 @@ impl CGenerator {
                 for (index, child) in child_ids.iter().skip(1).enumerate() {
                     writeln!(
                         self.definitions,
-                        "  if (!fw_expr_{child}(&operand, &out->items[{index}U])) goto fanout_cleanup; initialized = {next}U;",
+                        "  if (!fw_expr_{child}(&operand, &out->items[{index}U])) goto fanout_cleanup;\n  initialized = {next}U;",
                         next = index + 1
                     )
                     .map_err(|_| emission_error())?;
@@ -937,7 +938,8 @@ static void fw_set_double(FWV *out, double value) {
       ? fw_double_from_bits(UINT64_C(0x7ff8000000000000)) : value;
 }
 static int fw_borrow(const FWV *value, FWV *out) {
-  if (value == NULL) return 0; *out = *value; out->owns = 0; return 1;
+  if (value == NULL) return 0;
+  *out = *value; out->owns = 0; return 1;
 }
 static size_t fw_width(int type) { return type == 0 ? 1U : 8U; }
 static int fw_fail_resource(const char *producer,const char *reason,
@@ -968,7 +970,8 @@ static int fw_admit(size_t bytes,int tuple,size_t work,const char *producer,
       return fw_fail_resource(producer,"allocation_unavailable",line,column);
   }
   fw_live_bytes=live_after;fw_work_units=work_after;
-  if(live_after>fw_peak_live_bytes)fw_peak_live_bytes=live_after;return 1;
+  if(live_after>fw_peak_live_bytes)fw_peak_live_bytes=live_after;
+  return 1;
 }
 static void fw_refund(size_t bytes) {
   fw_live_bytes=bytes<=fw_live_bytes?fw_live_bytes-bytes:0U;
@@ -1132,7 +1135,8 @@ static int fw_apply(int primitive, int result_type, const FWV *args, size_t coun
     if (count != 1U || args[0].kind != 0 || args[0].type != 1) return fw_fail("TypeError","iota arguments do not match an accepted signature",line,column);
     bound = args[0].i; length = bound > 0 ? (size_t)bound : 0U;
     if (!fw_make_vector(out,1,length,length,name,line,column)) return 0;
-    for (i=0U;i<length;++i) ((int64_t *)out->data)[i]=(int64_t)i+1; return 1;
+    for (i=0U;i<length;++i) ((int64_t *)out->data)[i]=(int64_t)i+1;
+    return 1;
   }
   for (i=0U;i<count;++i) {
     if (args[i].kind==2) return fw_fail("TypeError","tuple argument is not accepted",line,column);
@@ -1162,7 +1166,8 @@ static int fw_apply(int primitive, int result_type, const FWV *args, size_t coun
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
 static int fw_append(FWBuffer *buffer,const char *text) {
   size_t n=strlen(text),needed; char *grown;
-  if(n>SIZE_MAX-buffer->size-1U) return 0; needed=buffer->size+n+1U;
+  if(n>SIZE_MAX-buffer->size-1U) return 0;
+  needed=buffer->size+n+1U;
   if(needed>buffer->capacity) { size_t next=buffer->capacity?buffer->capacity:128U;
     while(next<needed){if(next>SIZE_MAX/2U)return 0;next*=2U;}
     grown=(char *)realloc(buffer->data,next);if(grown==NULL)return 0;buffer->data=grown;buffer->capacity=next;}
@@ -1239,7 +1244,8 @@ static int fw_format(FWBuffer *buffer,const FWV *value) {
         }
         stack[depth++]=(FWFormatFrame){child,0U};continue;
       }
-      if(!fw_append(buffer,"]"))goto done;--depth;continue;
+      if(!fw_append(buffer,"]"))goto done;
+      --depth;continue;
     }
     if(current->kind==1){
       if(!fw_append(buffer,"("))goto done;
@@ -1250,7 +1256,8 @@ static int fw_format(FWBuffer *buffer,const FWV *value) {
         else if(scalar.type==1){if(snprintf(text,sizeof(text),"%" PRId64,scalar.i)<=0||!fw_append(buffer,text))goto done;}
         else if(!fw_format_double(text,sizeof(text),scalar.d)||!fw_append(buffer,text))goto done;
       }
-      if(!fw_append(buffer,")"))goto done;--depth;continue;
+      if(!fw_append(buffer,")"))goto done;
+      --depth;continue;
     }
     if(current->type==0){if(!fw_append(buffer,current->b?"true":"false"))goto done;}
     else if(current->type==1){if(snprintf(text,sizeof(text),"%" PRId64,current->i)<=0||!fw_append(buffer,text))goto done;}
@@ -1322,16 +1329,20 @@ static int fw_report_argument(const char *reason,size_t supplied,size_t position
 }
 static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   size_t supplied=argc>0?(size_t)argc-1U:0U,i,initialized=0U;FWV *values=NULL;FWBuffer output={0};int decoded;
+  (void)fw_apply;
+  (void)fw_make_tuple;
 #ifdef _WIN32
   if (_setmode(_fileno(stdout), _O_BINARY) == -1 || _setmode(_fileno(stderr), _O_BINARY) == -1) return 1;
 #endif
+  if(setvbuf(stdout,NULL,_IONBF,0)!=0)return 1;
   if(setlocale(LC_NUMERIC,"C")==NULL)return 1;
   if(supplied!=fw_required){size_t pos=supplied<fw_required?supplied+1U:fw_required+1U;(void)fw_report_argument(supplied<fw_required?"missing":"extra",supplied,pos);return 1;}
   for(i=0U;i<fw_required;++i){decoded=fw_decode(argv[i+1U],fw_parameter_types[i],&fw_parameters[i]);if(decoded!=FW_DECODE_OK){(void)fw_report_argument(decoded==FW_DECODE_RANGE?"out_of_range":"invalid_literal",supplied,i+1U);return 1;}}
   values=(FWV *)calloc(root_count?root_count:1U,sizeof(FWV));if(values==NULL)return 1;
   for(i=0U;i<root_count;++i){if(!roots[i](NULL,&values[i]))goto failure;initialized=i+1U;}
   for(i=0U;i<root_count;++i)if(!fw_format(&output,&values[i])||!fw_append(&output,"\n"))goto failure;
-  while(initialized)fw_free(&values[--initialized]);free(values);
+  while(initialized)fw_free(&values[--initialized]);
+  free(values);
   if(output.size){size_t accepted=fwrite(output.data,1U,output.size,stdout);
     if(accepted!=output.size){(void)fprintf(stderr,
       "faraweave_output_error reason=write_failed pending_byte_count=%zu accepted_byte_count=%zu output_position=%zu\n",
@@ -1341,7 +1352,8 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
       "faraweave_output_error reason=flush_failed pending_byte_count=%zu accepted_byte_count=%zu output_position=%zu\n",
       published,published,published);return 1;}}return 0;
 failure:
-  while(initialized)fw_free(&values[--initialized]);free(values);free(output.data);
+  while(initialized)fw_free(&values[--initialized]);
+  free(values);free(output.data);
   (void)fprintf(stderr,"<generated>:%zu:%zu: %s: %s\n",fw_error_line,fw_error_column,fw_error_kind?fw_error_kind:"FormattingError",fw_error_message?fw_error_message:"unable to format result");return 1;
 }
 "#;

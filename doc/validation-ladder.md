@@ -56,3 +56,24 @@ The Windows host cannot execute the `#[cfg(unix)]` unreadable-file journey,
 Linux `/dev/full` and sanitizer journeys, Linux ELF inspection, or macOS arm64
 execution. The exact Unix clippy diagnostic is covered structurally by the
 octal permission literal and must be re-executed by Linux and macOS CI.
+
+The subsequently exposed generated-C repairs additionally use an isolated WSL2
+Linux checkout with Rust 1.97.1. Its exact commands are the canonical commands
+above, `python tools/validation/contracts.py package linux-x64`, and:
+
+```sh
+python tools/validation/c11_journey.py
+```
+
+That journey compiles every emitted fixture with GCC strict C11, executes
+evaluator/generated/native parity, exercises `/dev/full`, and runs the first
+fixture under ASan+UBSan. The same three emitted fixtures are also compiled
+with Clang 18 using:
+
+```sh
+clang -std=c11 -frounding-math -ffp-contract=off -fno-fast-math -Wall -Wextra -Werror -pedantic-errors fixture.c -o fixture -lm
+```
+
+The WSL Clang installation lacks its ASan runtime libraries, so Clang sanitizer
+execution is excluded; GCC supplies the Linux sanitizer pass. Actual macOS
+arm64 execution remains assigned to CI.

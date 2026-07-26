@@ -391,6 +391,9 @@ fn generated_runtime_embeds_profile_and_typed_primitive_selection() {
             .source
             .contains("static int fw_apply(int primitive, int result_type")
     );
+    assert!(emitted.source.contains("(void)fw_apply;"));
+    assert!(emitted.source.contains("(void)fw_make_tuple;"));
+    assert!(emitted.source.contains("setvbuf(stdout,NULL,_IONBF,0)"));
     assert!(!emitted.source.contains("strcmp(name"));
     assert!(!emitted.source.contains("fw_format(buffer"));
     assert!(!emitted.source.contains("fw_free(&value->items"));
