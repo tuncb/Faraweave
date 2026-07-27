@@ -715,6 +715,112 @@ fn validate_arguments(raw: &crate::RawProgram, arguments: &[Value]) -> Result<()
     Ok(())
 }
 
+pub(crate) fn decode_verified_arguments(
+    program: &VerifiedProgram,
+    arguments: &[&str],
+) -> Result<Vec<Value>, Error> {
+    let raw = program.as_raw();
+    if arguments.len() != raw.parameters.len() {
+        let reason = if arguments.len() < raw.parameters.len() {
+            ArgumentErrorReason::Missing
+        } else {
+            ArgumentErrorReason::Extra
+        };
+        return Err(argument_error(
+            raw,
+            reason,
+            arguments.len(),
+            arguments.len().min(raw.parameters.len()) + 1,
+        ));
+    }
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(raw.parameters.len())
+        .map_err(|_| execution_allocation_error(SourceLocation::start(), "argument decoding"))?;
+    for (index, (parameter, spelling)) in raw.parameters.iter().zip(arguments).enumerate() {
+        let value = match parameter.scalar_type {
+            ScalarType::Bool => match *spelling {
+                "true" => Ok(Value::Bool(true)),
+                "false" => Ok(Value::Bool(false)),
+                _ => Err(ArgumentErrorReason::InvalidLiteral),
+            },
+            ScalarType::Int => decode_int(spelling).map(Value::Int),
+            ScalarType::Double => decode_double(spelling).map(Value::Double),
+        };
+        match value {
+            Ok(value) => decoded.push(value),
+            Err(reason) => {
+                return Err(argument_error(raw, reason, arguments.len(), index + 1));
+            }
+        }
+    }
+    Ok(decoded)
+}
+
+fn decode_int(spelling: &str) -> Result<i64, ArgumentErrorReason> {
+    let digits = spelling.strip_prefix('-').unwrap_or(spelling);
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.starts_with('0') && (digits.len() != 1 || spelling.starts_with('-')))
+    {
+        return Err(ArgumentErrorReason::InvalidLiteral);
+    }
+    spelling
+        .parse()
+        .map_err(|_| ArgumentErrorReason::OutOfRange)
+}
+
+fn decode_double(spelling: &str) -> Result<f64, ArgumentErrorReason> {
+    match spelling {
+        "inf" => return Ok(f64::INFINITY),
+        "-inf" => return Ok(f64::NEG_INFINITY),
+        "nan" => return Ok(f64::from_bits(0x7ff8_0000_0000_0000)),
+        _ => {}
+    }
+    if !canonical_double_argument(spelling) {
+        return Err(ArgumentErrorReason::InvalidLiteral);
+    }
+    let value: f64 = spelling
+        .parse()
+        .map_err(|_| ArgumentErrorReason::OutOfRange)?;
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or(ArgumentErrorReason::OutOfRange)
+}
+
+fn canonical_double_argument(spelling: &str) -> bool {
+    let text = spelling.strip_prefix('-').unwrap_or(spelling);
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(index) => (&text[..index], Some(&text[index + 1..])),
+        None => (text, None),
+    };
+    if let Some(exponent) = exponent {
+        let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+    }
+    let has_exponent = exponent.is_some();
+    let mut parts = mantissa.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || (integer.starts_with('0') && integer.len() != 1)
+    {
+        return false;
+    }
+    let has_fraction = fraction.is_some();
+    if let Some(fraction) = fraction
+        && (fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    has_fraction || has_exponent
+}
+
 fn contains_noncanonical_nan(value: &Value) -> Result<bool, Error> {
     let mut pending = Vec::new();
     pending
@@ -868,15 +974,15 @@ mod tests {
         }
     }
 
-    fn assert_differential(
+    fn assert_public_route_matches_direct_ir(
         source: &str,
         arguments: &[Value],
         configuration: EvaluationConfiguration,
     ) {
-        let legacy = evaluate_source_with_arguments(source, arguments, configuration);
+        let public = evaluate_source_with_arguments(source, arguments, configuration);
         let verified = compile(source);
         let interpreted = evaluate_verified_program(&verified, arguments, configuration);
-        assert_eq!(interpreted, legacy, "{source}");
+        assert_eq!(interpreted, public, "{source}");
     }
 
     #[test]
@@ -899,7 +1005,11 @@ mod tests {
                 vec![Value::Int(2), Value::Int(3)],
             ),
         ] {
-            assert_differential(source, &arguments, EvaluationConfiguration::default());
+            assert_public_route_matches_direct_ir(
+                source,
+                &arguments,
+                EvaluationConfiguration::default(),
+            );
         }
     }
 
@@ -941,7 +1051,7 @@ mod tests {
             "greater_than[2.0 1.0]\n",
             "iota[3]\n",
         ] {
-            assert_differential(source, &[], EvaluationConfiguration::default());
+            assert_public_route_matches_direct_ir(source, &[], EvaluationConfiguration::default());
         }
     }
 
@@ -955,10 +1065,14 @@ mod tests {
             vec![Value::Double(f64::from_bits(0x7ff8_0000_0000_0001))],
             vec![Value::Double(1.5), Value::Double(2.5)],
         ] {
-            assert_differential(source, &arguments, EvaluationConfiguration::default());
+            assert_public_route_matches_direct_ir(
+                source,
+                &arguments,
+                EvaluationConfiguration::default(),
+            );
         }
 
-        assert_differential(
+        assert_public_route_matches_direct_ir(
             "parameters[x Int]\n[x]\n",
             &[],
             EvaluationConfiguration {
@@ -969,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_observer_and_fault_ordinals_match_legacy() {
+    fn public_observer_and_fault_ordinals_match_direct_ir() {
         let source = "fanout[iota[3] {inc[_]} {add[_ (10 20 30)]}]\nadd[(1 2 3) (4 5 6)]\n";
         for fail_at_ordinal in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
             let configuration = EvaluationConfiguration {
@@ -983,23 +1097,23 @@ mod tests {
                 allocation_failure: AllocationFailureInjection { fail_at_ordinal },
             };
             take_events();
-            let legacy =
+            let public =
                 evaluate_source_with_arguments_and_observer(source, &[], configuration, observe);
-            let legacy_events = take_events();
+            let public_events = take_events();
             let verified = compile(source);
             let interpreted =
                 evaluate_verified_program_with_observer(&verified, &[], configuration, observe);
             let interpreted_events = take_events();
-            assert_eq!(interpreted, legacy, "fault {fail_at_ordinal:?}");
+            assert_eq!(interpreted, public, "fault {fail_at_ordinal:?}");
             assert_eq!(
-                interpreted_events, legacy_events,
+                interpreted_events, public_events,
                 "fault {fail_at_ordinal:?}"
             );
         }
     }
 
     #[test]
-    fn resource_limit_winners_and_cleanup_usage_match_legacy() {
+    fn public_resource_limit_winners_and_cleanup_usage_match_direct_ir() {
         let source = "[iota[3] iota[2]]\n";
         for limits in [
             ResourceLimits {
@@ -1027,7 +1141,7 @@ mod tests {
                 max_work_units: Some(4),
             },
         ] {
-            assert_differential(
+            assert_public_route_matches_direct_ir(
                 source,
                 &[],
                 EvaluationConfiguration {
@@ -1084,7 +1198,7 @@ mod tests {
             },
             allocation_failure: AllocationFailureInjection::default(),
         };
-        assert_differential(&source, &[], configuration);
+        assert_public_route_matches_direct_ir(&source, &[], configuration);
     }
 
     #[test]
