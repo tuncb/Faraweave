@@ -360,7 +360,7 @@ fn parameter_header_reason_and_span_contract_is_structured() {
 }
 
 #[test]
-fn generated_runtime_embeds_profile_and_typed_primitive_selection() {
+fn generated_runtime_embeds_profile_and_verified_primitive_selection() {
     let configuration = EvaluationConfiguration {
         profile: ExecutionProfile::BoundedV2,
         limits: ResourceLimits {
@@ -386,12 +386,10 @@ fn generated_runtime_embeds_profile_and_typed_primitive_selection() {
             .source
             .contains("const size_t fw_failure_ordinal = 0U;")
     );
-    assert!(
-        emitted
-            .source
-            .contains("static int fw_apply(int primitive, int result_type")
-    );
-    assert!(emitted.source.contains("(void)fw_apply;"));
+    assert!(emitted.source.contains("static int fw_kernel_1("));
+    assert!(emitted.source.contains("fw_impl_1(args, 1U"));
+    assert!(!emitted.source.contains("static int fw_apply("));
+    assert!(!emitted.source.contains("fw_apply_scalar"));
     assert!(emitted.source.contains("(void)fw_make_tuple;"));
     assert!(emitted.source.contains("setvbuf(stdout,NULL,_IONBF,0)"));
     assert!(!emitted.source.contains("strcmp(name"));

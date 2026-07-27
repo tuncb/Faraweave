@@ -161,7 +161,7 @@ fn cli_emit_c_is_deterministic_and_alias_safe() {
     assert!(
         fs::read_to_string(&left)
             .expect("emitted source")
-            .contains("setvbuf(stdout, NULL, _IONBF, 0)")
+            .contains("/* VerifiedProgram-driven definitions. */")
     );
     let original = fs::read(&source).expect("original");
     let alias = Command::new(binary())
@@ -206,8 +206,13 @@ fn cli_deep_tuple_journeys_do_not_depend_on_host_recursion() {
     assert!(emitted.stdout.is_empty());
     assert!(emitted.stderr.is_empty());
     let c_source = fs::read_to_string(&emitted_path).expect("emitted C");
-    assert!(c_source.contains(&"[".repeat(depth)));
-    assert!(c_source.contains(&"]".repeat(depth)));
+    assert_eq!(
+        c_source
+            .matches("fw_make_tuple(out, 1U, \"tuple_literal\"")
+            .count(),
+        depth
+    );
+    assert!(!c_source.contains(&"[".repeat(depth)));
 
     fs::write(
         &source_path,

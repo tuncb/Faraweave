@@ -1,17 +1,14 @@
+use crate::lowering::compile_parsed_source;
 use crate::parser::{
-    CallSyntax, Expr, ExprKind, Program, first_tuple_location, parse, program_contains_tuple,
-    validate_parameter_declarations,
+    first_tuple_location, parse, program_contains_tuple, validate_parameter_declarations,
 };
-use crate::primitive::{analyze, resolve_names};
+use crate::primitive::resolve_names;
 use crate::semantic_registry::{SEMANTIC_REGISTRY, ScalarKernel, implementation_from_numeric};
 use crate::typed_program::{
     ConstantRecord, Conversion as IrConversion, Feature, IndexRange, LiftMode, Node, NodeKind,
     Origin, RawProgram, ScalarConstant, TypeRecord, ValueAccess, VerifiedProgram,
 };
-use crate::{
-    Error, ErrorKind, EvaluationConfiguration, ProgramResult, ScalarType, Type, Value,
-    evaluate_source_with_configuration, format_value,
-};
+use crate::{Error, ErrorKind, EvaluationConfiguration, ScalarType};
 use std::fmt::Write;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -19,9 +16,6 @@ pub struct CEmissionResult {
     pub source: String,
 }
 
-/// Internal test seam for the IR-driven generator. Public source routing remains
-/// on the legacy generator until issue #9 performs the backend cutover.
-#[allow(dead_code)]
 pub(crate) fn emit_verified_c_program(
     program: &VerifiedProgram,
     configuration: EvaluationConfiguration,
@@ -83,7 +77,7 @@ impl<'a> IrCGenerator<'a> {
             self.emit_node(index, node)?;
         }
 
-        let mut source = ir_parameter_runtime()?;
+        let mut source = parameter_runtime()?;
         source.push_str("\n/* VerifiedProgram-driven definitions. */\n");
         source.push_str("FWV fw_parameters[");
         write!(source, "{}", self.program.parameters.len().max(1)).map_err(|_| emission_error())?;
@@ -687,31 +681,12 @@ fn range_slice<T>(values: &[T], range: IndexRange) -> Result<&[T], Error> {
     values.get(start..end).ok_or_else(emission_error)
 }
 
-fn ir_parameter_runtime() -> Result<String, Error> {
-    const LEGACY_APPLY: &str = "enum {\n  FW_INC";
-    const SELECTED_APPLY: &str = "typedef int (*FWSelectedKernel)";
-    const LEGACY_REFERENCE: &str = "  (void)fw_apply;\n";
-    let legacy_start = PARAMETER_RUNTIME
-        .find(LEGACY_APPLY)
-        .ok_or_else(emission_error)?;
-    let selected_start = PARAMETER_RUNTIME[legacy_start..]
-        .find(SELECTED_APPLY)
-        .and_then(|offset| legacy_start.checked_add(offset))
-        .ok_or_else(emission_error)?;
-    let legacy_reference = PARAMETER_RUNTIME[selected_start..]
-        .find(LEGACY_REFERENCE)
-        .and_then(|offset| selected_start.checked_add(offset))
-        .ok_or_else(emission_error)?;
-    let after_reference = legacy_reference
-        .checked_add(LEGACY_REFERENCE.len())
-        .ok_or_else(emission_error)?;
+fn parameter_runtime() -> Result<String, Error> {
     let mut runtime = String::new();
     runtime
-        .try_reserve(PARAMETER_RUNTIME.len())
+        .try_reserve_exact(PARAMETER_RUNTIME.len())
         .map_err(|_| emission_error())?;
-    runtime.push_str(&PARAMETER_RUNTIME[..legacy_start]);
-    runtime.push_str(&PARAMETER_RUNTIME[selected_start..legacy_reference]);
-    runtime.push_str(&PARAMETER_RUNTIME[after_reference..]);
+    runtime.push_str(PARAMETER_RUNTIME);
     Ok(runtime)
 }
 
@@ -723,462 +698,21 @@ pub fn emit_c_source_with_configuration(
     source: &str,
     configuration: EvaluationConfiguration,
 ) -> Result<CEmissionResult, Error> {
-    let _ = crate::resources::ResourceContext::new(
+    let resources = crate::resources::ResourceContext::new(
         configuration.profile,
         configuration.limits,
         configuration.allocation_failure,
     )?;
-    let program = parse(source)?;
-    validate_parameter_declarations(&program)?;
-    resolve_names(&program)?;
-    if program_contains_tuple(&program) {
-        let first = first_tuple_location(&program).unwrap_or_else(crate::SourceLocation::start);
-        crate::resources::ResourceContext::new(
-            configuration.profile,
-            configuration.limits,
-            configuration.allocation_failure,
-        )?
-        .require_tuple_profile(first)?;
+    let parsed = parse(source)?;
+    validate_parameter_declarations(&parsed)?;
+    resolve_names(&parsed)?;
+    if program_contains_tuple(&parsed) {
+        let first = first_tuple_location(&parsed).unwrap_or_else(crate::SourceLocation::start);
+        resources.require_tuple_profile(first)?;
     }
-    let _ = analyze(&program)?;
-    if program.parameters.is_empty() {
-        return match evaluate_source_with_configuration(source, configuration) {
-            Ok(result) => emit_constant_program(&result),
-            Err(error)
-                if matches!(
-                    error.kind,
-                    ErrorKind::DomainError | ErrorKind::ResourceError | ErrorKind::ShapeMismatch
-                ) =>
-            {
-                Ok(CEmissionResult {
-                    source: runtime_failure_program(&error),
-                })
-            }
-            Err(error) => Err(error),
-        };
-    }
-    emit_parameterized_program(&program, configuration)
-}
-
-fn emit_constant_program(result: &ProgramResult) -> Result<CEmissionResult, Error> {
-    let mut output = String::new();
-    for value in &result.values {
-        output.push_str(&format_value(value)?);
-        output.push('\n');
-    }
-    Ok(CEmissionResult {
-        source: format!(
-            "/* Generated by Faraweave 0.1.0. Strict C11; no runtime required. */\n\
-             #include <stdio.h>\n\
-             #ifdef _WIN32\n\
-             #include <fcntl.h>\n\
-             #include <io.h>\n\
-             #endif\n\
-             int main(int argc, char **argv) {{\n\
-             \x20 (void)argv;\n\
-             #ifdef _WIN32\n\
-             \x20 if (_setmode(_fileno(stdout), _O_BINARY) == -1 || _setmode(_fileno(stderr), _O_BINARY) == -1) return 1;\n\
-             #endif\n\
-             \x20 if (setvbuf(stdout, NULL, _IONBF, 0) != 0) return 1;\n\
-             \x20 if (argc != 1) {{\n\
-             \x20   (void)fprintf(stderr, \"faraweave_argument_error reason=extra required_count=0 supplied_count=%d position=1 parameter_name=- expected_type=- declaration_span=- actual_container=- actual_type=- invalid_value_invariant=-\\n\", argc - 1);\n\
-             \x20   return 1;\n\
-             \x20 }}\n\
-             \x20 static const char output[] = {literal};\n\
-             \x20 const size_t size = sizeof(output) - 1U;\n\
-             \x20 if (size != 0U) {{ const size_t accepted = fwrite(output, 1U, size, stdout);\n\
-             \x20   if (accepted != size) {{ (void)fprintf(stderr, \"faraweave_output_error reason=write_failed pending_byte_count=%zu accepted_byte_count=%zu output_position=%zu\\n\", size, accepted, accepted); return 1; }}\n\
-             \x20 }}\n\
-             \x20 if (fflush(stdout) != 0) {{\n\
-             \x20   (void)fprintf(stderr, \"faraweave_output_error reason=flush_failed pending_byte_count=%zu accepted_byte_count=%zu output_position=%zu\\n\", size, size, size); return 1;\n\
-             \x20 }}\n\
-             \x20 return 0;\n\
-             }}\n",
-            literal = c_string(&output)
-        ),
-    })
-}
-
-fn runtime_failure_program(error: &Error) -> String {
-    let diagnostic = format!(
-        "<generated>:{}:{}: {}: {}\n",
-        error.location.line,
-        error.location.column,
-        error.kind.diagnostic_name(),
-        error.message
-    );
-    format!(
-        "/* Generated by Faraweave 0.1.0. Strict C11; no runtime required. */\n\
-         #include <stdio.h>\n\
-         #ifdef _WIN32\n\
-         #include <fcntl.h>\n\
-         #include <io.h>\n\
-         #endif\n\
-         int main(int argc, char **argv) {{\n\
-         \x20 (void)argv;\n\
-         #ifdef _WIN32\n\
-         \x20 if (_setmode(_fileno(stdout), _O_BINARY) == -1 || _setmode(_fileno(stderr), _O_BINARY) == -1) return 1;\n\
-         #endif\n\
-         \x20 if (argc != 1) {{\n\
-         \x20   (void)fprintf(stderr, \"faraweave_argument_error reason=extra required_count=0 supplied_count=%d position=1 parameter_name=- expected_type=- declaration_span=- actual_container=- actual_type=- invalid_value_invariant=-\\n\", argc - 1);\n\
-         \x20   return 1;\n\
-         \x20 }}\n\
-         \x20 (void)fputs({}, stderr);\n\
-         \x20 return 1;\n\
-         }}\n",
-        c_string(&diagnostic)
-    )
-}
-
-struct CGenerator {
-    definitions: String,
-    next_id: usize,
-    parameter_types: Vec<ScalarType>,
-}
-
-fn emit_parameterized_program(
-    program: &Program,
-    configuration: EvaluationConfiguration,
-) -> Result<CEmissionResult, Error> {
-    let mut generator = CGenerator {
-        definitions: String::new(),
-        next_id: 0,
-        parameter_types: program
-            .parameters
-            .iter()
-            .map(|parameter| parameter.scalar_type)
-            .collect(),
-    };
-    let root_ids: Vec<usize> = program
-        .roots
-        .iter()
-        .map(|root| generator.emit_expr(root, None))
-        .collect::<Result<_, _>>()?;
-    let mut source = String::from(PARAMETER_RUNTIME);
-    source.push_str("\nFWV fw_parameters[");
-    writeln!(source, "{}];", program.parameters.len().max(1)).map_err(|_| emission_error())?;
-    source.push_str("const int fw_parameter_types[] = {");
-    for parameter in &program.parameters {
-        write!(
-            source,
-            "{},",
-            match parameter.scalar_type {
-                ScalarType::Bool => 0,
-                ScalarType::Int => 1,
-                ScalarType::Double => 2,
-            }
-        )
-        .map_err(|_| emission_error())?;
-    }
-    source.push_str("0};\nconst char *const fw_parameter_names[] = {");
-    for parameter in &program.parameters {
-        write!(source, "{},", c_string(&parameter.name)).map_err(|_| emission_error())?;
-    }
-    source.push_str("\"\"};\nconst size_t fw_parameter_spans[][6] = {");
-    for parameter in &program.parameters {
-        write!(
-            source,
-            "{{{}U,{}U,{}U,{}U,{}U,{}U}},",
-            parameter.span.begin.offset,
-            parameter.span.begin.line,
-            parameter.span.begin.column,
-            parameter.span.end.offset,
-            parameter.span.end.line,
-            parameter.span.end.column
-        )
-        .map_err(|_| emission_error())?;
-    }
-    source.push_str("{0U,0U,0U,0U,0U,0U}};\n");
-    source.push_str(&generator.definitions);
-    writeln!(
-        source,
-        "const size_t fw_required = {}U;",
-        program.parameters.len()
-    )
-    .map_err(|_| emission_error())?;
-    writeln!(
-        source,
-        "const int fw_profile = {};\n\
-         const int fw_has_vector_limit = {};\n\
-         const size_t fw_vector_limit = {}U;\n\
-         const int fw_has_tuple_limit = {};\n\
-         const size_t fw_tuple_limit = {}U;\n\
-         const int fw_has_live_limit = {};\n\
-         const size_t fw_live_limit = {}U;\n\
-         const int fw_has_work_limit = {};\n\
-         const size_t fw_work_limit = {}U;\n\
-         const int fw_has_failure_ordinal = {};\n\
-         const size_t fw_failure_ordinal = {}U;",
-        match configuration.profile {
-            crate::ExecutionProfile::TrustedLocalV1 => 0,
-            crate::ExecutionProfile::BoundedV1 => 1,
-            crate::ExecutionProfile::TrustedLocalV2 => 2,
-            crate::ExecutionProfile::BoundedV2 => 3,
-        },
-        i32::from(configuration.limits.max_vector_bytes.is_some()),
-        configuration.limits.max_vector_bytes.unwrap_or(0),
-        i32::from(configuration.limits.max_tuple_table_bytes.is_some()),
-        configuration.limits.max_tuple_table_bytes.unwrap_or(0),
-        i32::from(configuration.limits.max_live_evaluation_bytes.is_some()),
-        configuration.limits.max_live_evaluation_bytes.unwrap_or(0),
-        i32::from(configuration.limits.max_work_units.is_some()),
-        configuration.limits.max_work_units.unwrap_or(0),
-        i32::from(configuration.allocation_failure.fail_at_ordinal.is_some()),
-        configuration
-            .allocation_failure
-            .fail_at_ordinal
-            .unwrap_or(0),
-    )
-    .map_err(|_| emission_error())?;
-    source.push_str("static const FWExpr fw_roots[] = {");
-    for id in &root_ids {
-        write!(source, "fw_expr_{id},").map_err(|_| emission_error())?;
-    }
-    source.push_str("NULL};\n");
-    writeln!(
-        source,
-        "int main(int argc, char **argv) {{ return fw_main(argc, argv, {}U, fw_roots); }}",
-        root_ids.len()
-    )
-    .map_err(|_| emission_error())?;
-    Ok(CEmissionResult { source })
-}
-
-impl CGenerator {
-    fn emit_expr(
-        &mut self,
-        expression: &Expr,
-        placeholder_type: Option<&Type>,
-    ) -> Result<usize, Error> {
-        let child_ids = match &expression.kind {
-            ExprKind::Tuple(elements) => elements
-                .iter()
-                .map(|element| self.emit_expr(element, placeholder_type))
-                .collect::<Result<Vec<_>, _>>()?,
-            ExprKind::Call { arguments, .. } => arguments
-                .iter()
-                .map(|argument| self.emit_expr(argument, placeholder_type))
-                .collect::<Result<Vec<_>, _>>()?,
-            ExprKind::Fanout { operand, branches } => {
-                let operand_type =
-                    static_expression_type(operand, &self.parameter_types, placeholder_type)?;
-                let mut ids = vec![self.emit_expr(operand, placeholder_type)?];
-                for branch in branches {
-                    ids.push(self.emit_expr(branch, Some(&operand_type))?);
-                }
-                ids
-            }
-            ExprKind::Literal(_)
-            | ExprKind::Vector(_, _)
-            | ExprKind::DeepTuple { .. }
-            | ExprKind::UnaryChain { .. }
-            | ExprKind::Parameter(_)
-            | ExprKind::UnresolvedName { .. }
-            | ExprKind::Placeholder => Vec::new(),
-        };
-        let id = self.next_id;
-        self.next_id += 1;
-        writeln!(
-            self.definitions,
-            "static int fw_expr_{id}(const FWV *hole, FWV *out) {{"
-        )
-        .map_err(|_| emission_error())?;
-        match &expression.kind {
-            ExprKind::Literal(value) => self.emit_literal(value)?,
-            ExprKind::Vector(element_type, elements) => {
-                writeln!(
-                    self.definitions,
-                    "  (void)hole; if (!fw_make_vector(out, {}, {}U, 0U, \"vector_literal\", {}U, {}U)) return 0;",
-                    scalar_tag(*element_type),
-                    elements.len(),
-                    expression.span.begin.line,
-                    expression.span.begin.column
-                )
-                .map_err(|_| emission_error())?;
-                for (index, value) in elements.iter().enumerate() {
-                    writeln!(self.definitions, "  {};", vector_assignment(value, index)?)
-                        .map_err(|_| emission_error())?;
-                }
-                self.definitions.push_str("  return 1;\n");
-            }
-            ExprKind::DeepTuple { .. } => return Err(emission_error()),
-            ExprKind::UnaryChain { .. } => return Err(emission_error()),
-            ExprKind::Tuple(elements) => {
-                writeln!(
-                    self.definitions,
-                    "  if (!fw_make_tuple(out, {}U, \"tuple_literal\", {}U, {}U)) return 0;",
-                    elements.len(),
-                    expression.span.begin.line,
-                    expression.span.begin.column
-                )
-                .map_err(|_| emission_error())?;
-                for (index, child) in child_ids.iter().enumerate() {
-                    writeln!(
-                        self.definitions,
-                        "  if (!fw_expr_{child}(hole, &out->items[{index}U])) {{ fw_free(out); return 0; }}"
-                    )
-                    .map_err(|_| emission_error())?;
-                }
-                self.definitions.push_str("  return 1;\n");
-            }
-            ExprKind::Parameter(index) => {
-                writeln!(
-                    self.definitions,
-                    "  (void)hole; return fw_borrow(&fw_parameters[{index}U], out);"
-                )
-                .map_err(|_| emission_error())?;
-            }
-            ExprKind::Placeholder => {
-                self.definitions
-                    .push_str("  if (hole == NULL) return fw_fail(\"ValueError\", \"missing fanout placeholder\", 0U, 0U); return fw_borrow(hole, out);\n");
-            }
-            ExprKind::UnresolvedName { name, name_span } => {
-                return Err(Error::at_span(
-                    ErrorKind::UnknownPrimitive,
-                    *name_span,
-                    format!("unknown primitive '{name}'"),
-                ));
-            }
-            ExprKind::Call {
-                name,
-                syntax,
-                arguments,
-                ..
-            } => {
-                let count = arguments.len();
-                let result_type =
-                    static_expression_type(expression, &self.parameter_types, placeholder_type)?;
-                let result_scalar = match result_type {
-                    Type::Scalar(scalar) | Type::Vector(scalar) => scalar_tag(scalar),
-                    Type::Tuple(_) | Type::RepeatedTuple { .. } => return Err(emission_error()),
-                };
-                let metadata = emitted_semantic_metadata(*syntax, arguments);
-                let anchor = metadata
-                    .iter()
-                    .position(|(_, length)| length.is_some())
-                    .map_or("SIZE_MAX".to_owned(), |position| format!("{position}U"));
-                writeln!(
-                    self.definitions,
-                    "  FWV args[{}U]; size_t initialized = 0U; int ok;",
-                    count.max(1)
-                )
-                .map_err(|_| emission_error())?;
-                self.definitions
-                    .push_str("  (void)memset(args, 0, sizeof(args));\n");
-                write!(
-                    self.definitions,
-                    "  const size_t origins[{}U][2] = {{",
-                    metadata.len().max(1)
-                )
-                .map_err(|_| emission_error())?;
-                for (location, _) in &metadata {
-                    write!(
-                        self.definitions,
-                        "{{{}U,{}U}},",
-                        location.line, location.column
-                    )
-                    .map_err(|_| emission_error())?;
-                }
-                if metadata.is_empty() {
-                    self.definitions.push_str("{0U,0U}");
-                }
-                self.definitions.push_str("};\n");
-                for (index, child) in child_ids.iter().enumerate() {
-                    writeln!(
-                        self.definitions,
-                        "  if (!fw_expr_{child}(hole, &args[{index}U])) goto cleanup;\n  initialized = {next}U;",
-                        next = index + 1
-                    )
-                    .map_err(|_| emission_error())?;
-                }
-                if *syntax == CallSyntax::Prefix && count == 1 {
-                    writeln!(
-                        self.definitions,
-                        "  if (args[0].kind == 2) ok = fw_apply({}, {}, args[0].items, args[0].len, out, {}U, {}U, origins, {}U, {}); else ok = fw_apply({}, {}, args, 1U, out, {}U, {}U, origins, {}U, {});",
-                        primitive_tag(name)?,
-                        result_scalar,
-                        expression.span.begin.line,
-                        expression.span.begin.column,
-                        metadata.len(),
-                        anchor,
-                        primitive_tag(name)?,
-                        result_scalar,
-                        expression.span.begin.line,
-                        expression.span.begin.column,
-                        metadata.len(),
-                        anchor
-                    )
-                    .map_err(|_| emission_error())?;
-                } else {
-                    writeln!(
-                        self.definitions,
-                        "  ok = fw_apply({}, {}, args, {}U, out, {}U, {}U, origins, {}U, {});",
-                        primitive_tag(name)?,
-                        result_scalar,
-                        count,
-                        expression.span.begin.line,
-                        expression.span.begin.column,
-                        metadata.len(),
-                        anchor
-                    )
-                    .map_err(|_| emission_error())?;
-                }
-                self.definitions.push_str(
-                    "  while (initialized != 0U) fw_free(&args[--initialized]);\n  return ok;\ncleanup:\n  while (initialized != 0U) fw_free(&args[--initialized]);\n  return 0;\n",
-                );
-            }
-            ExprKind::Fanout { branches, .. } => {
-                let operand_id = child_ids[0];
-                writeln!(
-                    self.definitions,
-                    "  FWV operand = {{0}}; size_t initialized = 0U;\n  if (!fw_expr_{operand_id}(hole, &operand)) return 0;\n  if (!fw_make_tuple(out, {}U, \"fanout\", {}U, {}U)) {{ fw_free(&operand); return 0; }}",
-                    branches.len(),
-                    expression.span.begin.line,
-                    expression.span.begin.column
-                )
-                .map_err(|_| emission_error())?;
-                for (index, child) in child_ids.iter().skip(1).enumerate() {
-                    writeln!(
-                        self.definitions,
-                        "  if (!fw_expr_{child}(&operand, &out->items[{index}U])) goto fanout_cleanup;\n  initialized = {next}U;",
-                        next = index + 1
-                    )
-                    .map_err(|_| emission_error())?;
-                }
-                self.definitions.push_str(
-                    "  (void)initialized; fw_free(&operand); return 1;\nfanout_cleanup:\n  (void)initialized; fw_free(out); fw_free(&operand); return 0;\n",
-                );
-            }
-        }
-        self.definitions.push_str("}\n");
-        Ok(id)
-    }
-
-    fn emit_literal(&mut self, value: &Value) -> Result<(), Error> {
-        self.definitions.push_str("  (void)hole; ");
-        match value {
-            Value::Bool(value) => writeln!(
-                self.definitions,
-                "fw_set_bool(out, {}); return 1;",
-                i32::from(*value)
-            ),
-            Value::Int(value) => writeln!(
-                self.definitions,
-                "fw_set_int(out, {}); return 1;",
-                c_int64(*value)
-            ),
-            Value::Double(value) => writeln!(
-                self.definitions,
-                "fw_set_double(out, fw_double_from_bits(UINT64_C(0x{:016x}))); return 1;",
-                value.to_bits()
-            ),
-            Value::BoolVector(_)
-            | Value::IntVector(_)
-            | Value::DoubleVector(_)
-            | Value::Tuple(_) => return Err(emission_error()),
-        }
-        .map_err(|_| emission_error())
-    }
+    let program = compile_parsed_source(source, &parsed)
+        .map_err(crate::lowering::CompileError::into_evaluation_error)?;
+    emit_verified_c_program(&program, configuration)
 }
 
 const fn scalar_tag(scalar: ScalarType) -> i32 {
@@ -1186,223 +720,6 @@ const fn scalar_tag(scalar: ScalarType) -> i32 {
         ScalarType::Bool => 0,
         ScalarType::Int => 1,
         ScalarType::Double => 2,
-    }
-}
-
-fn primitive_tag(name: &str) -> Result<i32, Error> {
-    // TODO(#9): remove this legacy C-emitter-local name/tag mapping during the
-    // C/native VerifiedProgram cutover; it is intentionally not a semantic ID.
-    match name {
-        "inc" => Ok(0),
-        "dec" => Ok(1),
-        "neg" => Ok(2),
-        "abs" => Ok(3),
-        "add" => Ok(4),
-        "sub" => Ok(5),
-        "mul" => Ok(6),
-        "equals" => Ok(7),
-        "not_equals" => Ok(8),
-        "not" => Ok(9),
-        "and" => Ok(10),
-        "or" => Ok(11),
-        "odd" => Ok(12),
-        "even" => Ok(13),
-        "is_positive" => Ok(14),
-        "is_negative" => Ok(15),
-        "less_than" => Ok(16),
-        "greater_than" => Ok(17),
-        "iota" => Ok(18),
-        _ => Err(emission_error()),
-    }
-}
-
-fn vector_assignment(value: &Value, index: usize) -> Result<String, Error> {
-    match value {
-        Value::Bool(value) => Ok(format!(
-            "((unsigned char *)out->data)[{index}U] = {}U",
-            u8::from(*value)
-        )),
-        Value::Int(value) => Ok(format!(
-            "((int64_t *)out->data)[{index}U] = {}",
-            c_int64(*value)
-        )),
-        Value::Double(value) => Ok(format!(
-            "((double *)out->data)[{index}U] = fw_double_from_bits(UINT64_C(0x{:016x}))",
-            value.to_bits()
-        )),
-        Value::BoolVector(_) | Value::IntVector(_) | Value::DoubleVector(_) | Value::Tuple(_) => {
-            Err(emission_error())
-        }
-    }
-}
-
-fn emitted_semantic_metadata(
-    syntax: CallSyntax,
-    arguments: &[Expr],
-) -> Vec<(crate::SourceLocation, Option<usize>)> {
-    let semantic: &[Expr] = if syntax == CallSyntax::Prefix && arguments.len() == 1 {
-        match &arguments[0].kind {
-            ExprKind::Tuple(elements) => elements,
-            ExprKind::Fanout { branches, .. } => branches,
-            _ => arguments,
-        }
-    } else {
-        arguments
-    };
-    semantic
-        .iter()
-        .map(|expression| (expression.span.begin, known_vector_length(expression)))
-        .collect()
-}
-
-fn static_expression_type(
-    expression: &Expr,
-    parameters: &[ScalarType],
-    placeholder: Option<&Type>,
-) -> Result<Type, Error> {
-    match &expression.kind {
-        ExprKind::Literal(value) => Ok(value.value_type()),
-        ExprKind::Vector(scalar, _) => Ok(Type::Vector(*scalar)),
-        ExprKind::Tuple(elements) => elements
-            .iter()
-            .map(|element| static_expression_type(element, parameters, placeholder))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Type::Tuple),
-        ExprKind::DeepTuple { depth, leaf } => Ok(Type::RepeatedTuple {
-            depth: *depth,
-            leaf: leaf.scalar_type().ok_or_else(emission_error)?,
-        }),
-        ExprKind::UnaryChain { leaf, steps, .. } => {
-            let mut current = leaf.value_type();
-            for step in steps {
-                if step.name == "iota" {
-                    current = Type::Vector(ScalarType::Int);
-                    continue;
-                }
-                let scalar = if matches!(
-                    step.name.as_str(),
-                    "equals"
-                        | "not_equals"
-                        | "not"
-                        | "and"
-                        | "or"
-                        | "odd"
-                        | "even"
-                        | "is_positive"
-                        | "is_negative"
-                        | "less_than"
-                        | "greater_than"
-                ) {
-                    ScalarType::Bool
-                } else if matches!(
-                    current,
-                    Type::Scalar(ScalarType::Double) | Type::Vector(ScalarType::Double)
-                ) {
-                    ScalarType::Double
-                } else {
-                    ScalarType::Int
-                };
-                current = if matches!(current, Type::Vector(_)) {
-                    Type::Vector(scalar)
-                } else {
-                    Type::Scalar(scalar)
-                };
-            }
-            Ok(current)
-        }
-        ExprKind::Parameter(index) => parameters
-            .get(*index)
-            .copied()
-            .map(Type::Scalar)
-            .ok_or_else(emission_error),
-        ExprKind::Placeholder => placeholder.cloned().ok_or_else(emission_error),
-        ExprKind::UnresolvedName { .. } => Err(emission_error()),
-        ExprKind::Fanout { operand, branches } => {
-            let operand_type = static_expression_type(operand, parameters, placeholder)?;
-            branches
-                .iter()
-                .map(|branch| static_expression_type(branch, parameters, Some(&operand_type)))
-                .collect::<Result<Vec<_>, _>>()
-                .map(Type::Tuple)
-        }
-        ExprKind::Call {
-            name,
-            syntax,
-            arguments,
-            ..
-        } => {
-            let argument_types = arguments
-                .iter()
-                .map(|argument| static_expression_type(argument, parameters, placeholder))
-                .collect::<Result<Vec<_>, _>>()?;
-            let semantic = if *syntax == CallSyntax::Prefix
-                && argument_types.len() == 1
-                && let Type::Tuple(elements) = &argument_types[0]
-            {
-                elements.as_slice()
-            } else {
-                argument_types.as_slice()
-            };
-            if name == "iota" {
-                return Ok(Type::Vector(ScalarType::Int));
-            }
-            let scalar = if matches!(
-                name.as_str(),
-                "equals"
-                    | "not_equals"
-                    | "not"
-                    | "and"
-                    | "or"
-                    | "odd"
-                    | "even"
-                    | "is_positive"
-                    | "is_negative"
-                    | "less_than"
-                    | "greater_than"
-            ) {
-                ScalarType::Bool
-            } else if semantic.iter().any(|value_type| {
-                matches!(
-                    value_type,
-                    Type::Scalar(ScalarType::Double) | Type::Vector(ScalarType::Double)
-                )
-            }) {
-                ScalarType::Double
-            } else {
-                ScalarType::Int
-            };
-            if semantic
-                .iter()
-                .any(|value_type| matches!(value_type, Type::Vector(_)))
-            {
-                Ok(Type::Vector(scalar))
-            } else {
-                Ok(Type::Scalar(scalar))
-            }
-        }
-    }
-}
-
-fn known_vector_length(expression: &Expr) -> Option<usize> {
-    match &expression.kind {
-        ExprKind::Vector(_, elements) => Some(elements.len()),
-        ExprKind::Call {
-            name,
-            syntax,
-            arguments,
-            ..
-        } if name != "iota" => emitted_semantic_metadata(*syntax, arguments)
-            .into_iter()
-            .find_map(|(_, length)| length),
-        ExprKind::Literal(_)
-        | ExprKind::Parameter(_)
-        | ExprKind::DeepTuple { .. }
-        | ExprKind::UnaryChain { .. }
-        | ExprKind::UnresolvedName { .. }
-        | ExprKind::Placeholder
-        | ExprKind::Tuple(_)
-        | ExprKind::Fanout { .. }
-        | ExprKind::Call { .. } => None,
     }
 }
 
@@ -1751,121 +1068,6 @@ static int fw_put_scalar(FWV *value, size_t index, FWV scalar) {
 static double fw_as_double(FWV value) {
   return value.type == 2 ? value.d : fw_int_to_double(value.i);
 }
-enum {
-  FW_INC,FW_DEC,FW_NEG,FW_ABS,FW_ADD,FW_SUB,FW_MUL,FW_EQUALS,FW_NOT_EQUALS,
-  FW_NOT,FW_AND,FW_OR,FW_ODD,FW_EVEN,FW_IS_POSITIVE,FW_IS_NEGATIVE,
-  FW_LESS_THAN,FW_GREATER_THAN,FW_IOTA
-};
-static const char *fw_primitive_name(int primitive) {
-  static const char *const names[]={
-    "inc","dec","neg","abs","add","sub","mul","equals","not_equals","not",
-    "and","or","odd","even","is_positive","is_negative","less_than",
-    "greater_than","iota"
-  };
-  return primitive>=FW_INC&&primitive<=FW_IOTA?names[primitive]:"invalid";
-}
-static int fw_apply_scalar(int primitive, const FWV *args, size_t count, int result_type,
-                           FWV *out, size_t line, size_t column, size_t index,
-                           int vector_result) {
-  const char *name=fw_primitive_name(primitive);
-  int64_t a, b; double x, y;
-  if (primitive==FW_NOT) { fw_set_bool(out, !args[0].b); return 1; }
-  if (primitive==FW_AND) { fw_set_bool(out, args[0].b && args[1].b); return 1; }
-  if (primitive==FW_OR) { fw_set_bool(out, args[0].b || args[1].b); return 1; }
-  if (primitive==FW_ODD) { fw_set_bool(out, args[0].i % 2 != 0); return 1; }
-  if (primitive==FW_EVEN) { fw_set_bool(out, args[0].i % 2 == 0); return 1; }
-  if (result_type == 1) {
-    a = args[0].i; b = count > 1U ? args[1].i : 0;
-    if (primitive==FW_INC) { if (a == INT64_MAX) goto overflow; fw_set_int(out, a + 1); return 1; }
-    if (primitive==FW_DEC) { if (a == INT64_MIN) goto overflow; fw_set_int(out, a - 1); return 1; }
-    if (primitive==FW_NEG) { if (a == INT64_MIN) goto overflow; fw_set_int(out, -a); return 1; }
-    if (primitive==FW_ABS) { if (a == INT64_MIN) goto overflow; fw_set_int(out, a < 0 ? -a : a); return 1; }
-    if (primitive==FW_ADD) { if ((b > 0 && a > INT64_MAX-b)||(b < 0 && a < INT64_MIN-b)) goto overflow; fw_set_int(out,a+b); return 1; }
-    if (primitive==FW_SUB) { if ((b < 0 && a > INT64_MAX+b)||(b > 0 && a < INT64_MIN+b)) goto overflow; fw_set_int(out,a-b); return 1; }
-    if (primitive==FW_MUL) {
-      if (a != 0 && ((a == -1 && b == INT64_MIN) || (b == -1 && a == INT64_MIN) ||
-          (a > 0 && ((b > 0 && a > INT64_MAX/b)||(b < 0 && b < INT64_MIN/a))) ||
-          (a < 0 && ((b > 0 && a < INT64_MIN/b)||(b < 0 && a < INT64_MAX/b))))) goto overflow;
-      fw_set_int(out,a*b); return 1;
-    }
-  }
-  if (result_type == 2) {
-    x = fw_as_double(args[0]); y = count > 1U ? fw_as_double(args[1]) : 0.0;
-    if (primitive==FW_INC) { fw_set_double(out,fw_double_arithmetic(x,1.0,FW_DOUBLE_ADD)); return 1; }
-    if (primitive==FW_DEC) { fw_set_double(out,fw_double_arithmetic(x,1.0,FW_DOUBLE_SUB)); return 1; }
-    if (primitive==FW_NEG) { fw_set_double(out,fw_double_from_bits(fw_double_bits(x)^UINT64_C(0x8000000000000000))); return 1; }
-    if (primitive==FW_ABS) { fw_set_double(out,fw_double_from_bits(fw_double_bits(x)&UINT64_C(0x7fffffffffffffff))); return 1; }
-    if (primitive==FW_ADD) { fw_set_double(out,fw_double_arithmetic(x,y,FW_DOUBLE_ADD)); return 1; }
-    if (primitive==FW_SUB) { fw_set_double(out,fw_double_arithmetic(x,y,FW_DOUBLE_SUB)); return 1; }
-    if (primitive==FW_MUL) { fw_set_double(out,fw_double_arithmetic(x,y,FW_DOUBLE_MUL)); return 1; }
-  }
-  if (primitive==FW_EQUALS || primitive==FW_NOT_EQUALS) {
-    int equal;
-    if(args[0].type==0)equal=args[0].b==args[1].b;
-    else if(args[0].type==1&&args[1].type==1)equal=args[0].i==args[1].i;
-    else equal=fw_double_equal(fw_as_double(args[0]),fw_as_double(args[1]));
-    fw_set_bool(out, primitive==FW_EQUALS ? equal : !equal); return 1;
-  }
-  if (primitive==FW_IS_POSITIVE) { fw_set_bool(out,args[0].type==1?args[0].i>0:
-      !fw_double_is_nan(args[0].d)&&!fw_double_is_zero(args[0].d)&&
-      (fw_double_bits(args[0].d)&UINT64_C(0x8000000000000000))==0U); return 1; }
-  if (primitive==FW_IS_NEGATIVE) { fw_set_bool(out,args[0].type==1?args[0].i<0:
-      !fw_double_is_nan(args[0].d)&&!fw_double_is_zero(args[0].d)&&
-      (fw_double_bits(args[0].d)&UINT64_C(0x8000000000000000))!=0U); return 1; }
-  if (primitive==FW_LESS_THAN || primitive==FW_GREATER_THAN) {
-    int less=args[0].type==1&&args[1].type==1?args[0].i<args[1].i:
-      fw_double_less_than(fw_as_double(args[0]),fw_as_double(args[1]));
-    int greater=args[0].type==1&&args[1].type==1?args[0].i>args[1].i:
-      fw_double_less_than(fw_as_double(args[1]),fw_as_double(args[0]));
-    fw_set_bool(out,primitive==FW_LESS_THAN?less:greater);return 1;
-  }
-  return fw_fail("ValueError","invalid primitive invocation",line,column);
-overflow:
-  if(vector_result){
-    (void)snprintf(fw_error_storage,sizeof(fw_error_storage),
-                   "%s failed: integer_overflow at result index %zu",name,index);
-    return fw_fail("DomainError",fw_error_storage,line,column);
-  }
-  return fw_fail_primitive("DomainError",name,"integer_overflow",line,column);
-}
-static int fw_apply(int primitive, int result_type, const FWV *args, size_t count, FWV *out,
-                    size_t line, size_t column,const size_t (*origins)[2],
-                    size_t origin_count,size_t static_anchor) {
-  const char *name=fw_primitive_name(primitive);
-  size_t i, length = 1U,anchor=SIZE_MAX; int vector = 0;
-  if (primitive==FW_IOTA) {
-    int64_t bound;
-    if (count != 1U || args[0].kind != 0 || args[0].type != 1) return fw_fail("TypeError","iota arguments do not match an accepted signature",line,column);
-    bound = args[0].i; length = bound > 0 ? (size_t)bound : 0U;
-    if (!fw_make_vector(out,1,length,length,name,line,column)) return 0;
-    for (i=0U;i<length;++i) ((int64_t *)out->data)[i]=(int64_t)i+1;
-    return 1;
-  }
-  for (i=0U;i<count;++i) {
-    if (args[i].kind==2) return fw_fail("TypeError","tuple argument is not accepted",line,column);
-    if (args[i].kind==1)vector=1;
-  }
-  if(vector){
-    if(static_anchor<count&&args[static_anchor].kind==1)anchor=static_anchor;
-    else for(i=0U;i<count;++i)if(args[i].kind==1){anchor=i;break;}
-    length=args[anchor].len;
-    for(i=0U;i<count;++i)if(i!=anchor&&args[i].kind==1&&args[i].len!=length){
-      size_t origin_line=i<origin_count?origins[i][0]:line;
-      size_t origin_column=i<origin_count?origins[i][1]:column;
-      return fw_fail_shape(name,i+1U,length,args[i].len,origin_line,origin_column);
-    }
-  }
-  if (vector) { if (!fw_make_vector(out,result_type,length,length,name,line,column)) return 0; }
-  else { (void)memset(out,0,sizeof(*out)); out->type=result_type; }
-  if(!vector&&!fw_charge_work(length,name,line,column))return 0;
-  for (i=0U;i<length;++i) {
-    FWV scalar_args[2]={{0}}; FWV scalar_out={0}; size_t j;
-    for(j=0U;j<count;++j) scalar_args[j]=fw_scalar_at(&args[j],i);
-    if(!fw_apply_scalar(primitive,scalar_args,count,result_type,&scalar_out,line,column,i,vector)) { fw_free(out); return 0; }
-    (void)fw_put_scalar(out,i,scalar_out);
-  }
-  return 1;
-}
 typedef int (*FWSelectedKernel)(const FWV *,FWV *,const char *,size_t,size_t,size_t,int);
 static int fw_selected_integer_overflow(const char *name,size_t line,size_t column,
                                         size_t index,int vector_result) {
@@ -2093,7 +1295,6 @@ static int fw_report_argument(const char *reason,size_t supplied,size_t position
 }
 static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   size_t supplied=argc>0?(size_t)argc-1U:0U,i,initialized=0U;FWV *values=NULL;FWBuffer output={0};int decoded;
-  (void)fw_apply;
   (void)fw_apply_selected;
   (void)fw_apply_selected_iota;
   (void)fw_selected_integer_overflow;
@@ -2213,6 +1414,67 @@ mod ir_tests {
             Err(error) => panic!("second generation failed: {error}"),
         };
         assert_eq!(first.as_bytes(), second.as_bytes());
+    }
+
+    #[test]
+    fn public_emission_uses_the_verified_backend_for_every_parameter_count() {
+        let configuration = EvaluationConfiguration::default();
+        for source in [
+            "inc[1]\n",
+            "inc[9223372036854775807]\n",
+            "parameters[value Int]\ninc[value]\n",
+        ] {
+            let program = match compile_source(source) {
+                Ok(program) => program,
+                Err(error) => panic!("test source did not lower: {error}"),
+            };
+            let expected = match emit_verified_c_program(&program, configuration) {
+                Ok(emission) => emission,
+                Err(error) => panic!("verified program did not emit: {error}"),
+            };
+            let public = match emit_c_source_with_configuration(source, configuration) {
+                Ok(emission) => emission,
+                Err(error) => panic!("public source did not emit: {error}"),
+            };
+            assert_eq!(
+                public.source.as_bytes(),
+                expected.source.as_bytes(),
+                "{source}"
+            );
+            assert!(
+                public
+                    .source
+                    .contains("/* VerifiedProgram-driven definitions. */")
+            );
+        }
+    }
+
+    #[test]
+    fn production_c_emission_has_no_ast_evaluation_or_generic_dispatch_backend() {
+        let production = include_str!("c_emitter.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        for removed in [
+            "struct CGenerator",
+            "emit_parameterized_program(",
+            "emit_constant_program(",
+            "runtime_failure_program(",
+            "static_expression_type(",
+            "known_vector_length(",
+            "primitive_tag(",
+            "evaluate_source_with_configuration(",
+            "static int fw_apply(",
+            "fw_apply_scalar",
+            "FW_INC",
+        ] {
+            assert!(
+                !production.contains(removed),
+                "obsolete backend remains: {removed}"
+            );
+        }
+        assert!(production.contains("compile_parsed_source(source, &parsed)"));
+        assert!(production.contains("emit_verified_c_program(&program, configuration)"));
     }
 
     #[test]
@@ -2367,6 +1629,62 @@ mod ir_tests {
     }
 
     #[cfg(not(windows))]
+    fn assert_public_generated_matches_direct(
+        source: &str,
+        arguments: &[&str],
+        configuration: EvaluationConfiguration,
+    ) {
+        let program = match compile_source(source) {
+            Ok(program) => program,
+            Err(error) => panic!("test source did not lower: {error}"),
+        };
+        let internal = match emit_verified_c_program(&program, configuration) {
+            Ok(emission) => emission.source,
+            Err(error) => panic!("verified program did not emit: {error}"),
+        };
+        let public = match emit_c_source_with_configuration(source, configuration) {
+            Ok(emission) => emission.source,
+            Err(error) => panic!("public source did not emit: {error}"),
+        };
+        assert_eq!(public.as_bytes(), internal.as_bytes(), "{source}");
+
+        let generated = compile_and_run(&public, arguments);
+        let decoded = match crate::interpreter::decode_verified_arguments(&program, arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => panic!("test arguments did not decode: {error}"),
+        };
+        match crate::evaluate_verified_program(&program, &decoded, configuration) {
+            Ok(result) => {
+                let mut expected = String::new();
+                for value in &result.values {
+                    match crate::format_value(value) {
+                        Ok(value) => {
+                            expected.push_str(&value);
+                            expected.push('\n');
+                        }
+                        Err(error) => panic!("direct result did not format: {error}"),
+                    }
+                }
+                assert!(generated.status.success(), "{source}");
+                assert_eq!(generated.stdout, expected.as_bytes(), "{source}");
+                assert!(generated.stderr.is_empty(), "{source}");
+            }
+            Err(error) => {
+                let expected = format!(
+                    "<generated>:{}:{}: {}: {}\n",
+                    error.location.line,
+                    error.location.column,
+                    error.kind.diagnostic_name(),
+                    error.message
+                );
+                assert!(!generated.status.success(), "{source}");
+                assert!(generated.stdout.is_empty(), "{source}");
+                assert_eq!(generated.stderr, expected.as_bytes(), "{source}");
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn verified_generated_c_compiles_strictly_and_executes_success_and_failure_paths() {
         let successful = emit(
@@ -2396,7 +1714,7 @@ mod ir_tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn verified_generated_c_matches_legacy_backend_for_success_and_failure_corpus() {
+    fn public_generated_c_matches_direct_ir_for_success_and_failure_corpus() {
         let configuration = EvaluationConfiguration {
             profile: crate::ExecutionProfile::TrustedLocalV2,
             ..EvaluationConfiguration::default()
@@ -2411,20 +1729,7 @@ mod ir_tests {
             ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
         ];
         for (source, arguments) in corpus {
-            let verified =
-                compile_and_run(&emit_with_configuration(source, configuration), arguments);
-            let legacy_source = match emit_c_source_with_configuration(source, configuration) {
-                Ok(emission) => emission.source,
-                Err(error) => panic!("legacy generator failed: {error}"),
-            };
-            let legacy = compile_and_run_with_diagnostics(&legacy_source, arguments, false);
-            assert_eq!(
-                verified.status.success(),
-                legacy.status.success(),
-                "{source}"
-            );
-            assert_eq!(verified.stdout, legacy.stdout, "{source}");
-            assert_eq!(verified.stderr, legacy.stderr, "{source}");
+            assert_public_generated_matches_direct(source, arguments, configuration);
         }
 
         let resource_configuration = EvaluationConfiguration {
@@ -2436,24 +1741,12 @@ mod ir_tests {
             ..EvaluationConfiguration::default()
         };
         let source = "parameters[n Int]\n1\niota[n]\n";
-        let verified = compile_and_run(
-            &emit_with_configuration(source, resource_configuration),
-            &["3"],
-        );
-        let legacy_source = match emit_c_source_with_configuration(source, resource_configuration) {
-            Ok(emission) => emission.source,
-            Err(error) => panic!("legacy resource generator failed: {error}"),
-        };
-        let legacy = compile_and_run_with_diagnostics(&legacy_source, &["3"], false);
-        assert!(!verified.status.success());
-        assert!(verified.stdout.is_empty());
-        assert_eq!(verified.stdout, legacy.stdout);
-        assert_eq!(verified.stderr, legacy.stderr);
+        assert_public_generated_matches_direct(source, &["3"], resource_configuration);
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn tuple_resource_and_fault_order_matches_legacy_backend() {
+    fn tuple_resource_and_fault_order_matches_direct_ir() {
         let source = "[iota[3] iota[2]]\n";
         let configurations = [
             EvaluationConfiguration {
@@ -2526,21 +1819,13 @@ mod ir_tests {
             },
         ];
         for configuration in configurations {
-            let verified = compile_and_run(&emit_with_configuration(source, configuration), &[]);
-            let legacy_source = match emit_c_source_with_configuration(source, configuration) {
-                Ok(emission) => emission.source,
-                Err(error) => panic!("legacy tuple generator failed: {error}"),
-            };
-            let legacy = compile_and_run_with_diagnostics(&legacy_source, &[], false);
-            assert_eq!(verified.status.success(), legacy.status.success());
-            assert_eq!(verified.stdout, legacy.stdout);
-            assert_eq!(verified.stderr, legacy.stderr);
+            assert_public_generated_matches_direct(source, &[], configuration);
         }
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn all_direct_selected_kernels_compile_strictly_and_match_legacy_results() {
+    fn all_direct_selected_kernels_compile_strictly_and_match_direct_ir() {
         let source = "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
              abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
              mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
@@ -2549,14 +1834,6 @@ mod ir_tests {
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n";
         let configuration = EvaluationConfiguration::default();
-        let verified = compile_and_run(&emit_with_configuration(source, configuration), &[]);
-        let legacy_source = match emit_c_source_with_configuration(source, configuration) {
-            Ok(emission) => emission.source,
-            Err(error) => panic!("legacy all-kernel generator failed: {error}"),
-        };
-        let legacy = compile_and_run_with_diagnostics(&legacy_source, &[], false);
-        assert!(verified.status.success());
-        assert_eq!(verified.stdout, legacy.stdout);
-        assert_eq!(verified.stderr, legacy.stderr);
+        assert_public_generated_matches_direct(source, &[], configuration);
     }
 }
