@@ -1924,6 +1924,7 @@ struct FanOutContextVisits {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct NestedFanOutVisits {
     nodes: u64,
+    region_nodes: u64,
     branches: u64,
 }
 
@@ -1935,7 +1936,6 @@ fn verify_no_nested_fan_out_with_visits(
     program: &RawProgram,
     visits: &mut NestedFanOutVisits,
 ) -> Result<(), VerifyError> {
-    let mut previous_fan_out = None;
     for (node_index, node) in program.nodes.iter().copied().enumerate() {
         visits.nodes = visits.nodes.saturating_add(1);
         let NodeKind::FanOut { branches, .. } = node.kind else {
@@ -1959,9 +1959,18 @@ fn verify_no_nested_fan_out_with_visits(
                     "fan_out.operand",
                 )
             })?;
-        if let Some(nested) = previous_fan_out
-            && nested >= operand
+        let mut nested = None;
+        for (offset, candidate) in program.nodes[operand as usize..node_index]
+            .iter()
+            .enumerate()
         {
+            visits.region_nodes = visits.region_nodes.saturating_add(1);
+            if matches!(candidate.kind, NodeKind::FanOut { .. }) {
+                nested = Some(operand.saturating_add(offset as u32));
+                break;
+            }
+        }
+        if let Some(nested) = nested {
             let branch_bounds = range_bounds(
                 branches,
                 program.branches.len(),
@@ -1991,7 +2000,6 @@ fn verify_no_nested_fan_out_with_visits(
                 "nested_fan_out",
             ));
         }
-        previous_fan_out = Some(node_index as u32);
     }
     Ok(())
 }
@@ -3295,6 +3303,330 @@ mod tests {
         must(builder.finish())
     }
 
+    fn push_test_inc(
+        builder: &mut RawProgramBuilder,
+        producer: NodeIndex,
+        access: ValueAccess,
+        ownership: OwnershipMode,
+        int_type: TypeIndex,
+        origin: OriginIndex,
+    ) -> NodeIndex {
+        let edge_start = builder.raw.edges.len() as u32;
+        must(builder.push_edge(Edge {
+            producer,
+            argument_position: 1,
+            access,
+            cardinality: Some(Cardinality::StaticScalar),
+            conversion: Conversion::Identity,
+            ownership,
+            origin,
+        }));
+        must(builder.push_node(Node {
+            kind: NodeKind::SelectedApply {
+                primitive_id: 1,
+                signature_id: 1,
+                implementation_id: 1,
+                primitive_origin: origin,
+                lift: LiftMode::Scalar,
+                result_element_type: ScalarType::Int,
+                shape: ShapePlan {
+                    static_anchor: None,
+                    dynamic_checks: IndexRange::default(),
+                },
+            },
+            result_type: int_type,
+            cardinality: Some(Cardinality::StaticScalar),
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin,
+        }))
+    }
+
+    fn two_branch_nested_fan_out_program() -> RawProgram {
+        let mut builder = RawProgramBuilder::new();
+        for feature in [
+            Feature::StableSemanticIds,
+            Feature::Tuples,
+            Feature::PrefixSpread,
+            Feature::FanOut,
+        ] {
+            must(builder.push_feature(feature.numeric()));
+        }
+        let origin = source_fixture(&mut builder);
+        let int_type = must(builder.push_type(TypeRecord::Scalar(ScalarType::Int)));
+        must(builder.push_type_element(int_type));
+        let inner_result_type = must(builder.push_type(TypeRecord::Tuple {
+            elements: IndexRange { start: 0, count: 1 },
+        }));
+        must(builder.push_type_element(int_type));
+        must(builder.push_type_element(int_type));
+        let outer_result_type = must(builder.push_type(TypeRecord::Tuple {
+            elements: IndexRange { start: 1, count: 2 },
+        }));
+        let constant = must(builder.push_constant(ConstantRecord::Scalar(ScalarConstant::Int(1))));
+        let operand = must(builder.push_node(Node {
+            kind: NodeKind::Constant { constant },
+            result_type: int_type,
+            cardinality: Some(Cardinality::StaticScalar),
+            edges: IndexRange::default(),
+            origin,
+        }));
+
+        let mut outer_branches = Vec::new();
+        let mut branch_roots = Vec::new();
+        let mut releases = Vec::new();
+        must(outer_branches.try_reserve_exact(2));
+        must(branch_roots.try_reserve_exact(2));
+        must(releases.try_reserve_exact(10));
+        for _ in 0..2 {
+            let branch_start = builder.raw.nodes.len() as u32;
+            let inner_operand = push_test_inc(
+                &mut builder,
+                operand,
+                ValueAccess::FanOutOperandBorrow,
+                OwnershipMode::ImmutableBorrow,
+                int_type,
+                origin,
+            );
+            let inner_branch = push_test_inc(
+                &mut builder,
+                inner_operand,
+                ValueAccess::FanOutOperandBorrow,
+                OwnershipMode::ImmutableBorrow,
+                int_type,
+                origin,
+            );
+            must(builder.push_branch(FanOutBranch {
+                nodes: IndexRange {
+                    start: inner_branch.0,
+                    count: 1,
+                },
+                root: inner_branch,
+                placeholder_origin: origin,
+                origin,
+            }));
+            let inner_edge_start = builder.raw.edges.len() as u32;
+            must(builder.push_edge(Edge {
+                producer: inner_operand,
+                argument_position: 1,
+                access: ValueAccess::WholeValue,
+                cardinality: Some(Cardinality::StaticScalar),
+                conversion: Conversion::Identity,
+                ownership: OwnershipMode::OwnedInput,
+                origin,
+            }));
+            let inner_fan_out = must(builder.push_node(Node {
+                kind: NodeKind::FanOut {
+                    branches: IndexRange {
+                        start: builder.raw.branches.len() as u32 - 1,
+                        count: 1,
+                    },
+                    keyword_origin: origin,
+                },
+                result_type: inner_result_type,
+                cardinality: None,
+                edges: IndexRange {
+                    start: inner_edge_start,
+                    count: 1,
+                },
+                origin,
+            }));
+            let prepare_edge_start = builder.raw.edges.len() as u32;
+            must(builder.push_edge(Edge {
+                producer: inner_fan_out,
+                argument_position: 1,
+                access: ValueAccess::WholeValue,
+                cardinality: None,
+                conversion: Conversion::Identity,
+                ownership: OwnershipMode::InfallibleTransfer,
+                origin,
+            }));
+            let prepare = must(builder.push_node(Node {
+                kind: NodeKind::PrefixSpreadPrepare,
+                result_type: inner_result_type,
+                cardinality: None,
+                edges: IndexRange {
+                    start: prepare_edge_start,
+                    count: 1,
+                },
+                origin,
+            }));
+            let root = push_test_inc(
+                &mut builder,
+                prepare,
+                ValueAccess::TupleElement(0),
+                OwnershipMode::ImmutableBorrow,
+                int_type,
+                origin,
+            );
+            outer_branches.push(FanOutBranch {
+                nodes: IndexRange {
+                    start: branch_start,
+                    count: builder.raw.nodes.len() as u32 - branch_start,
+                },
+                root,
+                placeholder_origin: origin,
+                origin,
+            });
+            branch_roots.push(root);
+            releases.extend([
+                (inner_operand, inner_fan_out),
+                (inner_branch, inner_fan_out),
+                (inner_fan_out, prepare),
+                (prepare, root),
+            ]);
+        }
+        for branch in outer_branches {
+            must(builder.push_branch(branch));
+        }
+        let outer_edge_start = builder.raw.edges.len() as u32;
+        must(builder.push_edge(Edge {
+            producer: operand,
+            argument_position: 1,
+            access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
+            conversion: Conversion::Identity,
+            ownership: OwnershipMode::OwnedInput,
+            origin,
+        }));
+        let outer_fan_out = must(builder.push_node(Node {
+            kind: NodeKind::FanOut {
+                branches: IndexRange { start: 2, count: 2 },
+                keyword_origin: origin,
+            },
+            result_type: outer_result_type,
+            cardinality: None,
+            edges: IndexRange {
+                start: outer_edge_start,
+                count: 1,
+            },
+            origin,
+        }));
+        must(builder.push_ownership(Ownership {
+            owner: operand,
+            release_after: ReleaseAfter::Node(outer_fan_out),
+        }));
+        let mut release_index = 0;
+        for node_index in 1..outer_fan_out.0 {
+            let owner = NodeIndex(node_index);
+            let release_after = if branch_roots.contains(&owner) {
+                outer_fan_out
+            } else {
+                let (_, release) = releases[release_index];
+                release_index += 1;
+                release
+            };
+            must(builder.push_ownership(Ownership {
+                owner,
+                release_after: ReleaseAfter::Node(release_after),
+            }));
+        }
+        must(builder.push_ownership(Ownership {
+            owner: outer_fan_out,
+            release_after: ReleaseAfter::Root(RootIndex(0)),
+        }));
+        must(builder.push_root(Root {
+            node: outer_fan_out,
+            origin,
+        }));
+        must(builder.finish())
+    }
+
+    fn sibling_fan_out_program() -> RawProgram {
+        let mut builder = RawProgramBuilder::new();
+        for feature in [Feature::StableSemanticIds, Feature::Tuples, Feature::FanOut] {
+            must(builder.push_feature(feature.numeric()));
+        }
+        let origin = source_fixture(&mut builder);
+        let int_type = must(builder.push_type(TypeRecord::Scalar(ScalarType::Int)));
+        must(builder.push_type_element(int_type));
+        let tuple_type = must(builder.push_type(TypeRecord::Tuple {
+            elements: IndexRange { start: 0, count: 1 },
+        }));
+        let mut fan_outs = Vec::new();
+        must(fan_outs.try_reserve_exact(2));
+        for value in [1_i64, 2_i64] {
+            let constant =
+                must(builder.push_constant(ConstantRecord::Scalar(ScalarConstant::Int(value))));
+            let operand = must(builder.push_node(Node {
+                kind: NodeKind::Constant { constant },
+                result_type: int_type,
+                cardinality: Some(Cardinality::StaticScalar),
+                edges: IndexRange {
+                    start: builder.raw.edges.len() as u32,
+                    count: 0,
+                },
+                origin,
+            }));
+            let branch_root = push_test_inc(
+                &mut builder,
+                operand,
+                ValueAccess::FanOutOperandBorrow,
+                OwnershipMode::ImmutableBorrow,
+                int_type,
+                origin,
+            );
+            let branch_index = builder.raw.branches.len() as u32;
+            must(builder.push_branch(FanOutBranch {
+                nodes: IndexRange {
+                    start: branch_root.0,
+                    count: 1,
+                },
+                root: branch_root,
+                placeholder_origin: origin,
+                origin,
+            }));
+            let edge_start = builder.raw.edges.len() as u32;
+            must(builder.push_edge(Edge {
+                producer: operand,
+                argument_position: 1,
+                access: ValueAccess::WholeValue,
+                cardinality: Some(Cardinality::StaticScalar),
+                conversion: Conversion::Identity,
+                ownership: OwnershipMode::OwnedInput,
+                origin,
+            }));
+            let fan_out = must(builder.push_node(Node {
+                kind: NodeKind::FanOut {
+                    branches: IndexRange {
+                        start: branch_index,
+                        count: 1,
+                    },
+                    keyword_origin: origin,
+                },
+                result_type: tuple_type,
+                cardinality: None,
+                edges: IndexRange {
+                    start: edge_start,
+                    count: 1,
+                },
+                origin,
+            }));
+            fan_outs.push((operand, branch_root, fan_out));
+        }
+        for (root_index, (operand, branch_root, fan_out)) in fan_outs.into_iter().enumerate() {
+            must(builder.push_ownership(Ownership {
+                owner: operand,
+                release_after: ReleaseAfter::Node(fan_out),
+            }));
+            must(builder.push_ownership(Ownership {
+                owner: branch_root,
+                release_after: ReleaseAfter::Node(fan_out),
+            }));
+            must(builder.push_ownership(Ownership {
+                owner: fan_out,
+                release_after: ReleaseAfter::Root(RootIndex(root_index as u32)),
+            }));
+            must(builder.push_root(Root {
+                node: fan_out,
+                origin,
+            }));
+        }
+        must(builder.finish())
+    }
+
     fn fan_out_prefix_spread_program() -> RawProgram {
         let mut builder = RawProgramBuilder::new();
         for feature in [
@@ -4407,30 +4739,59 @@ mod tests {
 
     #[test]
     fn nested_fan_out_is_rejected_before_overlapping_context_scans() {
+        assert!(sibling_fan_out_program().verify().is_ok());
+        assert_eq!(
+            two_branch_nested_fan_out_program().verify(),
+            Err(VerifyError::MalformedProgram(MalformedProgram {
+                invariant: Invariant::InvalidRecord,
+                record: RecordKind::Branch,
+                index: Some(2),
+                field: "nested_fan_out",
+            }))
+        );
+
         for width in [64_u32, 128_u32] {
-            let mut program = wide_fan_out_program(width);
-            program.nodes[1].kind = NodeKind::FanOut {
-                branches: IndexRange::default(),
-                keyword_origin: OriginIndex(0),
-            };
+            let program = wide_fan_out_program(width);
             let mut visits = NestedFanOutVisits::default();
-            assert_eq!(
-                verify_no_nested_fan_out_with_visits(&program, &mut visits),
-                Err(VerifyError::MalformedProgram(MalformedProgram {
-                    invariant: Invariant::InvalidRecord,
-                    record: RecordKind::Branch,
-                    index: Some(0),
-                    field: "nested_fan_out",
-                }))
-            );
+            assert!(verify_no_nested_fan_out_with_visits(&program, &mut visits).is_ok());
             assert_eq!(
                 visits,
                 NestedFanOutVisits {
                     nodes: u64::from(width) + 2,
-                    branches: 1,
+                    region_nodes: u64::from(width) + 1,
+                    branches: 0,
                 }
             );
         }
+
+        let mut program = wide_fan_out_program(4);
+        program.nodes[1].kind = NodeKind::FanOut {
+            branches: IndexRange::default(),
+            keyword_origin: OriginIndex(0),
+        };
+        program.nodes[3].kind = NodeKind::FanOut {
+            branches: IndexRange::default(),
+            keyword_origin: OriginIndex(0),
+        };
+        program.edges[2].producer = NodeIndex(2);
+        let mut visits = NestedFanOutVisits::default();
+        assert_eq!(
+            verify_no_nested_fan_out_with_visits(&program, &mut visits),
+            Err(VerifyError::MalformedProgram(MalformedProgram {
+                invariant: Invariant::InvalidRecord,
+                record: RecordKind::Branch,
+                index: Some(0),
+                field: "nested_fan_out",
+            }))
+        );
+        assert_eq!(
+            visits,
+            NestedFanOutVisits {
+                nodes: 6,
+                region_nodes: 4,
+                branches: 1,
+            }
+        );
     }
 
     #[test]
