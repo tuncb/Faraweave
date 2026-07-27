@@ -1,20 +1,20 @@
 # Faraweave Portable Typed IR Implementation Plan
 
-**Status:** Proposed
-
-**Related specifications:**
-
-- [FARAWEAVE-SPEC-0005](faraweave-spec-0005-program-parameters.md)
-- [FARAWEAVE-SPEC-0006](faraweave-spec-0006-structural-tuples-and-profile-v2.md)
-- [FARAWEAVE-SPEC-0007](faraweave-spec-0007-explicit-sequential-fanout.md)
+**Status:** Accepted by [GitHub issue #1](https://github.com/tuncb/Faraweave/issues/1)
 
 **Relevant decision record:**
-[Issue #45 — value-independent typed lowering](../doc/decisions/issue-45-value-independent-typed-lowering.md)
+[Issue #1 — accept the portable typed FWIR plan](../decisions/issue-1-accept-fwir-plan.md)
 
 **Purpose:** Decompose a portable, verified, typed Faraweave IR into
 dependency-ordered GitHub issues. The completed work makes the IR the one
 semantic input to the direct interpreter and C11 generator and then exposes a
 versioned artifact that other systems can validate, inspect, and execute.
+
+The intended format name is **Faraweave Intermediate Representation (FWIR)**,
+and `.fwir` is its provisional file extension. Neither name nor extension
+freezes a public format: [issue #10](https://github.com/tuncb/Faraweave/issues/10)
+owns the encoding and compatibility decision after the interpreter and C
+backend cutovers.
 
 ## 1. Outcome
 
@@ -78,7 +78,7 @@ transactions, native process isolation, or publication guarantees.
 ## 3. Planning boundaries
 
 This document plans work; it does not define the final public FWIR schema.
-Every work package below becomes a GitHub issue before implementation.
+Every work package below has a separate GitHub issue.
 
 The plan covers:
 
@@ -147,90 +147,90 @@ producers requires a later specification and conformance boundary.
 
 | Milestone | Result | Work packages |
 | --- | --- | --- |
-| M0 — Accepted contract | The semantic boundary and non-goals are normative. | IR-00 through IR-01 |
-| M1 — One interpreter authority | Source lowers once and direct execution consumes only typed IR. | IR-02 through IR-06 |
-| M2 — One backend authority | C emission and native build consume the same typed IR. | IR-07 through IR-08 |
-| M3 — Portable product | Canonical bytes can be safely published, loaded, inspected, and executed. | IR-09 through IR-12 |
-| M4 — Product acceptance | Compatibility, hostile-input, differential, docs, and final QA are complete. | IR-13 through IR-14 |
+| M0 — Accepted contract | The semantic boundary and non-goals are normative. | #1 through #2 |
+| M1 — One interpreter authority | Source lowers once and direct execution consumes only typed IR. | #3 through #7 |
+| M2 — One backend authority | C emission and native build consume the same typed IR. | #8 through #9 |
+| M3 — Portable product | Canonical bytes can be safely published, loaded, inspected, and executed. | #10 through #13 |
+| M4 — Product acceptance | Compatibility, hostile-input, differential, docs, and final QA are complete. | #14 through #15 |
 
-## 6. Dependency graph
+## 6. Accepted dependency graph
 
-The symbolic IDs below are temporary planning identifiers. Replace them with
-GitHub issue numbers after issue creation and update dependency text in the
-issues, not in per-issue decision-record filenames.
+The graph uses the permanent GitHub issue numbers. Every child is blocked by
+the node immediately above it except for #9, which is blocked by both #7 and
+#8.
 
 ```text
-IR-00 Umbrella
+#1 Umbrella
   |
   v
-IR-01 Semantic contract
+#2 Semantic contract
   |
   v
-IR-02 Stable identities
+#3 Stable identities
   |
   v
-IR-03 In-memory IR + verifier
+#4 In-memory IR + verifier
   |
   v
-IR-04 Typed lowering
+#5 Typed lowering
   |
   +-----------------------+
   |                       |
   v                       v
-IR-05 IR interpreter    IR-07 IR C generator
+#6 IR interpreter       #8 IR C generator
   |                       |
   v                       |
-IR-06 Eval cutover        |
+#7 Eval cutover           |
   |                       |
   +-----------+-----------+
               v
-        IR-08 C/native cutover
+        #9 C/native cutover
               |
               v
-        IR-09 Encoding decision
+        #10 Encoding decision
               |
               v
-        IR-10 Canonical encoder
+        #11 Canonical encoder
               |
               v
-        IR-11 Decoder + validation
+        #12 Decoder + validation
               |
               v
-        IR-12 Public API + CLI
+        #13 Public API + CLI
               |
               v
-        IR-13 Conformance/security
+        #14 Conformance/security
               |
               v
-        IR-14 Final acceptance
+        #15 Final acceptance
 ```
 
-IR-05 and IR-07 may be implemented independently after IR-04, but IR-08 waits
-for the direct-evaluation cutover so differential evidence compares two IR
+#6 and #8 may be implemented independently after #5, but #9 waits for the
+direct-evaluation cutover so differential evidence compares two IR
 consumers rather than an IR backend with the legacy AST evaluator.
 
-## 7. Issue creation order
+## 7. Accepted issue map
 
-Create issues in this order so every dependency can use a real issue number:
+The original planning identifiers map to the created issues as follows:
 
-1. IR-00
-2. IR-01
-3. IR-02
-4. IR-03
-5. IR-04
-6. IR-05
-7. IR-06
-8. IR-07
-9. IR-08
-10. IR-09
-11. IR-10
-12. IR-11
-13. IR-12
-14. IR-13
-15. IR-14
+1. IR-00: [#1](https://github.com/tuncb/Faraweave/issues/1)
+2. IR-01: [#2](https://github.com/tuncb/Faraweave/issues/2)
+3. IR-02: [#3](https://github.com/tuncb/Faraweave/issues/3)
+4. IR-03: [#4](https://github.com/tuncb/Faraweave/issues/4)
+5. IR-04: [#5](https://github.com/tuncb/Faraweave/issues/5)
+6. IR-05: [#6](https://github.com/tuncb/Faraweave/issues/6)
+7. IR-06: [#7](https://github.com/tuncb/Faraweave/issues/7)
+8. IR-07: [#8](https://github.com/tuncb/Faraweave/issues/8)
+9. IR-08: [#9](https://github.com/tuncb/Faraweave/issues/9)
+10. IR-09: [#10](https://github.com/tuncb/Faraweave/issues/10)
+11. IR-10: [#11](https://github.com/tuncb/Faraweave/issues/11)
+12. IR-11: [#12](https://github.com/tuncb/Faraweave/issues/12)
+13. IR-12: [#13](https://github.com/tuncb/Faraweave/issues/13)
+14. IR-13: [#14](https://github.com/tuncb/Faraweave/issues/14)
+15. IR-14: [#15](https://github.com/tuncb/Faraweave/issues/15)
 
-After creation, add every child to the IR-00 checklist and replace symbolic
-dependency references in issue bodies with `#<number>` links.
+The live child checklist in #1 is authoritative for completion state. At plan
+acceptance, #2 through #15 are open and correctly remain unchecked.
 
 ## 8. GitHub issue template
 
@@ -282,7 +282,7 @@ Use this structure for every work package:
 
 Every material representation, schema, ownership, compatibility, error,
 backend, or test-policy decision belongs in that GitHub issue's append-only
-record under `doc/decisions/issue-<number>-<stable-slug>.md`.
+record under `decisions/issue-<number>-<stable-slug>.md`.
 
 ## 9. IR-00 — Track portable typed IR as a product
 
@@ -297,9 +297,9 @@ track completion without combining implementation into the umbrella.
 
 - Review and accept or correct this plan.
 - Create IR-01 through IR-14.
-- Link the current specifications and Issue #45 decision.
+- Link the current plan decision.
 - Record the intended format name, provisional `.fwir` extension, and the rule
-  that no public format is frozen before IR-09.
+  that no public format is frozen before #10.
 - Add a checklist of all child issues and their accepted dependencies.
 
 ### Out of scope
@@ -310,12 +310,12 @@ track completion without combining implementation into the umbrella.
 
 ### Acceptance criteria
 
-- [ ] Every work package has one GitHub issue with scope, non-goals,
+- [x] Every work package has one GitHub issue with scope, non-goals,
       dependencies, acceptance criteria, and validation.
-- [ ] The dependency graph has no cycle or implementation work hidden in the
+- [x] The dependency graph has no cycle or implementation work hidden in the
       umbrella.
-- [ ] Existing language and backend specifications are linked.
-- [ ] Public-format compatibility is explicitly deferred to IR-09.
+- [x] The current plan and issue boundaries are linked.
+- [x] Public-format compatibility is explicitly deferred to #10.
 
 ### Validation
 
