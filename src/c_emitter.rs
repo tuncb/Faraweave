@@ -3,10 +3,10 @@ use crate::parser::{
     validate_parameter_declarations,
 };
 use crate::primitive::{analyze, resolve_names};
-use crate::semantic_registry::{SEMANTIC_REGISTRY, implementation_from_numeric};
+use crate::semantic_registry::{SEMANTIC_REGISTRY, ScalarKernel, implementation_from_numeric};
 use crate::typed_program::{
-    ConstantRecord, Conversion as IrConversion, IndexRange, LiftMode, Node, NodeKind, Origin,
-    RawProgram, ScalarConstant, ValueAccess, VerifiedProgram,
+    ConstantRecord, Conversion as IrConversion, Feature, IndexRange, LiftMode, Node, NodeKind,
+    Origin, RawProgram, ScalarConstant, TypeRecord, ValueAccess, VerifiedProgram,
 };
 use crate::{
     Error, ErrorKind, EvaluationConfiguration, ProgramResult, ScalarType, Type, Value,
@@ -26,7 +26,40 @@ pub(crate) fn emit_verified_c_program(
     program: &VerifiedProgram,
     configuration: EvaluationConfiguration,
 ) -> Result<CEmissionResult, Error> {
+    validate_ir_emission_configuration(program.as_raw(), configuration)?;
     IrCGenerator::new(program.as_raw(), configuration).emit()
+}
+
+fn validate_ir_emission_configuration(
+    program: &RawProgram,
+    configuration: EvaluationConfiguration,
+) -> Result<(), Error> {
+    let resources = crate::resources::ResourceContext::new(
+        configuration.profile,
+        configuration.limits,
+        configuration.allocation_failure,
+    )?;
+    if !program.features.contains(&Feature::Tuples.numeric()) {
+        return Ok(());
+    }
+    let location = program
+        .nodes
+        .iter()
+        .filter(|node| {
+            program
+                .types
+                .get(node.result_type.0 as usize)
+                .is_some_and(|record| matches!(record, TypeRecord::Tuple { .. }))
+        })
+        .filter_map(|node| program.origins.get(node.origin.0 as usize))
+        .min_by_key(|origin| origin.span.begin.offset)
+        .map(|origin| crate::SourceLocation {
+            offset: origin.span.begin.offset as usize,
+            line: origin.span.begin.line as usize,
+            column: origin.span.begin.column as usize,
+        })
+        .unwrap_or_else(crate::SourceLocation::start);
+    resources.require_tuple_profile(location)
 }
 
 struct IrCGenerator<'a> {
@@ -161,17 +194,114 @@ impl<'a> IrCGenerator<'a> {
             if !used {
                 continue;
             }
+            let implementation = descriptor.implementation_id.numeric();
+            if descriptor.kernel == ScalarKernel::IotaInt {
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_iota({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
+            self.emit_selected_kernel(implementation, descriptor.kernel)?;
             writeln!(
                 self.definitions,
-                "static int fw_impl_{}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ return fw_apply_selected({}, {}, {}, args, count, out, line, column, origins, origin_count, static_anchor, shape_checks, shape_count, conversions, lift); }}",
-                descriptor.implementation_id.numeric(),
-                descriptor.primitive_id.numeric() - 1,
+                "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ return fw_apply_selected(fw_kernel_{implementation}, {}, {}, args, count, out, line, column, origins, origin_count, static_anchor, shape_checks, shape_count, conversions, lift); }}",
                 c_string(descriptor.primitive_name),
                 scalar_tag(descriptor.result),
             )
             .map_err(|_| emission_error())?;
         }
         Ok(())
+    }
+
+    fn emit_selected_kernel(
+        &mut self,
+        implementation: u16,
+        kernel: ScalarKernel,
+    ) -> Result<(), Error> {
+        let body = match kernel {
+            ScalarKernel::IncInt => {
+                "if(args[0].i==INT64_MAX)return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,args[0].i+INT64_C(1));return 1;"
+            }
+            ScalarKernel::DecInt => {
+                "if(args[0].i==INT64_MIN)return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,args[0].i-INT64_C(1));return 1;"
+            }
+            ScalarKernel::NegInt => {
+                "if(args[0].i==INT64_MIN)return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,-args[0].i);return 1;"
+            }
+            ScalarKernel::AbsInt => {
+                "if(args[0].i==INT64_MIN)return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,args[0].i<0?-args[0].i:args[0].i);return 1;"
+            }
+            ScalarKernel::AddInt => {
+                "int64_t a=args[0].i,b=args[1].i;if((b>0&&a>INT64_MAX-b)||(b<0&&a<INT64_MIN-b))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a+b);return 1;"
+            }
+            ScalarKernel::SubInt => {
+                "int64_t a=args[0].i,b=args[1].i;if((b<0&&a>INT64_MAX+b)||(b>0&&a<INT64_MIN+b))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a-b);return 1;"
+            }
+            ScalarKernel::MulInt => {
+                "int64_t a=args[0].i,b=args[1].i;if(a!=0&&((a==-1&&b==INT64_MIN)||(b==-1&&a==INT64_MIN)||(a>0&&((b>0&&a>INT64_MAX/b)||(b<0&&b<INT64_MIN/a)))||(a<0&&((b>0&&a<INT64_MIN/b)||(b<0&&a<INT64_MAX/b)))))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a*b);return 1;"
+            }
+            ScalarKernel::IncDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,1.0,FW_DOUBLE_ADD));return 1;"
+            }
+            ScalarKernel::DecDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,1.0,FW_DOUBLE_SUB));return 1;"
+            }
+            ScalarKernel::NegDouble => {
+                "fw_set_double(out,fw_double_from_bits(fw_double_bits(args[0].d)^UINT64_C(0x8000000000000000)));return 1;"
+            }
+            ScalarKernel::AbsDouble => {
+                "fw_set_double(out,fw_double_from_bits(fw_double_bits(args[0].d)&UINT64_C(0x7fffffffffffffff)));return 1;"
+            }
+            ScalarKernel::AddDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_ADD));return 1;"
+            }
+            ScalarKernel::SubDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_SUB));return 1;"
+            }
+            ScalarKernel::MulDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_MUL));return 1;"
+            }
+            ScalarKernel::EqualsBool => "fw_set_bool(out,args[0].b==args[1].b);return 1;",
+            ScalarKernel::EqualsInt => "fw_set_bool(out,args[0].i==args[1].i);return 1;",
+            ScalarKernel::EqualsDouble => {
+                "fw_set_bool(out,fw_double_equal(args[0].d,args[1].d));return 1;"
+            }
+            ScalarKernel::NotEqualsBool => "fw_set_bool(out,args[0].b!=args[1].b);return 1;",
+            ScalarKernel::NotEqualsInt => "fw_set_bool(out,args[0].i!=args[1].i);return 1;",
+            ScalarKernel::NotEqualsDouble => {
+                "fw_set_bool(out,!fw_double_equal(args[0].d,args[1].d));return 1;"
+            }
+            ScalarKernel::NotBool => "fw_set_bool(out,!args[0].b);return 1;",
+            ScalarKernel::AndBool => "fw_set_bool(out,args[0].b&&args[1].b);return 1;",
+            ScalarKernel::OrBool => "fw_set_bool(out,args[0].b||args[1].b);return 1;",
+            ScalarKernel::OddInt => "fw_set_bool(out,args[0].i%2!=0);return 1;",
+            ScalarKernel::EvenInt => "fw_set_bool(out,args[0].i%2==0);return 1;",
+            ScalarKernel::IsPositiveInt => "fw_set_bool(out,args[0].i>0);return 1;",
+            ScalarKernel::IsNegativeInt => "fw_set_bool(out,args[0].i<0);return 1;",
+            ScalarKernel::IsPositiveDouble => {
+                "fw_set_bool(out,!fw_double_is_nan(args[0].d)&&!fw_double_is_zero(args[0].d)&&(fw_double_bits(args[0].d)&UINT64_C(0x8000000000000000))==0U);return 1;"
+            }
+            ScalarKernel::IsNegativeDouble => {
+                "fw_set_bool(out,!fw_double_is_nan(args[0].d)&&!fw_double_is_zero(args[0].d)&&(fw_double_bits(args[0].d)&UINT64_C(0x8000000000000000))!=0U);return 1;"
+            }
+            ScalarKernel::LessThanInt => "fw_set_bool(out,args[0].i<args[1].i);return 1;",
+            ScalarKernel::LessThanDouble => {
+                "fw_set_bool(out,fw_double_less_than(args[0].d,args[1].d));return 1;"
+            }
+            ScalarKernel::GreaterThanInt => "fw_set_bool(out,args[0].i>args[1].i);return 1;",
+            ScalarKernel::GreaterThanDouble => {
+                "fw_set_bool(out,fw_double_less_than(args[1].d,args[0].d));return 1;"
+            }
+            ScalarKernel::IotaInt => return Err(emission_error()),
+        };
+        writeln!(
+            self.definitions,
+            "static int fw_kernel_{implementation}(const FWV *args,FWV *out,const char *name,size_t line,size_t column,size_t index,int vector_result) {{ (void)name;(void)line;(void)column;(void)index;(void)vector_result; {body} }}"
+        )
+        .map_err(|_| emission_error())
     }
 
     fn emit_node(&mut self, index: usize, node: Node) -> Result<(), Error> {
@@ -297,21 +427,35 @@ impl<'a> IrCGenerator<'a> {
         let origin = self.origin(node.origin.0)?;
         writeln!(
             self.definitions,
-            "  if (!fw_make_tuple(out, {}U, \"tuple_literal\", {}U, {}U)) return 0;",
+            "  FWV children[{}U]; size_t initialized = 0U;",
+            edges.len().max(1)
+        )
+        .map_err(|_| emission_error())?;
+        self.definitions
+            .push_str("  (void)memset(children, 0, sizeof(children));\n");
+        for (position, edge) in edges.iter().copied().enumerate() {
+            self.emit_edge_call(edge, &format!("&children[{position}U]"), "tuple_cleanup")?;
+            writeln!(self.definitions, "  initialized = {}U;", position + 1)
+                .map_err(|_| emission_error())?;
+        }
+        writeln!(
+            self.definitions,
+            "  if (!fw_make_tuple(out, {}U, \"tuple_literal\", {}U, {}U)) goto tuple_cleanup;",
             edges.len(),
             origin.span.begin.line,
             origin.span.begin.column
         )
         .map_err(|_| emission_error())?;
-        if edges.is_empty() {
-            self.definitions.push_str("  return 1;\n");
-            return Ok(());
+        for position in 0..edges.len() {
+            writeln!(
+                self.definitions,
+                "  out->items[{position}U] = children[{position}U]; (void)memset(&children[{position}U], 0, sizeof(children[{position}U]));"
+            )
+            .map_err(|_| emission_error())?;
         }
-        for (position, edge) in edges.iter().copied().enumerate() {
-            self.emit_edge_call(edge, &format!("&out->items[{position}U]"), "tuple_cleanup")?;
-        }
-        self.definitions
-            .push_str("  return 1;\ntuple_cleanup:\n  fw_free(out); return 0;\n");
+        self.definitions.push_str(
+            "  return 1;\ntuple_cleanup:\n  while (initialized != 0U) fw_free(&children[--initialized]);\n  return 0;\n",
+        );
         Ok(())
     }
 
@@ -544,8 +688,8 @@ fn range_slice<T>(values: &[T], range: IndexRange) -> Result<&[T], Error> {
 }
 
 fn ir_parameter_runtime() -> Result<String, Error> {
-    const LEGACY_APPLY: &str = "static int fw_apply(int primitive, int result_type";
-    const SELECTED_APPLY: &str = "static FWV fw_scalar_at_selected";
+    const LEGACY_APPLY: &str = "enum {\n  FW_INC";
+    const SELECTED_APPLY: &str = "typedef int (*FWSelectedKernel)";
     const LEGACY_REFERENCE: &str = "  (void)fw_apply;\n";
     let legacy_start = PARAMETER_RUNTIME
         .find(LEGACY_APPLY)
@@ -1722,25 +1866,28 @@ static int fw_apply(int primitive, int result_type, const FWV *args, size_t coun
   }
   return 1;
 }
+typedef int (*FWSelectedKernel)(const FWV *,FWV *,const char *,size_t,size_t,size_t,int);
+static int fw_selected_integer_overflow(const char *name,size_t line,size_t column,
+                                        size_t index,int vector_result) {
+  if(vector_result){
+    (void)snprintf(fw_error_storage,sizeof(fw_error_storage),
+                   "%s failed: integer_overflow at result index %zu",name,index);
+    return fw_fail("DomainError",fw_error_storage,line,column);
+  }
+  return fw_fail_primitive("DomainError",name,"integer_overflow",line,column);
+}
 static FWV fw_scalar_at_selected(const FWV *value,size_t index,int conversion) {
   FWV result=fw_scalar_at(value,index);
   if(conversion!=0){int64_t integer=result.i;fw_set_double(&result,fw_int_to_double(integer));}
   return result;
 }
-static int fw_apply_selected(int primitive,const char *name,int result_type,
+static int fw_apply_selected(FWSelectedKernel kernel,const char *name,int result_type,
                              const FWV *args,size_t count,FWV *out,
                              size_t line,size_t column,const size_t (*origins)[2],
                              size_t origin_count,size_t static_anchor,
                              const size_t *shape_checks,size_t shape_count,
                              const int *conversions,int lift) {
   size_t i,length=1U,anchor=static_anchor;
-  if(primitive==FW_IOTA){
-    int64_t bound=args[0].i;
-    length=bound>0?(size_t)bound:0U;
-    if(!fw_make_vector(out,1,length,length,name,line,column))return 0;
-    for(i=0U;i<length;++i)((int64_t *)out->data)[i]=(int64_t)i+1;
-    return 1;
-  }
   if(lift!=0){
     if(anchor==SIZE_MAX){
       if(shape_count==0U)return fw_fail("ValueError","selected vector plan has no anchor",line,column);
@@ -1765,10 +1912,19 @@ static int fw_apply_selected(int primitive,const char *name,int result_type,
     FWV scalar_args[2]={{0}};FWV scalar_out={0};size_t j;
     for(j=0U;j<count;++j)
       scalar_args[j]=fw_scalar_at_selected(&args[j],i,conversions[j]);
-    if(!fw_apply_scalar(primitive,scalar_args,count,result_type,&scalar_out,
-                        line,column,i,lift!=0)){fw_free(out);return 0;}
+    if(!kernel(scalar_args,&scalar_out,name,line,column,i,lift!=0)){
+      fw_free(out);return 0;
+    }
     (void)fw_put_scalar(out,i,scalar_out);
   }
+  return 1;
+}
+static int fw_apply_selected_iota(const char *name,const FWV *args,FWV *out,
+                                  size_t line,size_t column) {
+  int64_t bound=args[0].i;
+  size_t i,length=bound>0?(size_t)bound:0U;
+  if(!fw_make_vector(out,1,length,length,name,line,column))return 0;
+  for(i=0U;i<length;++i)((int64_t *)out->data)[i]=(int64_t)i+1;
   return 1;
 }
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
@@ -1939,6 +2095,14 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   size_t supplied=argc>0?(size_t)argc-1U:0U,i,initialized=0U;FWV *values=NULL;FWBuffer output={0};int decoded;
   (void)fw_apply;
   (void)fw_apply_selected;
+  (void)fw_apply_selected_iota;
+  (void)fw_selected_integer_overflow;
+  (void)fw_as_double;
+  (void)fw_borrow;
+  (void)fw_double_arithmetic;
+  (void)fw_double_equal;
+  (void)fw_double_less_than;
+  (void)fw_set_int;
   (void)fw_make_tuple;
 #ifdef _WIN32
   if (_setmode(_fileno(stdout), _O_BINARY) == -1 || _setmode(_fileno(stderr), _O_BINARY) == -1) return 1;
@@ -2049,6 +2213,89 @@ mod ir_tests {
             Err(error) => panic!("second generation failed: {error}"),
         };
         assert_eq!(first.as_bytes(), second.as_bytes());
+    }
+
+    #[test]
+    fn verified_generator_preflights_configuration_and_tuple_profile() {
+        let scalar = match compile_source("inc[1]\n") {
+            Ok(program) => program,
+            Err(error) => panic!("scalar source did not lower: {error}"),
+        };
+        let invalid_configuration = EvaluationConfiguration {
+            limits: crate::ResourceLimits {
+                max_work_units: Some(1),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        let error = match emit_verified_c_program(&scalar, invalid_configuration) {
+            Ok(_) => panic!("trusted profile with a limit unexpectedly emitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::InvalidExecutionProfile);
+
+        let tuple = match compile_source("parameters[x Int]\n[inc[x] 2]\n") {
+            Ok(program) => program,
+            Err(error) => panic!("tuple source did not lower: {error}"),
+        };
+        let error = match emit_verified_c_program(
+            &tuple,
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::TrustedLocalV1,
+                ..EvaluationConfiguration::default()
+            },
+        ) {
+            Ok(_) => panic!("V1 tuple program unexpectedly emitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::ProfileError);
+        assert_eq!((error.location.line, error.location.column), (2, 1));
+    }
+
+    #[test]
+    fn tuple_children_precede_outer_table_admission_in_generated_code() {
+        let source = emit("[iota[3] iota[2]]\n");
+        let tuple = match source.find("static int fw_ir_node_4") {
+            Some(index) => &source[index..],
+            None => panic!("missing tuple node"),
+        };
+        let first_child = tuple.find("fw_ir_node_1(hole, &children[0U])");
+        let second_child = tuple.find("fw_ir_node_3(hole, &children[1U])");
+        let admission = tuple.find("fw_make_tuple(out, 2U");
+        assert!(
+            matches!(
+                (first_child, second_child, admission),
+                (Some(first), Some(second), Some(admit)) if first < second && second < admit
+            ),
+            "tuple node did not execute children before admission"
+        );
+    }
+
+    #[test]
+    fn every_selected_id_emits_a_direct_kernel_symbol_without_type_redispatch() {
+        let source = emit(
+            "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
+             abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
+             mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
+             not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
+             and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
+             is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
+             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n",
+        );
+        for implementation in 1..34 {
+            assert!(
+                source.contains(&format!("static int fw_kernel_{implementation}(")),
+                "missing kernel {implementation}"
+            );
+            assert!(
+                source.contains(&format!("fw_apply_selected(fw_kernel_{implementation},")),
+                "implementation {implementation} is not direct"
+            );
+        }
+        assert!(source.contains("static int fw_impl_34("));
+        assert!(source.contains("return fw_apply_selected_iota(\"iota\""));
+        assert!(!source.contains("fw_apply_scalar"));
+        assert!(!source.contains("primitive=="));
     }
 
     #[cfg(not(windows))]
@@ -2200,6 +2447,115 @@ mod ir_tests {
         let legacy = compile_and_run_with_diagnostics(&legacy_source, &["3"], false);
         assert!(!verified.status.success());
         assert!(verified.stdout.is_empty());
+        assert_eq!(verified.stdout, legacy.stdout);
+        assert_eq!(verified.stderr, legacy.stderr);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tuple_resource_and_fault_order_matches_legacy_backend() {
+        let source = "[iota[3] iota[2]]\n";
+        let configurations = [
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_vector_bytes: Some(16),
+                    ..crate::ResourceLimits::default()
+                },
+                ..EvaluationConfiguration::default()
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_live_evaluation_bytes: Some(32),
+                    ..crate::ResourceLimits::default()
+                },
+                ..EvaluationConfiguration::default()
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_work_units: Some(4),
+                    ..crate::ResourceLimits::default()
+                },
+                ..EvaluationConfiguration::default()
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_tuple_table_bytes: Some(16),
+                    ..crate::ResourceLimits::default()
+                },
+                ..EvaluationConfiguration::default()
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_vector_bytes: Some(128),
+                    max_tuple_table_bytes: Some(128),
+                    max_live_evaluation_bytes: Some(256),
+                    max_work_units: Some(256),
+                },
+                allocation_failure: crate::AllocationFailureInjection {
+                    fail_at_ordinal: Some(0),
+                },
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_vector_bytes: Some(128),
+                    max_tuple_table_bytes: Some(128),
+                    max_live_evaluation_bytes: Some(256),
+                    max_work_units: Some(256),
+                },
+                allocation_failure: crate::AllocationFailureInjection {
+                    fail_at_ordinal: Some(1),
+                },
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_vector_bytes: Some(128),
+                    max_tuple_table_bytes: Some(128),
+                    max_live_evaluation_bytes: Some(256),
+                    max_work_units: Some(256),
+                },
+                allocation_failure: crate::AllocationFailureInjection {
+                    fail_at_ordinal: Some(2),
+                },
+            },
+        ];
+        for configuration in configurations {
+            let verified = compile_and_run(&emit_with_configuration(source, configuration), &[]);
+            let legacy_source = match emit_c_source_with_configuration(source, configuration) {
+                Ok(emission) => emission.source,
+                Err(error) => panic!("legacy tuple generator failed: {error}"),
+            };
+            let legacy = compile_and_run_with_diagnostics(&legacy_source, &[], false);
+            assert_eq!(verified.status.success(), legacy.status.success());
+            assert_eq!(verified.stdout, legacy.stdout);
+            assert_eq!(verified.stderr, legacy.stderr);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn all_direct_selected_kernels_compile_strictly_and_match_legacy_results() {
+        let source = "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
+             abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
+             mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
+             not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
+             and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
+             is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
+             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n";
+        let configuration = EvaluationConfiguration::default();
+        let verified = compile_and_run(&emit_with_configuration(source, configuration), &[]);
+        let legacy_source = match emit_c_source_with_configuration(source, configuration) {
+            Ok(emission) => emission.source,
+            Err(error) => panic!("legacy all-kernel generator failed: {error}"),
+        };
+        let legacy = compile_and_run_with_diagnostics(&legacy_source, &[], false);
+        assert!(verified.status.success());
         assert_eq!(verified.stdout, legacy.stdout);
         assert_eq!(verified.stderr, legacy.stderr);
     }
