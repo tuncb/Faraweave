@@ -92,6 +92,8 @@ enum RegistryValidationError {
     UnknownSignatureId,
     UnknownImplementationId,
     InconsistentPrimitiveIdentity,
+    InconsistentSignatureIdentity,
+    InconsistentImplementationIdentity,
 }
 
 const PRIMITIVE_COUNT: u16 = 19;
@@ -409,6 +411,44 @@ fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryVali
             return Err(RegistryValidationError::MissingImplementationId);
         }
     }
+
+    for descriptor in registry {
+        let canonical_primitive = SEMANTIC_REGISTRY
+            .iter()
+            .find(|canonical| canonical.primitive_id == descriptor.primitive_id);
+        if canonical_primitive.is_none_or(|canonical| {
+            descriptor.primitive_name != canonical.primitive_name
+                || descriptor.behavior != canonical.behavior
+        }) {
+            return Err(RegistryValidationError::InconsistentPrimitiveIdentity);
+        }
+
+        let canonical_signature = SEMANTIC_REGISTRY
+            .iter()
+            .find(|canonical| canonical.signature_id == descriptor.signature_id);
+        if canonical_signature.is_none_or(|canonical| {
+            descriptor.primitive_id != canonical.primitive_id
+                || descriptor.parameters != canonical.parameters
+                || descriptor.result != canonical.result
+                || descriptor.behavior != canonical.behavior
+        }) {
+            return Err(RegistryValidationError::InconsistentSignatureIdentity);
+        }
+
+        let canonical_implementation = SEMANTIC_REGISTRY
+            .iter()
+            .find(|canonical| canonical.implementation_id == descriptor.implementation_id);
+        if canonical_implementation.is_none_or(|canonical| {
+            descriptor.primitive_id != canonical.primitive_id
+                || descriptor.parameters != canonical.parameters
+                || descriptor.result != canonical.result
+                || descriptor.behavior != canonical.behavior
+                || descriptor.kernel != canonical.kernel
+        }) {
+            return Err(RegistryValidationError::InconsistentImplementationIdentity);
+        }
+    }
+
     Ok(())
 }
 
@@ -548,6 +588,61 @@ mod tests {
         assert_eq!(
             validate_registry(&inconsistent),
             Err(RegistryValidationError::InconsistentPrimitiveIdentity)
+        );
+    }
+
+    #[test]
+    fn invalid_registry_fixtures_reject_changed_stable_semantic_meanings() {
+        let mut swapped_primitives = SEMANTIC_REGISTRY.to_vec();
+        for descriptor in &mut swapped_primitives[..2] {
+            descriptor.primitive_name = "dec";
+        }
+        for descriptor in &mut swapped_primitives[2..4] {
+            descriptor.primitive_name = "inc";
+        }
+        assert_eq!(
+            validate_registry(&swapped_primitives),
+            Err(RegistryValidationError::InconsistentPrimitiveIdentity)
+        );
+
+        let mut swapped_signatures = SEMANTIC_REGISTRY.to_vec();
+        let first_signature = swapped_signatures[0].signature_id;
+        swapped_signatures[0].signature_id = swapped_signatures[33].signature_id;
+        swapped_signatures[33].signature_id = first_signature;
+        assert_eq!(
+            validate_registry(&swapped_signatures),
+            Err(RegistryValidationError::InconsistentSignatureIdentity)
+        );
+
+        let mut swapped_implementations = SEMANTIC_REGISTRY.to_vec();
+        let first_implementation = swapped_implementations[0].implementation_id;
+        swapped_implementations[0].implementation_id =
+            swapped_implementations[33].implementation_id;
+        swapped_implementations[33].implementation_id = first_implementation;
+        assert_eq!(
+            validate_registry(&swapped_implementations),
+            Err(RegistryValidationError::InconsistentImplementationIdentity)
+        );
+
+        let mut changed_signature_parameters = SEMANTIC_REGISTRY.to_vec();
+        changed_signature_parameters[0].parameters = DOUBLE1;
+        assert_eq!(
+            validate_registry(&changed_signature_parameters),
+            Err(RegistryValidationError::InconsistentSignatureIdentity)
+        );
+
+        let mut changed_signature_result = SEMANTIC_REGISTRY.to_vec();
+        changed_signature_result[0].result = ScalarType::Double;
+        assert_eq!(
+            validate_registry(&changed_signature_result),
+            Err(RegistryValidationError::InconsistentSignatureIdentity)
+        );
+
+        let mut changed_implementation_kernel = SEMANTIC_REGISTRY.to_vec();
+        changed_implementation_kernel[0].kernel = ScalarKernel::DecInt;
+        assert_eq!(
+            validate_registry(&changed_implementation_kernel),
+            Err(RegistryValidationError::InconsistentImplementationIdentity)
         );
     }
 
