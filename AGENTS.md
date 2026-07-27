@@ -11,4 +11,8 @@
 # Decisions
 
 If you make a decision, document it under decisions folder. Create a markdown file per issue. Be brief, write at most 3-4 sentences per decision.
-Shorter without loosing meaning is better.
+Shorter without losing meaning is better.
+
+# Testing
+
+Add tests for each added feature or behavioral change.  While adding tests do not stop at the happy path, make sure we have good coverage of all paths. DO NOT create tests for documentation. Do not damage architecture for testing, architecture is more important.
