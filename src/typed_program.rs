@@ -1921,6 +1921,81 @@ struct FanOutContextVisits {
     edges: u64,
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct NestedFanOutVisits {
+    nodes: u64,
+    branches: u64,
+}
+
+fn verify_no_nested_fan_out(program: &RawProgram) -> Result<(), VerifyError> {
+    verify_no_nested_fan_out_with_visits(program, &mut NestedFanOutVisits::default())
+}
+
+fn verify_no_nested_fan_out_with_visits(
+    program: &RawProgram,
+    visits: &mut NestedFanOutVisits,
+) -> Result<(), VerifyError> {
+    let mut previous_fan_out = None;
+    for (node_index, node) in program.nodes.iter().copied().enumerate() {
+        visits.nodes = visits.nodes.saturating_add(1);
+        let NodeKind::FanOut { branches, .. } = node.kind else {
+            continue;
+        };
+        let edge_bounds = range_bounds(
+            node.edges,
+            program.edges.len(),
+            RecordKind::Node,
+            node_index as u32,
+            "edges",
+        )?;
+        let operand = program.edges[edge_bounds]
+            .first()
+            .map(|edge| edge.producer.0)
+            .ok_or_else(|| {
+                malformed(
+                    Invariant::InvalidRecord,
+                    RecordKind::Node,
+                    Some(node_index as u32),
+                    "fan_out.operand",
+                )
+            })?;
+        if let Some(nested) = previous_fan_out
+            && nested >= operand
+        {
+            let branch_bounds = range_bounds(
+                branches,
+                program.branches.len(),
+                RecordKind::Node,
+                node_index as u32,
+                "branches",
+            )?;
+            for (offset, branch) in program.branches[branch_bounds].iter().copied().enumerate() {
+                visits.branches = visits.branches.saturating_add(1);
+                if branch
+                    .nodes
+                    .checked_end()
+                    .is_some_and(|end| nested >= branch.nodes.start && nested < end)
+                {
+                    return Err(malformed(
+                        Invariant::InvalidRecord,
+                        RecordKind::Branch,
+                        Some(branches.start.saturating_add(offset as u32)),
+                        "nested_fan_out",
+                    ));
+                }
+            }
+            return Err(malformed(
+                Invariant::InvalidRecord,
+                RecordKind::Branch,
+                Some(branches.start),
+                "nested_fan_out",
+            ));
+        }
+        previous_fan_out = Some(node_index as u32);
+    }
+    Ok(())
+}
+
 fn build_fan_out_borrow_context(
     program: &RawProgram,
     injection: VerifyAllocationFailureInjection,
@@ -2285,6 +2360,7 @@ fn verify_semantic_ownership(
     program: &RawProgram,
     injection: VerifyAllocationFailureInjection,
 ) -> Result<(), VerifyError> {
+    verify_no_nested_fan_out(program)?;
     let mut fan_out_visits = FanOutContextVisits::default();
     let fan_out_borrow_context =
         build_fan_out_borrow_context(program, injection, &mut fan_out_visits)?;
@@ -4327,6 +4403,34 @@ mod tests {
                 field: "ownership",
             }))
         );
+    }
+
+    #[test]
+    fn nested_fan_out_is_rejected_before_overlapping_context_scans() {
+        for width in [64_u32, 128_u32] {
+            let mut program = wide_fan_out_program(width);
+            program.nodes[1].kind = NodeKind::FanOut {
+                branches: IndexRange::default(),
+                keyword_origin: OriginIndex(0),
+            };
+            let mut visits = NestedFanOutVisits::default();
+            assert_eq!(
+                verify_no_nested_fan_out_with_visits(&program, &mut visits),
+                Err(VerifyError::MalformedProgram(MalformedProgram {
+                    invariant: Invariant::InvalidRecord,
+                    record: RecordKind::Branch,
+                    index: Some(0),
+                    field: "nested_fan_out",
+                }))
+            );
+            assert_eq!(
+                visits,
+                NestedFanOutVisits {
+                    nodes: u64::from(width) + 2,
+                    branches: 1,
+                }
+            );
+        }
     }
 
     #[test]
