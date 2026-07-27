@@ -1,0 +1,3 @@
+# Issue #4 — flat typed-program verifier
+
+Raw semantic records use owned strings, fixed-width indexes, flat arenas, and checked sidecar ranges; `VerifiedProgram` remains opaque and is created only by consuming a successfully verified `RawProgram`. Verification follows the `FWIR-SEM-016` category order, requires postorder types and nodes, and uses explicit fallible worklists so valid depth does not depend on the host stack. Ownership has one checked sink and one logical release per owned node, with narrowly validated immutable borrows for parameters, prefix spreading, and fan-out. The builder reserves every arena fallibly, and synthetic refusal and count-overflow seams keep those failures deterministic without adding a dependency.

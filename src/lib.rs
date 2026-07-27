@@ -10,6 +10,7 @@ mod primitive;
 mod resources;
 mod semantic_registry;
 mod strict_float;
+mod typed_program;
 mod value;
 
 pub use c_emitter::{CEmissionResult, emit_c_source, emit_c_source_with_configuration};
@@ -32,6 +33,14 @@ pub use native_builder::{
 pub use resources::{
     AllocationFailureInjection, ExecutionProfile, ResourceEvent, ResourceEventKind, ResourceLimits,
     ResourceObserver, ResourceUsage,
+};
+pub use typed_program::{
+    Arena, BuildError, Cardinality, ConstantIndex, ConstantRecord, Conversion, Edge, FanOutBranch,
+    Feature, IndexRange, Invariant, LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, Origin,
+    OriginIndex, OriginPosition, OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex,
+    ProgramRanges, RawProgram, RawProgramBuilder, RecordKind, ReleaseAfter, Root, RootIndex,
+    SUPPORTED_SEMANTIC_MAJOR, SUPPORTED_SEMANTIC_MINOR, ScalarConstant, ShapePlan, SourceUnit,
+    SourceUnitIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram, VerifyError,
 };
 pub use value::{ScalarType, TupleValues, Type, Value, format_type, format_value};
 
