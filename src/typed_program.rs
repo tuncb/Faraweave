@@ -163,6 +163,7 @@ pub struct Edge {
     pub producer: NodeIndex,
     pub argument_position: u32,
     pub access: ValueAccess,
+    pub cardinality: Option<Cardinality>,
     pub conversion: Conversion,
     pub ownership: OwnershipMode,
     pub origin: OriginIndex,
@@ -262,7 +263,15 @@ pub struct RawProgram {
 
 impl RawProgram {
     pub fn verify(self) -> Result<VerifiedProgram, VerifyError> {
-        verify_program(&self)?;
+        verify_program(&self, VerifyAllocationFailureInjection::none())?;
+        Ok(VerifiedProgram { raw: self })
+    }
+
+    pub fn verify_with_allocation_failure(
+        self,
+        injection: VerifyAllocationFailureInjection,
+    ) -> Result<VerifiedProgram, VerifyError> {
+        verify_program(&self, injection)?;
         Ok(VerifiedProgram { raw: self })
     }
 }
@@ -319,20 +328,61 @@ pub enum Invariant {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerifyError {
+pub struct MalformedProgram {
     pub invariant: Invariant,
     pub record: RecordKind,
     pub index: Option<u32>,
     pub field: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifyAllocationSite {
+    DynamicShapeScratch,
+    ReachabilityBits,
+    ReachabilityWorklist,
+    OwnershipSinks,
+    OwnershipLastUse,
+    OwnershipRootOwner,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VerifyAllocationFailureInjection {
+    fail_at: Option<VerifyAllocationSite>,
+}
+
+impl VerifyAllocationFailureInjection {
+    pub const fn none() -> Self {
+        Self { fail_at: None }
+    }
+
+    pub const fn at(site: VerifyAllocationSite) -> Self {
+        Self {
+            fail_at: Some(site),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifyError {
+    MalformedProgram(MalformedProgram),
+    AllocationUnavailable { site: VerifyAllocationSite },
+}
+
 impl std::fmt::Display for VerifyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "malformed program: {:?} at {:?} {:?}.{}",
-            self.invariant, self.record, self.index, self.field
-        )
+        match self {
+            Self::MalformedProgram(error) => write!(
+                formatter,
+                "malformed program: {:?} at {:?} {:?}.{}",
+                error.invariant, error.record, error.index, error.field
+            ),
+            Self::AllocationUnavailable { site } => {
+                write!(
+                    formatter,
+                    "typed-program verification allocation unavailable at {site:?}"
+                )
+            }
+        }
     }
 }
 
@@ -544,16 +594,19 @@ fn checked_count(length: u64, arena: Arena) -> Result<u32, BuildError> {
     u32::try_from(length).map_err(|_| BuildError::CountOverflow { arena })
 }
 
-fn verify_program(program: &RawProgram) -> Result<(), VerifyError> {
+fn verify_program(
+    program: &RawProgram,
+    injection: VerifyAllocationFailureInjection,
+) -> Result<(), VerifyError> {
     if program.module.semantic_major != SUPPORTED_SEMANTIC_MAJOR
         || program.module.semantic_minor > SUPPORTED_SEMANTIC_MINOR
     {
-        return Err(VerifyError {
-            invariant: Invariant::UnsupportedVersion,
-            record: RecordKind::Module,
-            index: None,
-            field: "semantic_version",
-        });
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "semantic_version",
+        ));
     }
     let mut previous_feature = None;
     for (index, feature) in program.features.iter().copied().enumerate() {
@@ -565,31 +618,32 @@ fn verify_program(program: &RawProgram) -> Result<(), VerifyError> {
         ]
         .contains(&feature)
         {
-            return Err(VerifyError {
-                invariant: Invariant::UnknownFeature,
-                record: RecordKind::Feature,
-                index: u32::try_from(index).ok(),
-                field: "id",
-            });
+            return Err(malformed(
+                Invariant::UnknownFeature,
+                RecordKind::Feature,
+                u32::try_from(index).ok(),
+                "id",
+            ));
         }
         if previous_feature.is_some_and(|previous| previous >= feature) {
-            return Err(VerifyError {
-                invariant: Invariant::DuplicateFeature,
-                record: RecordKind::Feature,
-                index: checked_index(index),
-                field: "id",
-            });
+            return Err(malformed(
+                Invariant::DuplicateFeature,
+                RecordKind::Feature,
+                checked_index(index),
+                "id",
+            ));
         }
         previous_feature = Some(feature);
     }
     verify_module_ranges(program)?;
-    verify_sources_and_origins(program)?;
     verify_parameters(program)?;
     verify_types(program)?;
     verify_constants(program)?;
-    verify_nodes_and_edges(program)?;
-    verify_reachability(program)?;
-    verify_ownership(program)?;
+    verify_sources_and_origins(program)?;
+    verify_node_and_edge_references(program)?;
+    verify_reachability(program, injection)?;
+    verify_node_metadata(program, injection)?;
+    verify_semantic_ownership(program, injection)?;
     verify_roots_and_features(program)?;
     Ok(())
 }
@@ -604,11 +658,26 @@ fn malformed(
     index: Option<u32>,
     field: &'static str,
 ) -> VerifyError {
-    VerifyError {
+    VerifyError::MalformedProgram(MalformedProgram {
         invariant,
         record,
         index,
         field,
+    })
+}
+
+fn allocation_error(site: VerifyAllocationSite) -> VerifyError {
+    VerifyError::AllocationUnavailable { site }
+}
+
+fn injected(
+    injection: VerifyAllocationFailureInjection,
+    site: VerifyAllocationSite,
+) -> Result<(), VerifyError> {
+    if injection.fail_at == Some(site) {
+        Err(allocation_error(site))
+    } else {
+        Ok(())
     }
 }
 
@@ -1020,6 +1089,72 @@ fn edge_type(program: &RawProgram, edge: Edge) -> Option<TypeIndex> {
     }
 }
 
+fn cardinality_matches_type(
+    program: &RawProgram,
+    type_index: TypeIndex,
+    cardinality: Option<Cardinality>,
+) -> bool {
+    match type_record(program, type_index) {
+        Some(TypeRecord::Scalar(_)) => cardinality == Some(Cardinality::StaticScalar),
+        Some(TypeRecord::Vector(_)) => matches!(
+            cardinality,
+            Some(Cardinality::StaticVector(_) | Cardinality::DynamicVector)
+        ),
+        Some(TypeRecord::Tuple { .. }) => cardinality.is_none(),
+        None => false,
+    }
+}
+
+fn tuple_element_cardinality(
+    program: &RawProgram,
+    mut prepared: NodeIndex,
+    element: u32,
+) -> Option<Option<Cardinality>> {
+    loop {
+        let node = program.nodes.get(prepared.0 as usize)?;
+        if !matches!(node.kind, NodeKind::PrefixSpreadPrepare) {
+            return None;
+        }
+        let prepared_edges = range_bounds(
+            node.edges,
+            program.edges.len(),
+            RecordKind::Node,
+            prepared.0,
+            "edges",
+        )
+        .ok()?;
+        let owner = program.edges.get(prepared_edges.start)?.producer;
+        let owner_node = program.nodes.get(owner.0 as usize)?;
+        match owner_node.kind {
+            NodeKind::TupleConstruct => {
+                let owner_edges = range_bounds(
+                    owner_node.edges,
+                    program.edges.len(),
+                    RecordKind::Node,
+                    owner.0,
+                    "edges",
+                )
+                .ok()?;
+                return program
+                    .edges
+                    .get(owner_edges.start.checked_add(element as usize)?)
+                    .map(|edge| edge.cardinality);
+            }
+            NodeKind::FanOut { branches, .. } => {
+                let branch = program
+                    .branches
+                    .get(branches.start.checked_add(element)? as usize)?;
+                return program
+                    .nodes
+                    .get(branch.root.0 as usize)
+                    .map(|root| root.cardinality);
+            }
+            NodeKind::PrefixSpreadPrepare => prepared = owner,
+            _ => return None,
+        }
+    }
+}
+
 fn scalar_container(program: &RawProgram, index: TypeIndex) -> Option<(ScalarType, bool)> {
     match type_record(program, index)? {
         TypeRecord::Scalar(scalar) => Some((scalar, false)),
@@ -1028,7 +1163,7 @@ fn scalar_container(program: &RawProgram, index: TypeIndex) -> Option<(ScalarTyp
     }
 }
 
-fn verify_nodes_and_edges(program: &RawProgram) -> Result<(), VerifyError> {
+fn verify_node_and_edge_references(program: &RawProgram) -> Result<(), VerifyError> {
     let mut next_edge = 0_u32;
     let mut next_shape_check = 0_u32;
     let mut next_branch = 0_u32;
@@ -1101,6 +1236,55 @@ fn verify_nodes_and_edges(program: &RawProgram) -> Result<(), VerifyError> {
                 ));
             }
         }
+        match node.kind {
+            NodeKind::Constant { constant } => {
+                if !in_bounds(constant.0, program.constants.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "constant",
+                    ));
+                }
+            }
+            NodeKind::ParameterBorrow { parameter } => {
+                if !in_bounds(parameter.0, program.parameters.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "parameter",
+                    ));
+                }
+            }
+            NodeKind::SelectedApply {
+                primitive_origin, ..
+            } => {
+                if !in_bounds(primitive_origin.0, program.origins.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "primitive_origin",
+                    ));
+                }
+            }
+            NodeKind::FanOut {
+                branches,
+                keyword_origin,
+            } => {
+                if !in_bounds(keyword_origin.0, program.origins.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "keyword_origin",
+                    ));
+                }
+                verify_fan_out_references(program, node_index, branches)?;
+            }
+            NodeKind::TupleConstruct | NodeKind::PrefixSpreadPrepare => {}
+        }
         next_edge = node.edges.checked_end().ok_or_else(|| {
             malformed(
                 Invariant::RangeOverflow,
@@ -1109,7 +1293,6 @@ fn verify_nodes_and_edges(program: &RawProgram) -> Result<(), VerifyError> {
                 "edges",
             )
         })?;
-        verify_node(program, node_index, node, edges)?;
         if let NodeKind::SelectedApply { shape, .. } = node.kind {
             if shape.dynamic_checks.start != next_shape_check {
                 return Err(malformed(
@@ -1137,7 +1320,6 @@ fn verify_nodes_and_edges(program: &RawProgram) -> Result<(), VerifyError> {
                     "branches",
                 ));
             }
-            verify_fan_out(program, node_index, node, edges, branches)?;
             next_branch = branches.checked_end().ok_or_else(|| {
                 malformed(
                     Invariant::RangeOverflow,
@@ -1175,11 +1357,190 @@ fn verify_nodes_and_edges(program: &RawProgram) -> Result<(), VerifyError> {
     Ok(())
 }
 
+fn verify_node_metadata(
+    program: &RawProgram,
+    injection: VerifyAllocationFailureInjection,
+) -> Result<(), VerifyError> {
+    for (index, node) in program.nodes.iter().copied().enumerate() {
+        let node_index = u32::try_from(index).unwrap_or(u32::MAX);
+        let bounds = range_bounds(
+            node.edges,
+            program.edges.len(),
+            RecordKind::Node,
+            node_index,
+            "edges",
+        )?;
+        for (offset, edge) in program.edges[bounds.clone()].iter().copied().enumerate() {
+            let edge_index = node.edges.start.saturating_add(offset as u32);
+            let edge_type = edge_type(program, edge).ok_or_else(|| {
+                malformed(
+                    Invariant::InvalidRecord,
+                    RecordKind::Edge,
+                    Some(edge_index),
+                    "access",
+                )
+            })?;
+            let expected_cardinality = match edge.access {
+                ValueAccess::TupleElement(element) => {
+                    tuple_element_cardinality(program, edge.producer, element)
+                }
+                ValueAccess::WholeValue | ValueAccess::FanOutOperandBorrow => {
+                    Some(program.nodes[edge.producer.0 as usize].cardinality)
+                }
+            };
+            if !cardinality_matches_type(program, edge_type, edge.cardinality)
+                || expected_cardinality != Some(edge.cardinality)
+            {
+                return Err(malformed(
+                    Invariant::InconsistentResultMetadata,
+                    RecordKind::Edge,
+                    Some(edge_index),
+                    "cardinality",
+                ));
+            }
+        }
+        verify_node(program, node_index, node, &program.edges[bounds], injection)?;
+        if let NodeKind::FanOut { branches, .. } = node.kind {
+            verify_fan_out_result_metadata(program, node_index, node, branches)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_fan_out_references(
+    program: &RawProgram,
+    node_index: u32,
+    branches: IndexRange,
+) -> Result<(), VerifyError> {
+    let bounds = range_bounds(
+        branches,
+        program.branches.len(),
+        RecordKind::Node,
+        node_index,
+        "branches",
+    )?;
+    let mut previous_end = program
+        .nodes
+        .get(node_index as usize)
+        .and_then(|node| {
+            range_bounds(
+                node.edges,
+                program.edges.len(),
+                RecordKind::Node,
+                node_index,
+                "edges",
+            )
+            .ok()
+        })
+        .and_then(|edges| program.edges[edges].first())
+        .and_then(|edge| edge.producer.0.checked_add(1))
+        .ok_or_else(|| {
+            malformed(
+                Invariant::InvalidRecord,
+                RecordKind::Node,
+                Some(node_index),
+                "fan_out.operand",
+            )
+        })?;
+    for (offset, branch) in program.branches[bounds].iter().copied().enumerate() {
+        let branch_index = branches.start.saturating_add(offset as u32);
+        let end = branch.nodes.checked_end().ok_or_else(|| {
+            malformed(
+                Invariant::RangeOverflow,
+                RecordKind::Branch,
+                Some(branch_index),
+                "nodes",
+            )
+        })?;
+        if branch.nodes.start != previous_end
+            || branch.nodes.count == 0
+            || end > node_index
+            || branch.root.0 < branch.nodes.start
+            || branch.root.0 >= end
+        {
+            return Err(malformed(
+                Invariant::NonPostorderReference,
+                RecordKind::Branch,
+                Some(branch_index),
+                "nodes",
+            ));
+        }
+        if !in_bounds(branch.origin.0, program.origins.len())
+            || !in_bounds(branch.placeholder_origin.0, program.origins.len())
+        {
+            return Err(malformed(
+                Invariant::IndexOutOfBounds,
+                RecordKind::Branch,
+                Some(branch_index),
+                "origin",
+            ));
+        }
+        previous_end = end;
+    }
+    if previous_end != node_index {
+        return Err(malformed(
+            Invariant::RangeMismatch,
+            RecordKind::Node,
+            Some(node_index),
+            "fan_out.region",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_fan_out_result_metadata(
+    program: &RawProgram,
+    node_index: u32,
+    node: Node,
+    branches: IndexRange,
+) -> Result<(), VerifyError> {
+    let Some(TypeRecord::Tuple { elements }) = type_record(program, node.result_type) else {
+        return Err(malformed(
+            Invariant::InconsistentResultMetadata,
+            RecordKind::Node,
+            Some(node_index),
+            "result_type",
+        ));
+    };
+    if elements.count != branches.count {
+        return Err(malformed(
+            Invariant::InconsistentResultMetadata,
+            RecordKind::Node,
+            Some(node_index),
+            "result_type",
+        ));
+    }
+    let bounds = range_bounds(
+        branches,
+        program.branches.len(),
+        RecordKind::Node,
+        node_index,
+        "branches",
+    )?;
+    for (offset, branch) in program.branches[bounds].iter().enumerate() {
+        let expected_type = program.type_elements[elements.start as usize + offset];
+        if program
+            .nodes
+            .get(branch.root.0 as usize)
+            .is_some_and(|root| root.result_type != expected_type)
+        {
+            return Err(malformed(
+                Invariant::InconsistentResultMetadata,
+                RecordKind::Branch,
+                Some(branches.start.saturating_add(offset as u32)),
+                "root",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_node(
     program: &RawProgram,
     node_index: u32,
     node: Node,
     edges: &[Edge],
+    injection: VerifyAllocationFailureInjection,
 ) -> Result<(), VerifyError> {
     let inconsistent = |field| {
         malformed(
@@ -1256,12 +1617,16 @@ fn verify_node(
                 return Err(inconsistent("cardinality"));
             }
             for (offset, edge) in edges.iter().copied().enumerate() {
-                let expected = program.type_elements
-                    [usize::try_from(elements.start).unwrap_or(usize::MAX) + offset];
+                let expected_index = usize::try_from(elements.start)
+                    .ok()
+                    .and_then(|start| start.checked_add(offset));
+                let expected = expected_index
+                    .and_then(|index| program.type_elements.get(index))
+                    .copied()
+                    .ok_or_else(|| inconsistent("elements"))?;
                 if edge_type(program, edge) != Some(expected)
                     || edge.access != ValueAccess::WholeValue
                     || edge.conversion != Conversion::Identity
-                    || edge.ownership != OwnershipMode::InfallibleTransfer
                 {
                     return Err(inconsistent("elements"));
                 }
@@ -1271,7 +1636,6 @@ fn verify_node(
             if edges.len() != 1
                 || edges[0].access != ValueAccess::WholeValue
                 || edges[0].conversion != Conversion::Identity
-                || edges[0].ownership != OwnershipMode::InfallibleTransfer
                 || !matches!(
                     type_record(program, node.result_type),
                     Some(TypeRecord::Tuple { .. })
@@ -1302,6 +1666,7 @@ fn verify_node(
             lift,
             result_element_type,
             shape,
+            injection,
         )?,
         NodeKind::FanOut { .. } => {
             if node.cardinality.is_some() {
@@ -1325,6 +1690,7 @@ fn verify_apply(
     lift: LiftMode,
     result_element_type: ScalarType,
     shape: ShapePlan,
+    injection: VerifyAllocationFailureInjection,
 ) -> Result<(), VerifyError> {
     use crate::semantic_registry::{StructuralBehavior, implementation_from_numeric};
     let descriptor = implementation_from_numeric(implementation_id).map_err(|_| {
@@ -1366,15 +1732,11 @@ fn verify_apply(
     let mut any_dynamic = false;
     let mut static_length = None;
     let mut first_static = None;
+    injected(injection, VerifyAllocationSite::DynamicShapeScratch)?;
     let mut expected_dynamic = Vec::new();
-    expected_dynamic.try_reserve(edges.len()).map_err(|_| {
-        malformed(
-            Invariant::InvalidRecord,
-            RecordKind::Node,
-            Some(node_index),
-            "shape",
-        )
-    })?;
+    expected_dynamic
+        .try_reserve(edges.len())
+        .map_err(|_| allocation_error(VerifyAllocationSite::DynamicShapeScratch))?;
     for (offset, (edge, accepted)) in edges
         .iter()
         .copied()
@@ -1414,35 +1776,9 @@ fn verify_apply(
                 "conversion",
             ));
         }
-        let producer_kind = program.nodes[edge.producer.0 as usize].kind;
-        let valid_ownership = match edge.access {
-            ValueAccess::WholeValue => {
-                if matches!(producer_kind, NodeKind::ParameterBorrow { .. }) {
-                    edge.ownership == OwnershipMode::ImmutableBorrow
-                } else {
-                    edge.ownership == OwnershipMode::OwnedInput
-                }
-            }
-            ValueAccess::TupleElement(_) => {
-                matches!(producer_kind, NodeKind::PrefixSpreadPrepare)
-                    && edge.ownership == OwnershipMode::ImmutableBorrow
-            }
-            ValueAccess::FanOutOperandBorrow => {
-                edge.ownership == OwnershipMode::ImmutableBorrow
-                    && fan_out_borrow_has_context(program, node_index, edge.producer)
-            }
-        };
-        if !valid_ownership {
-            return Err(malformed(
-                Invariant::AmbiguousOwnership,
-                RecordKind::Edge,
-                Some(node.edges.start.saturating_add(offset as u32)),
-                "ownership",
-            ));
-        }
         if vector {
             any_vector = true;
-            match program.nodes[edge.producer.0 as usize].cardinality {
+            match edge.cardinality {
                 Some(Cardinality::StaticVector(length)) => {
                     if first_static.is_none() {
                         first_static = Some(offset as u32);
@@ -1479,10 +1815,9 @@ fn verify_apply(
         "shape.dynamic_checks",
     )?;
     let actual_dynamic = &program.shape_checks[dynamic_bounds];
-    let expected_dynamic: Vec<u32> = expected_dynamic
-        .into_iter()
-        .map(|offset| node.edges.start.saturating_add(offset))
-        .collect();
+    for edge_index in &mut expected_dynamic {
+        *edge_index = node.edges.start.saturating_add(*edge_index);
+    }
     if shape.static_anchor != first_static || actual_dynamic != expected_dynamic {
         return Err(malformed(
             Invariant::InconsistentResultMetadata,
@@ -1590,11 +1925,19 @@ fn verify_fan_out(
             "keyword_origin",
         ));
     }
+    let operand_is_parameter = edges
+        .first()
+        .and_then(|edge| program.nodes.get(edge.producer.0 as usize))
+        .is_some_and(|node| matches!(node.kind, NodeKind::ParameterBorrow { .. }));
     if branches.count == 0
         || edges.len() != 1
         || edges[0].access != ValueAccess::WholeValue
         || edges[0].conversion != Conversion::Identity
-        || edges[0].ownership != OwnershipMode::OwnedInput
+        || if operand_is_parameter {
+            edges[0].ownership != OwnershipMode::ImmutableBorrow
+        } else {
+            edges[0].ownership != OwnershipMode::OwnedInput
+        }
     {
         return Err(malformed(
             Invariant::InvalidRecord,
@@ -1666,6 +2009,17 @@ fn verify_fan_out(
                 "origin",
             ));
         }
+        if !matches!(
+            program.nodes[branch.root.0 as usize].kind,
+            NodeKind::SelectedApply { .. }
+        ) {
+            return Err(malformed(
+                Invariant::InvalidRecord,
+                RecordKind::Branch,
+                Some(branch_index),
+                "root_kind",
+            ));
+        }
         let start = branch.nodes.start as usize;
         let end = branch.nodes.checked_end().unwrap_or(branch.nodes.start) as usize;
         let mut placeholders = 0_u32;
@@ -1685,6 +2039,14 @@ fn verify_fan_out(
                 .unwrap_or(branch_node.edges.start) as usize;
             for edge in &program.edges[edge_start..edge_end] {
                 if edge.access == ValueAccess::FanOutOperandBorrow {
+                    if !matches!(branch_node.kind, NodeKind::SelectedApply { .. }) {
+                        return Err(malformed(
+                            Invariant::InvalidRecord,
+                            RecordKind::Branch,
+                            Some(branch_index),
+                            "placeholder_aggregate",
+                        ));
+                    }
                     if edge.producer != operand || edge.ownership != OwnershipMode::ImmutableBorrow
                     {
                         return Err(malformed(
@@ -1728,30 +2090,24 @@ fn verify_fan_out(
     Ok(())
 }
 
-fn verify_reachability(program: &RawProgram) -> Result<(), VerifyError> {
+fn verify_reachability(
+    program: &RawProgram,
+    injection: VerifyAllocationFailureInjection,
+) -> Result<(), VerifyError> {
+    injected(injection, VerifyAllocationSite::ReachabilityBits)?;
     let mut reachable = Vec::new();
     reachable
         .try_reserve_exact(program.nodes.len())
-        .map_err(|_| {
-            malformed(
-                Invariant::InvalidRecord,
-                RecordKind::Node,
-                None,
-                "reachability_allocation",
-            )
-        })?;
+        .map_err(|_| allocation_error(VerifyAllocationSite::ReachabilityBits))?;
     reachable.resize(program.nodes.len(), false);
+    injected(injection, VerifyAllocationSite::ReachabilityWorklist)?;
     let mut work = Vec::new();
-    work.try_reserve(program.roots.len()).map_err(|_| {
-        malformed(
-            Invariant::InvalidRecord,
-            RecordKind::Root,
-            None,
-            "reachability_allocation",
-        )
-    })?;
-    for root in program.roots.iter().rev() {
-        push_verify_work(&mut work, root.node)?;
+    work.try_reserve(program.roots.len())
+        .map_err(|_| allocation_error(VerifyAllocationSite::ReachabilityWorklist))?;
+    for (root_index, root) in program.roots.iter().enumerate().rev() {
+        if let Some(node) = root_traversal_node(program, root_index, *root) {
+            push_verify_work(&mut work, node)?;
+        }
     }
     while let Some(node_index) = work.pop() {
         let index = node_index.0 as usize;
@@ -1798,15 +2154,26 @@ fn verify_reachability(program: &RawProgram) -> Result<(), VerifyError> {
     Ok(())
 }
 
+fn root_traversal_node(program: &RawProgram, root_index: usize, root: Root) -> Option<NodeIndex> {
+    if in_bounds(root.node.0, program.nodes.len()) {
+        return Some(root.node);
+    }
+    let root_index = u32::try_from(root_index).ok()?;
+    let mut owners = program
+        .ownership
+        .iter()
+        .filter(|ownership| {
+            ownership.release_after == ReleaseAfter::Root(RootIndex(root_index))
+                && in_bounds(ownership.owner.0, program.nodes.len())
+        })
+        .map(|ownership| ownership.owner);
+    let owner = owners.next()?;
+    owners.next().is_none().then_some(owner)
+}
+
 fn push_verify_work(work: &mut Vec<NodeIndex>, node: NodeIndex) -> Result<(), VerifyError> {
-    work.try_reserve(1).map_err(|_| {
-        malformed(
-            Invariant::InvalidRecord,
-            RecordKind::Node,
-            Some(node.0),
-            "reachability_allocation",
-        )
-    })?;
+    work.try_reserve(1)
+        .map_err(|_| allocation_error(VerifyAllocationSite::ReachabilityWorklist))?;
     work.push(node);
     Ok(())
 }
@@ -1814,19 +2181,104 @@ fn push_verify_work(work: &mut Vec<NodeIndex>, node: NodeIndex) -> Result<(), Ve
 fn filled_verify_vec<T: Clone>(
     length: usize,
     value: T,
-    field: &'static str,
+    site: VerifyAllocationSite,
 ) -> Result<Vec<T>, VerifyError> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(length)
-        .map_err(|_| malformed(Invariant::InvalidRecord, RecordKind::Ownership, None, field))?;
+        .map_err(|_| allocation_error(site))?;
     values.resize(length, value);
     Ok(values)
 }
 
-fn verify_ownership(program: &RawProgram) -> Result<(), VerifyError> {
-    let mut sinks = filled_verify_vec(program.nodes.len(), 0_u32, "sinks_allocation")?;
-    let mut last_use = filled_verify_vec(program.nodes.len(), None, "last_use_allocation")?;
+fn verify_semantic_ownership(
+    program: &RawProgram,
+    injection: VerifyAllocationFailureInjection,
+) -> Result<(), VerifyError> {
+    for (consumer_index, node) in program.nodes.iter().copied().enumerate() {
+        let bounds = range_bounds(
+            node.edges,
+            program.edges.len(),
+            RecordKind::Node,
+            consumer_index as u32,
+            "edges",
+        )?;
+        for (offset, edge) in program.edges[bounds.clone()].iter().copied().enumerate() {
+            let producer_kind = program.nodes[edge.producer.0 as usize].kind;
+            let parameter = matches!(producer_kind, NodeKind::ParameterBorrow { .. });
+            let valid = match (node.kind, edge.access) {
+                (NodeKind::TupleConstruct, ValueAccess::WholeValue) => {
+                    if parameter {
+                        edge.ownership == OwnershipMode::ImmutableBorrow
+                    } else {
+                        edge.ownership == OwnershipMode::InfallibleTransfer
+                    }
+                }
+                (NodeKind::PrefixSpreadPrepare, ValueAccess::WholeValue) => {
+                    edge.ownership == OwnershipMode::InfallibleTransfer
+                }
+                (NodeKind::SelectedApply { .. }, ValueAccess::WholeValue) => {
+                    if parameter {
+                        edge.ownership == OwnershipMode::ImmutableBorrow
+                    } else {
+                        edge.ownership == OwnershipMode::OwnedInput
+                    }
+                }
+                (NodeKind::SelectedApply { .. }, ValueAccess::TupleElement(_)) => {
+                    matches!(producer_kind, NodeKind::PrefixSpreadPrepare)
+                        && edge.ownership == OwnershipMode::ImmutableBorrow
+                }
+                (NodeKind::SelectedApply { .. }, ValueAccess::FanOutOperandBorrow) => {
+                    edge.ownership == OwnershipMode::ImmutableBorrow
+                        && fan_out_borrow_has_context(program, consumer_index as u32, edge.producer)
+                }
+                (NodeKind::FanOut { .. }, ValueAccess::WholeValue) => {
+                    if parameter {
+                        edge.ownership == OwnershipMode::ImmutableBorrow
+                    } else {
+                        edge.ownership == OwnershipMode::OwnedInput
+                    }
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(malformed(
+                    Invariant::AmbiguousOwnership,
+                    RecordKind::Edge,
+                    Some(node.edges.start.saturating_add(offset as u32)),
+                    "ownership",
+                ));
+            }
+        }
+        if let NodeKind::FanOut { branches, .. } = node.kind {
+            verify_fan_out(
+                program,
+                consumer_index as u32,
+                node,
+                &program.edges[bounds],
+                branches,
+            )?;
+        }
+    }
+    verify_ownership(program, injection)
+}
+
+fn verify_ownership(
+    program: &RawProgram,
+    injection: VerifyAllocationFailureInjection,
+) -> Result<(), VerifyError> {
+    injected(injection, VerifyAllocationSite::OwnershipSinks)?;
+    let mut sinks = filled_verify_vec(
+        program.nodes.len(),
+        0_u32,
+        VerifyAllocationSite::OwnershipSinks,
+    )?;
+    injected(injection, VerifyAllocationSite::OwnershipLastUse)?;
+    let mut last_use = filled_verify_vec(
+        program.nodes.len(),
+        None,
+        VerifyAllocationSite::OwnershipLastUse,
+    )?;
     for (consumer, node) in program.nodes.iter().enumerate() {
         let bounds = range_bounds(
             node.edges,
@@ -1858,22 +2310,22 @@ fn verify_ownership(program: &RawProgram) -> Result<(), VerifyError> {
             }
         }
     }
-    let mut root_owner = filled_verify_vec(program.nodes.len(), None, "root_owner_allocation")?;
+    injected(injection, VerifyAllocationSite::OwnershipRootOwner)?;
+    let mut root_owner = filled_verify_vec(
+        program.nodes.len(),
+        None,
+        VerifyAllocationSite::OwnershipRootOwner,
+    )?;
     for (root_index, root) in program.roots.iter().enumerate() {
-        if !in_bounds(root.node.0, program.nodes.len()) {
-            return Err(malformed(
-                Invariant::IndexOutOfBounds,
-                RecordKind::Root,
-                checked_index(root_index),
-                "node",
-            ));
-        }
+        let Some(root_node) = root_traversal_node(program, root_index, *root) else {
+            continue;
+        };
         if !matches!(
-            program.nodes[root.node.0 as usize].kind,
+            program.nodes[root_node.0 as usize].kind,
             NodeKind::ParameterBorrow { .. }
         ) {
-            sinks[root.node.0 as usize] = sinks[root.node.0 as usize].saturating_add(1);
-            root_owner[root.node.0 as usize] = Some(RootIndex(root_index as u32));
+            sinks[root_node.0 as usize] = sinks[root_node.0 as usize].saturating_add(1);
+            root_owner[root_node.0 as usize] = Some(RootIndex(root_index as u32));
         }
     }
     for (index, node) in program.nodes.iter().enumerate() {
@@ -1954,6 +2406,14 @@ fn has_feature(program: &RawProgram, feature: Feature) -> bool {
 
 fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
     for (index, root) in program.roots.iter().enumerate() {
+        if !in_bounds(root.node.0, program.nodes.len()) {
+            return Err(malformed(
+                Invariant::IndexOutOfBounds,
+                RecordKind::Root,
+                checked_index(index),
+                "node",
+            ));
+        }
         if !in_bounds(root.origin.0, program.origins.len()) {
             return Err(malformed(
                 Invariant::IndexOutOfBounds,
@@ -2111,6 +2571,7 @@ mod tests {
             producer: first_node,
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::InfallibleTransfer,
             origin,
@@ -2119,6 +2580,7 @@ mod tests {
             producer: second_node,
             argument_position: 2,
             access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::InfallibleTransfer,
             origin,
@@ -2182,6 +2644,7 @@ mod tests {
                 producer,
                 argument_position: position,
                 access: ValueAccess::WholeValue,
+                cardinality: Some(Cardinality::StaticVector(2)),
                 conversion: Conversion::Identity,
                 ownership: OwnershipMode::OwnedInput,
                 origin,
@@ -2240,6 +2703,7 @@ mod tests {
             producer: bound,
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::OwnedInput,
             origin,
@@ -2306,6 +2770,7 @@ mod tests {
             producer: left_bound,
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::OwnedInput,
             origin,
@@ -2332,6 +2797,7 @@ mod tests {
             producer: right_bound,
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::OwnedInput,
             origin,
@@ -2359,6 +2825,7 @@ mod tests {
                 producer,
                 argument_position: position,
                 access: ValueAccess::WholeValue,
+                cardinality: Some(Cardinality::DynamicVector),
                 conversion: Conversion::Identity,
                 ownership: OwnershipMode::OwnedInput,
                 origin,
@@ -2419,6 +2886,7 @@ mod tests {
             producer: tuple,
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: None,
             conversion: Conversion::Identity,
             ownership: OwnershipMode::InfallibleTransfer,
             origin: OriginIndex(0),
@@ -2435,6 +2903,7 @@ mod tests {
                 producer: NodeIndex(3),
                 argument_position: element + 1,
                 access: ValueAccess::TupleElement(element),
+                cardinality: Some(Cardinality::StaticScalar),
                 conversion: Conversion::Identity,
                 ownership: OwnershipMode::ImmutableBorrow,
                 origin: OriginIndex(0),
@@ -2497,6 +2966,7 @@ mod tests {
             producer: operand,
             argument_position: 1,
             access: ValueAccess::FanOutOperandBorrow,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::ImmutableBorrow,
             origin,
@@ -2523,6 +2993,7 @@ mod tests {
             producer: operand,
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::OwnedInput,
             origin,
@@ -2563,7 +3034,10 @@ mod tests {
     fn verify_error(program: RawProgram, invariant: Invariant) {
         match program.verify() {
             Ok(_) => panic!("fixture unexpectedly verified"),
-            Err(error) => assert_eq!(error.invariant, invariant, "{error:?}"),
+            Err(VerifyError::MalformedProgram(error)) => {
+                assert_eq!(error.invariant, invariant, "{error:?}");
+            }
+            Err(error) => panic!("expected malformed program, got {error:?}"),
         }
     }
 
@@ -2642,6 +3116,7 @@ mod tests {
             producer: NodeIndex(0),
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::OwnedInput,
             origin: OriginIndex(0),
@@ -2662,7 +3137,7 @@ mod tests {
 
         let mut bad_edge = tuple_program();
         bad_edge.edges[0].ownership = OwnershipMode::OwnedInput;
-        verify_error(bad_edge, Invariant::InconsistentResultMetadata);
+        verify_error(bad_edge, Invariant::AmbiguousOwnership);
 
         let mut stray_fan_out_borrow = iota_program();
         stray_fan_out_borrow.edges[0].access = ValueAccess::FanOutOperandBorrow;
@@ -2674,6 +3149,7 @@ mod tests {
             producer: NodeIndex(1),
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: None,
             conversion: Conversion::Identity,
             ownership: OwnershipMode::OwnedInput,
             origin: OriginIndex(0),
@@ -2727,6 +3203,10 @@ mod tests {
         root.roots[0].origin = OriginIndex(9);
         verify_error(root, Invariant::IndexOutOfBounds);
 
+        let mut root_node = scalar_program();
+        root_node.roots[0].node = NodeIndex(9);
+        verify_error(root_node, Invariant::IndexOutOfBounds);
+
         let mut feature = tuple_program();
         feature.features.clear();
         feature.module.ranges.features.count = 0;
@@ -2775,6 +3255,350 @@ mod tests {
         ));
     }
 
+    fn vector_prefix_spread_program(left_dynamic: bool, right_dynamic: bool) -> RawProgram {
+        let mut builder = RawProgramBuilder::new();
+        for feature in [
+            Feature::StableSemanticIds,
+            Feature::Tuples,
+            Feature::PrefixSpread,
+        ] {
+            must(builder.push_feature(feature.numeric()));
+        }
+        let origin = source_fixture(&mut builder);
+        let int_type = must(builder.push_type(TypeRecord::Scalar(ScalarType::Int)));
+        let vector_type = must(builder.push_type(TypeRecord::Vector(ScalarType::Int)));
+        must(builder.push_type_element(vector_type));
+        must(builder.push_type_element(vector_type));
+        let tuple_type = must(builder.push_type(TypeRecord::Tuple {
+            elements: IndexRange { start: 0, count: 2 },
+        }));
+
+        let mut elements = Vec::new();
+        let mut releases = Vec::new();
+        for dynamic in [left_dynamic, right_dynamic] {
+            if dynamic {
+                let bound_value =
+                    must(builder.push_constant(ConstantRecord::Scalar(ScalarConstant::Int(2))));
+                let bound = must(builder.push_node(Node {
+                    kind: NodeKind::Constant {
+                        constant: bound_value,
+                    },
+                    result_type: int_type,
+                    cardinality: Some(Cardinality::StaticScalar),
+                    edges: IndexRange {
+                        start: builder.raw.edges.len() as u32,
+                        count: 0,
+                    },
+                    origin,
+                }));
+                let edge_start = builder.raw.edges.len() as u32;
+                must(builder.push_edge(Edge {
+                    producer: bound,
+                    argument_position: 1,
+                    access: ValueAccess::WholeValue,
+                    cardinality: Some(Cardinality::StaticScalar),
+                    conversion: Conversion::Identity,
+                    ownership: OwnershipMode::OwnedInput,
+                    origin,
+                }));
+                let vector = must(builder.push_node(Node {
+                    kind: NodeKind::SelectedApply {
+                        primitive_id: 19,
+                        signature_id: 34,
+                        implementation_id: 34,
+                        primitive_origin: origin,
+                        lift: LiftMode::DynamicVector,
+                        result_element_type: ScalarType::Int,
+                        shape: ShapePlan {
+                            static_anchor: None,
+                            dynamic_checks: IndexRange::default(),
+                        },
+                    },
+                    result_type: vector_type,
+                    cardinality: Some(Cardinality::DynamicVector),
+                    edges: IndexRange {
+                        start: edge_start,
+                        count: 1,
+                    },
+                    origin,
+                }));
+                releases.push((bound, ReleaseAfter::Node(vector)));
+                elements.push((vector, Cardinality::DynamicVector));
+            } else {
+                let element_start = builder.raw.constant_elements.len() as u32;
+                must(builder.push_constant_element(ScalarConstant::Int(1)));
+                must(builder.push_constant_element(ScalarConstant::Int(2)));
+                let value = must(builder.push_constant(ConstantRecord::Vector {
+                    element_type: ScalarType::Int,
+                    elements: IndexRange {
+                        start: element_start,
+                        count: 2,
+                    },
+                }));
+                let vector = must(builder.push_node(Node {
+                    kind: NodeKind::Constant { constant: value },
+                    result_type: vector_type,
+                    cardinality: Some(Cardinality::StaticVector(2)),
+                    edges: IndexRange {
+                        start: builder.raw.edges.len() as u32,
+                        count: 0,
+                    },
+                    origin,
+                }));
+                elements.push((vector, Cardinality::StaticVector(2)));
+            }
+        }
+        let tuple_edge_start = builder.raw.edges.len() as u32;
+        for (position, (producer, cardinality)) in elements.iter().copied().enumerate() {
+            must(builder.push_edge(Edge {
+                producer,
+                argument_position: position as u32 + 1,
+                access: ValueAccess::WholeValue,
+                cardinality: Some(cardinality),
+                conversion: Conversion::Identity,
+                ownership: OwnershipMode::InfallibleTransfer,
+                origin,
+            }));
+        }
+        let tuple = must(builder.push_node(Node {
+            kind: NodeKind::TupleConstruct,
+            result_type: tuple_type,
+            cardinality: None,
+            edges: IndexRange {
+                start: tuple_edge_start,
+                count: 2,
+            },
+            origin,
+        }));
+        for (element, _) in &elements {
+            releases.push((*element, ReleaseAfter::Node(tuple)));
+        }
+        let prepare_edge = builder.raw.edges.len() as u32;
+        must(builder.push_edge(Edge {
+            producer: tuple,
+            argument_position: 1,
+            access: ValueAccess::WholeValue,
+            cardinality: None,
+            conversion: Conversion::Identity,
+            ownership: OwnershipMode::InfallibleTransfer,
+            origin,
+        }));
+        let prepare = must(builder.push_node(Node {
+            kind: NodeKind::PrefixSpreadPrepare,
+            result_type: tuple_type,
+            cardinality: None,
+            edges: IndexRange {
+                start: prepare_edge,
+                count: 1,
+            },
+            origin,
+        }));
+        releases.push((tuple, ReleaseAfter::Node(prepare)));
+        let apply_edges = builder.raw.edges.len() as u32;
+        for (position, (_, cardinality)) in elements.iter().copied().enumerate() {
+            must(builder.push_edge(Edge {
+                producer: prepare,
+                argument_position: position as u32 + 1,
+                access: ValueAccess::TupleElement(position as u32),
+                cardinality: Some(cardinality),
+                conversion: Conversion::Identity,
+                ownership: OwnershipMode::ImmutableBorrow,
+                origin,
+            }));
+            if cardinality == Cardinality::DynamicVector {
+                must(builder.push_shape_check(apply_edges.saturating_add(position as u32)));
+            }
+        }
+        let any_dynamic = left_dynamic || right_dynamic;
+        let first_static = if left_dynamic {
+            if right_dynamic { None } else { Some(1) }
+        } else {
+            Some(0)
+        };
+        let apply = must(builder.push_node(Node {
+            kind: NodeKind::SelectedApply {
+                primitive_id: 5,
+                signature_id: 9,
+                implementation_id: 9,
+                primitive_origin: origin,
+                lift: LiftMode::Vector,
+                result_element_type: ScalarType::Int,
+                shape: ShapePlan {
+                    static_anchor: first_static,
+                    dynamic_checks: IndexRange {
+                        start: 0,
+                        count: u32::from(left_dynamic) + u32::from(right_dynamic),
+                    },
+                },
+            },
+            result_type: vector_type,
+            cardinality: Some(if any_dynamic {
+                Cardinality::DynamicVector
+            } else {
+                Cardinality::StaticVector(2)
+            }),
+            edges: IndexRange {
+                start: apply_edges,
+                count: 2,
+            },
+            origin,
+        }));
+        releases.push((prepare, ReleaseAfter::Node(apply)));
+        releases.push((apply, ReleaseAfter::Root(RootIndex(0))));
+        releases.sort_by_key(|(owner, _)| owner.0);
+        for (owner, release_after) in releases {
+            must(builder.push_ownership(Ownership {
+                owner,
+                release_after,
+            }));
+        }
+        must(builder.push_root(Root {
+            node: apply,
+            origin,
+        }));
+        must(builder.finish())
+    }
+
+    #[test]
+    fn tuple_element_cardinality_drives_all_vector_shape_combinations() {
+        for combination in [(false, false), (true, false), (true, true)] {
+            let result = vector_prefix_spread_program(combination.0, combination.1).verify();
+            assert!(result.is_ok(), "{combination:?}: {result:?}");
+        }
+
+        let mut cardinality = vector_prefix_spread_program(false, false);
+        let last = cardinality.edges.len() - 1;
+        cardinality.edges[last].cardinality = Some(Cardinality::DynamicVector);
+        verify_error(cardinality, Invariant::InconsistentResultMetadata);
+
+        let mut bad_shape = vector_prefix_spread_program(true, false);
+        let Some(last_node) = bad_shape.nodes.last_mut() else {
+            panic!("fixture apply missing");
+        };
+        let NodeKind::SelectedApply { ref mut shape, .. } = last_node.kind else {
+            panic!("fixture apply kind changed");
+        };
+        shape.static_anchor = Some(0);
+        verify_error(bad_shape, Invariant::InconsistentResultMetadata);
+    }
+
+    #[test]
+    fn verifier_allocation_refusal_is_distinct_at_every_scratch_site() {
+        for site in [
+            VerifyAllocationSite::DynamicShapeScratch,
+            VerifyAllocationSite::ReachabilityBits,
+            VerifyAllocationSite::ReachabilityWorklist,
+            VerifyAllocationSite::OwnershipSinks,
+            VerifyAllocationSite::OwnershipLastUse,
+            VerifyAllocationSite::OwnershipRootOwner,
+        ] {
+            assert_eq!(
+                dynamic_shape_program()
+                    .verify_with_allocation_failure(VerifyAllocationFailureInjection::at(site),),
+                Err(VerifyError::AllocationUnavailable { site })
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_borrows_materialize_in_tuples_and_feed_fan_out_without_ownership() {
+        let mut tuple = tuple_program();
+        tuple.module.parameter_header_origin = Some(OriginIndex(0));
+        tuple.parameters.push(Parameter {
+            slot: 0,
+            name: "input".to_owned(),
+            scalar_type: ScalarType::Int,
+            declaration_origin: OriginIndex(0),
+            name_origin: OriginIndex(0),
+        });
+        tuple.module.ranges.parameters.count = 1;
+        tuple.nodes[0].kind = NodeKind::ParameterBorrow {
+            parameter: ParameterIndex(0),
+        };
+        tuple.edges[0].ownership = OwnershipMode::ImmutableBorrow;
+        tuple.ownership.remove(0);
+        tuple.module.ranges.ownership.count -= 1;
+        assert!(tuple.clone().verify().is_ok());
+        tuple.edges[0].ownership = OwnershipMode::InfallibleTransfer;
+        verify_error(tuple, Invariant::AmbiguousOwnership);
+
+        let mut fan_out = fan_out_program();
+        fan_out.module.parameter_header_origin = Some(OriginIndex(0));
+        fan_out.parameters.push(Parameter {
+            slot: 0,
+            name: "input".to_owned(),
+            scalar_type: ScalarType::Int,
+            declaration_origin: OriginIndex(0),
+            name_origin: OriginIndex(0),
+        });
+        fan_out.module.ranges.parameters.count = 1;
+        fan_out.nodes[0].kind = NodeKind::ParameterBorrow {
+            parameter: ParameterIndex(0),
+        };
+        fan_out.edges[1].ownership = OwnershipMode::ImmutableBorrow;
+        fan_out.ownership.remove(0);
+        fan_out.module.ranges.ownership.count -= 1;
+        assert!(fan_out.clone().verify().is_ok());
+        fan_out.edges[1].ownership = OwnershipMode::OwnedInput;
+        verify_error(fan_out, Invariant::AmbiguousOwnership);
+    }
+
+    #[test]
+    fn verifier_category_winners_follow_the_normative_order() {
+        let mut version_over_range = scalar_program();
+        version_over_range.module.semantic_major = 2;
+        version_over_range.module.ranges.nodes.count = 2;
+        verify_error(version_over_range, Invariant::UnsupportedVersion);
+
+        let mut range_over_record = parameter_program();
+        range_over_record.module.ranges.nodes.count = 2;
+        range_over_record.parameters[0].slot = 9;
+        verify_error(range_over_record, Invariant::RangeMismatch);
+
+        let mut record_over_reference = parameter_program();
+        record_over_reference.parameters[0].slot = 9;
+        record_over_reference.nodes[0].result_type = TypeIndex(99);
+        verify_error(record_over_reference, Invariant::InvalidRecord);
+
+        let mut reference_over_metadata = vector_apply_program();
+        reference_over_metadata.edges[0].producer = NodeIndex(2);
+        reference_over_metadata.nodes[2].cardinality = Some(Cardinality::StaticVector(9));
+        verify_error(reference_over_metadata, Invariant::NonPostorderReference);
+
+        let mut metadata_over_ownership = vector_apply_program();
+        metadata_over_ownership.nodes[2].cardinality = Some(Cardinality::StaticVector(9));
+        metadata_over_ownership.edges[0].ownership = OwnershipMode::ImmutableBorrow;
+        verify_error(
+            metadata_over_ownership,
+            Invariant::InconsistentResultMetadata,
+        );
+
+        let mut ownership_over_features = tuple_program();
+        ownership_over_features.edges[0].ownership = OwnershipMode::OwnedInput;
+        ownership_over_features.features.clear();
+        ownership_over_features.module.ranges.features.count = 0;
+        verify_error(ownership_over_features, Invariant::AmbiguousOwnership);
+    }
+
+    #[test]
+    fn fan_out_rejects_non_apply_roots_and_placeholder_aggregates() {
+        let mut constant_root = fan_out_program();
+        constant_root.nodes[1].kind = NodeKind::Constant {
+            constant: ConstantIndex(0),
+        };
+        constant_root.nodes[1].edges = IndexRange::default();
+        constant_root.edges.remove(0);
+        constant_root.nodes[2].edges.start = 0;
+        constant_root.module.ranges.edges.count = 1;
+        verify_error(constant_root, Invariant::InvalidRecord);
+
+        for kind in [NodeKind::TupleConstruct, NodeKind::PrefixSpreadPrepare] {
+            let mut aggregate = fan_out_program();
+            aggregate.nodes[1].kind = kind;
+            assert!(aggregate.verify().is_err());
+        }
+    }
+
     fn deep_tuple_program(depth: u32) -> RawProgram {
         let mut builder = RawProgramBuilder::new();
         must(builder.push_feature(Feature::Tuples.numeric()));
@@ -2802,6 +3626,11 @@ mod tests {
                 producer: current_node,
                 argument_position: 1,
                 access: ValueAccess::WholeValue,
+                cardinality: if index == 0 {
+                    Some(Cardinality::StaticScalar)
+                } else {
+                    None
+                },
                 conversion: Conversion::Identity,
                 ownership: OwnershipMode::InfallibleTransfer,
                 origin,
@@ -2851,6 +3680,7 @@ mod tests {
                 producer: current,
                 argument_position: 1,
                 access: ValueAccess::WholeValue,
+                cardinality: Some(Cardinality::StaticScalar),
                 conversion: Conversion::Identity,
                 ownership: OwnershipMode::OwnedInput,
                 origin,
@@ -2924,6 +3754,7 @@ mod tests {
                 producer: operand,
                 argument_position: 1,
                 access: ValueAccess::FanOutOperandBorrow,
+                cardinality: Some(Cardinality::StaticScalar),
                 conversion: Conversion::Identity,
                 ownership: OwnershipMode::ImmutableBorrow,
                 origin,
@@ -2964,6 +3795,7 @@ mod tests {
             producer: operand,
             argument_position: 1,
             access: ValueAccess::WholeValue,
+            cardinality: Some(Cardinality::StaticScalar),
             conversion: Conversion::Identity,
             ownership: OwnershipMode::OwnedInput,
             origin,
