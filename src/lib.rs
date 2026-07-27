@@ -4,6 +4,7 @@
 mod c_emitter;
 mod error;
 mod evaluator;
+mod lowering;
 mod native_builder;
 mod parser;
 mod primitive;

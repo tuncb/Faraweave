@@ -506,7 +506,7 @@ impl RawProgramBuilder {
     }
 
     #[cfg(test)]
-    fn with_reservation_failure_at(ordinal: u32) -> Self {
+    pub(crate) fn with_reservation_failure_at(ordinal: u32) -> Self {
         let mut builder = Self::new();
         builder.fail_at_reservation = Some(ordinal);
         builder
@@ -514,6 +514,33 @@ impl RawProgramBuilder {
 
     pub fn set_parameter_header_origin(&mut self, origin: OriginIndex) {
         self.raw.module.parameter_header_origin = Some(origin);
+    }
+
+    pub(crate) fn finish_preview_type_elements(&self) -> Result<u32, BuildError> {
+        checked_count(self.raw.type_elements.len() as u64, Arena::TypeElement)
+    }
+
+    pub(crate) fn finish_preview_constant_elements(&self) -> Result<u32, BuildError> {
+        checked_count(
+            self.raw.constant_elements.len() as u64,
+            Arena::ConstantElement,
+        )
+    }
+
+    pub(crate) fn finish_preview_edges(&self) -> Result<u32, BuildError> {
+        checked_count(self.raw.edges.len() as u64, Arena::Edge)
+    }
+
+    pub(crate) fn finish_preview_shape_checks(&self) -> Result<u32, BuildError> {
+        checked_count(self.raw.shape_checks.len() as u64, Arena::ShapeCheck)
+    }
+
+    pub(crate) fn finish_preview_nodes(&self) -> Result<u32, BuildError> {
+        checked_count(self.raw.nodes.len() as u64, Arena::Node)
+    }
+
+    pub(crate) fn finish_preview_branches(&self) -> Result<u32, BuildError> {
+        checked_count(self.raw.branches.len() as u64, Arena::Branch)
     }
 
     push_method!(push_feature, features, u16, Feature);
@@ -878,8 +905,8 @@ fn verify_parameters(program: &RawProgram) -> Result<(), VerifyError> {
         program.module.parameter_header_origin,
     ) {
         (true, None) => {}
-        (false, Some(origin)) if in_bounds(origin.0, program.origins.len()) => {}
-        (false, Some(_)) => {
+        (_, Some(origin)) if in_bounds(origin.0, program.origins.len()) => {}
+        (_, Some(_)) => {
             return Err(malformed(
                 Invariant::IndexOutOfBounds,
                 RecordKind::Module,
@@ -887,7 +914,7 @@ fn verify_parameters(program: &RawProgram) -> Result<(), VerifyError> {
                 "parameter_header_origin",
             ));
         }
-        (true, Some(_)) | (false, None) => {
+        (false, None) => {
             return Err(malformed(
                 Invariant::InvalidRecord,
                 RecordKind::Module,

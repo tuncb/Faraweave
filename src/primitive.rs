@@ -37,6 +37,162 @@ pub(crate) fn analyze(program: &Program) -> Result<Vec<TypeInfo>, Error> {
         .collect()
 }
 
+pub(crate) fn analyze_for_lowering(program: &Program) -> Result<Vec<TypeInfo>, Error> {
+    resolve_names(program)?;
+    let mut parameter_types = Vec::new();
+    parameter_types
+        .try_reserve(program.parameters.len())
+        .map_err(|_| analysis_allocation_error(SourceLocation::start()))?;
+    for parameter in &program.parameters {
+        parameter_types.push(TypeInfo {
+            value_type: Type::Scalar(parameter.scalar_type),
+            known_length: None,
+            location: parameter.span.begin,
+        });
+    }
+    for root in &program.roots {
+        if let Some(error) = first_arity_error(root, &parameter_types, None)? {
+            return Err(error);
+        }
+    }
+    analyze(program)
+}
+
+fn first_arity_error(
+    expression: &Expr,
+    parameters: &[TypeInfo],
+    placeholder: Option<&TypeInfo>,
+) -> Result<Option<Error>, Error> {
+    match &expression.kind {
+        ExprKind::Call {
+            name,
+            syntax,
+            arguments,
+            ..
+        } => {
+            for argument in arguments {
+                if let Some(error) = first_arity_error(argument, parameters, placeholder)? {
+                    return Ok(Some(error));
+                }
+            }
+            let actual = match syntax {
+                CallSyntax::Direct => arguments.len(),
+                CallSyntax::Prefix => {
+                    let Some(argument) = arguments.first() else {
+                        return Ok(None);
+                    };
+                    let Ok(inferred) = infer(argument, parameters, placeholder, false) else {
+                        return Ok(None);
+                    };
+                    match inferred.value_type {
+                        Type::Tuple(elements) => elements.len(),
+                        Type::RepeatedTuple { .. } | Type::Scalar(_) | Type::Vector(_) => {
+                            arguments.len()
+                        }
+                    }
+                }
+            };
+            arity_error(name, actual, expression.span.begin)
+        }
+        ExprKind::Tuple(elements) => {
+            for element in elements {
+                if let Some(error) = first_arity_error(element, parameters, placeholder)? {
+                    return Ok(Some(error));
+                }
+            }
+            Ok(None)
+        }
+        ExprKind::Fanout { operand, branches } => {
+            if let Some(error) = first_arity_error(operand, parameters, placeholder)? {
+                return Ok(Some(error));
+            }
+            let operand_type = infer(operand, parameters, placeholder, false).ok();
+            for branch in branches {
+                if let Some(error) = first_arity_error(branch, parameters, operand_type.as_ref())? {
+                    return Ok(Some(error));
+                }
+            }
+            Ok(None)
+        }
+        ExprKind::UnaryChain {
+            leaf,
+            leaf_span,
+            steps,
+        } => {
+            let mut current = Some(TypeInfo {
+                value_type: leaf.value_type(),
+                known_length: None,
+                location: leaf_span.begin,
+            });
+            for step in steps {
+                if current.is_none() {
+                    break;
+                }
+                if let Some(error) = arity_error(&step.name, 1, step.span.begin)? {
+                    return Ok(Some(error));
+                }
+                current = current.and_then(|current| {
+                    select_call(
+                        &step.name,
+                        std::slice::from_ref(&current),
+                        step.span.begin,
+                        false,
+                    )
+                    .ok()
+                });
+            }
+            Ok(None)
+        }
+        ExprKind::Literal(_)
+        | ExprKind::Vector(_, _)
+        | ExprKind::DeepTuple { .. }
+        | ExprKind::Parameter(_)
+        | ExprKind::Placeholder
+        | ExprKind::UnresolvedName { .. } => Ok(None),
+    }
+}
+
+fn arity_error(
+    name: &str,
+    actual: usize,
+    location: SourceLocation,
+) -> Result<Option<Error>, Error> {
+    let Ok(primitive) = primitive_from_name(name) else {
+        return Ok(None);
+    };
+    if descriptors(primitive).any(|signature| signature.parameters.len() == actual) {
+        return Ok(None);
+    }
+    let Some(expected) = descriptors(primitive)
+        .next()
+        .map(|signature| signature.parameters.len())
+    else {
+        return Ok(None);
+    };
+    let mut accepted = Vec::new();
+    accepted
+        .try_reserve(1)
+        .map_err(|_| analysis_allocation_error(location))?;
+    accepted.push(expected);
+    let mut error = Error::new(
+        ErrorKind::ArityError,
+        location,
+        format!("{name} received {actual} argument(s); accepted arity {expected}"),
+    );
+    error.primitive = Some(name.to_owned());
+    error.actual_arity = Some(actual);
+    error.expected_arity = accepted;
+    Ok(Some(error))
+}
+
+fn analysis_allocation_error(location: SourceLocation) -> Error {
+    Error::new(
+        ErrorKind::ResourceError,
+        location,
+        "analysis failed: allocation_unavailable",
+    )
+}
+
 pub(crate) fn resolve_names(program: &Program) -> Result<(), Error> {
     for root in &program.roots {
         validate_names(root)?;
