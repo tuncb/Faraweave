@@ -489,6 +489,8 @@ const fn scalar_tag(scalar: ScalarType) -> i32 {
 }
 
 fn primitive_tag(name: &str) -> Result<i32, Error> {
+    // TODO(#9): remove this legacy C-emitter-local name/tag mapping during the
+    // C/native VerifiedProgram cutover; it is intentionally not a semantic ID.
     match name {
         "inc" => Ok(0),
         "dec" => Ok(1),

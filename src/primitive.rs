@@ -1,5 +1,8 @@
 use crate::parser::{CallSyntax, Expr, ExprKind, Program};
 use crate::resources::ResourceContext;
+use crate::semantic_registry::{
+    Conversion, StructuralBehavior, conversion, descriptors, primitive_from_name,
+};
 use crate::strict_float::{self, Binary64Operation};
 use crate::{
     DomainErrorContext, DomainErrorReason, Error, ErrorKind, ScalarType, SourceLocation, Type,
@@ -11,105 +14,6 @@ pub(crate) struct TypeInfo {
     pub value_type: Type,
     pub known_length: Option<usize>,
     pub location: SourceLocation,
-}
-
-#[derive(Clone, Copy)]
-struct Signature {
-    parameters: &'static [ScalarType],
-    result: ScalarType,
-}
-
-const INT1: &[ScalarType] = &[ScalarType::Int];
-const DOUBLE1: &[ScalarType] = &[ScalarType::Double];
-const BOOL1: &[ScalarType] = &[ScalarType::Bool];
-const INT2: &[ScalarType] = &[ScalarType::Int, ScalarType::Int];
-const DOUBLE2: &[ScalarType] = &[ScalarType::Double, ScalarType::Double];
-const BOOL2: &[ScalarType] = &[ScalarType::Bool, ScalarType::Bool];
-
-const NUMERIC_UNARY: &[Signature] = &[
-    Signature {
-        parameters: INT1,
-        result: ScalarType::Int,
-    },
-    Signature {
-        parameters: DOUBLE1,
-        result: ScalarType::Double,
-    },
-];
-const NUMERIC_BINARY: &[Signature] = &[
-    Signature {
-        parameters: INT2,
-        result: ScalarType::Int,
-    },
-    Signature {
-        parameters: DOUBLE2,
-        result: ScalarType::Double,
-    },
-];
-const NUMERIC_PREDICATE: &[Signature] = &[
-    Signature {
-        parameters: INT1,
-        result: ScalarType::Bool,
-    },
-    Signature {
-        parameters: DOUBLE1,
-        result: ScalarType::Bool,
-    },
-];
-const NUMERIC_RELATION: &[Signature] = &[
-    Signature {
-        parameters: INT2,
-        result: ScalarType::Bool,
-    },
-    Signature {
-        parameters: DOUBLE2,
-        result: ScalarType::Bool,
-    },
-];
-const EQUALITY: &[Signature] = &[
-    Signature {
-        parameters: BOOL2,
-        result: ScalarType::Bool,
-    },
-    Signature {
-        parameters: INT2,
-        result: ScalarType::Bool,
-    },
-    Signature {
-        parameters: DOUBLE2,
-        result: ScalarType::Bool,
-    },
-];
-const BOOLEAN_UNARY: &[Signature] = &[Signature {
-    parameters: BOOL1,
-    result: ScalarType::Bool,
-}];
-const BOOLEAN_BINARY: &[Signature] = &[Signature {
-    parameters: BOOL2,
-    result: ScalarType::Bool,
-}];
-const INTEGER_PREDICATE: &[Signature] = &[Signature {
-    parameters: INT1,
-    result: ScalarType::Bool,
-}];
-const IOTA: &[Signature] = &[Signature {
-    parameters: INT1,
-    result: ScalarType::Int,
-}];
-
-fn signatures(name: &str) -> Option<&'static [Signature]> {
-    match name {
-        "inc" | "dec" | "neg" | "abs" => Some(NUMERIC_UNARY),
-        "add" | "sub" | "mul" => Some(NUMERIC_BINARY),
-        "equals" | "not_equals" => Some(EQUALITY),
-        "not" => Some(BOOLEAN_UNARY),
-        "and" | "or" => Some(BOOLEAN_BINARY),
-        "odd" | "even" => Some(INTEGER_PREDICATE),
-        "is_positive" | "is_negative" => Some(NUMERIC_PREDICATE),
-        "less_than" | "greater_than" => Some(NUMERIC_RELATION),
-        "iota" => Some(IOTA),
-        _ => None,
-    }
 }
 
 pub(crate) fn analyze(program: &Program) -> Result<Vec<TypeInfo>, Error> {
@@ -151,7 +55,7 @@ fn validate_names(expression: &Expr) -> Result<(), Error> {
             for argument in arguments {
                 validate_names(argument)?;
             }
-            if signatures(name).is_none() {
+            if primitive_from_name(name).is_err() {
                 return Err(Error::at_span(
                     ErrorKind::UnknownPrimitive,
                     *name_span,
@@ -167,7 +71,7 @@ fn validate_names(expression: &Expr) -> Result<(), Error> {
         ExprKind::DeepTuple { .. } => {}
         ExprKind::UnaryChain { steps, .. } => {
             for step in steps {
-                if signatures(&step.name).is_none() {
+                if primitive_from_name(&step.name).is_err() {
                     return Err(Error::at_span(
                         ErrorKind::UnknownPrimitive,
                         step.name_span,
@@ -328,19 +232,15 @@ fn select_call(
     location: SourceLocation,
     shapes: bool,
 ) -> Result<TypeInfo, Error> {
-    let available = signatures(name).ok_or_else(|| {
+    let primitive = primitive_from_name(name).map_err(|_| {
         Error::new(
             ErrorKind::UnknownPrimitive,
             location,
             format!("unknown primitive '{name}'"),
         )
     })?;
-    if !available
-        .iter()
-        .any(|signature| signature.parameters.len() == actual.len())
-    {
-        let mut accepted: Vec<usize> = available
-            .iter()
+    if !descriptors(primitive).any(|signature| signature.parameters.len() == actual.len()) {
+        let mut accepted: Vec<usize> = descriptors(primitive)
             .map(|signature| signature.parameters.len())
             .collect();
         accepted.sort_unstable();
@@ -364,7 +264,17 @@ fn select_call(
         error.expected_arity = accepted;
         return Err(error);
     }
-    if name == "iota"
+    let structural_behavior = descriptors(primitive)
+        .next()
+        .map(|descriptor| descriptor.behavior)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnknownPrimitive,
+                location,
+                format!("unknown primitive '{name}'"),
+            )
+        })?;
+    if structural_behavior == StructuralBehavior::Iota
         && actual
             .first()
             .is_some_and(|argument| !matches!(argument.value_type, Type::Scalar(_)))
@@ -382,7 +292,7 @@ fn select_call(
     }
     let mut selected = None;
     let mut selected_cost = usize::MAX;
-    for signature in available {
+    for signature in descriptors(primitive) {
         if signature.parameters.len() != actual.len() {
             continue;
         }
@@ -393,24 +303,22 @@ fn select_call(
                 accepted = false;
                 break;
             };
-            if actual_scalar == *parameter {
-                continue;
-            }
-            if actual_scalar == ScalarType::Int && *parameter == ScalarType::Double {
-                cost += 1;
-            } else {
-                accepted = false;
-                break;
+            match conversion(actual_scalar, *parameter) {
+                Some(Conversion::Identity) => {}
+                Some(Conversion::PromoteIntToDouble) => cost += 1,
+                None => {
+                    accepted = false;
+                    break;
+                }
             }
         }
         if accepted && cost < selected_cost {
-            selected = Some(*signature);
+            selected = Some(signature);
             selected_cost = cost;
         }
     }
     let Some(selected) = selected else {
-        let matched_prefix = available
-            .iter()
+        let matched_prefix = descriptors(primitive)
             .filter(|signature| signature.parameters.len() == actual.len())
             .map(|signature| {
                 signature
@@ -419,9 +327,7 @@ fn select_call(
                     .zip(actual)
                     .take_while(|(parameter, argument)| {
                         scalar_element_type(&argument.value_type).is_some_and(|actual_type| {
-                            actual_type == **parameter
-                                || (actual_type == ScalarType::Int
-                                    && **parameter == ScalarType::Double)
+                            conversion(actual_type, **parameter).is_some()
                         })
                     })
                     .count()
@@ -476,7 +382,7 @@ fn select_call(
             }
         }
     }
-    if name == "iota" {
+    if selected.behavior == StructuralBehavior::Iota {
         return Ok(TypeInfo {
             value_type: Type::Vector(ScalarType::Int),
             known_length: None,
