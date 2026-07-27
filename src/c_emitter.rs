@@ -77,7 +77,7 @@ impl<'a> IrCGenerator<'a> {
             self.emit_node(index, node)?;
         }
 
-        let mut source = String::from(PARAMETER_RUNTIME);
+        let mut source = parameter_runtime()?;
         source.push_str("\n/* VerifiedProgram-driven definitions. */\n");
         source.push_str("FWV fw_parameters[");
         write!(source, "{}", self.program.parameters.len().max(1)).map_err(|_| emission_error())?;
@@ -679,6 +679,15 @@ fn range_slice<T>(values: &[T], range: IndexRange) -> Result<&[T], Error> {
         .ok_or_else(emission_error)
         .and_then(to_usize)?;
     values.get(start..end).ok_or_else(emission_error)
+}
+
+fn parameter_runtime() -> Result<String, Error> {
+    let mut runtime = String::new();
+    runtime
+        .try_reserve_exact(PARAMETER_RUNTIME.len())
+        .map_err(|_| emission_error())?;
+    runtime.push_str(PARAMETER_RUNTIME);
+    Ok(runtime)
 }
 
 pub fn emit_c_source(source: &str) -> Result<CEmissionResult, Error> {
