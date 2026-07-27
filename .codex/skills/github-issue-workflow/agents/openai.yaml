@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Issue Workflow"
+  short_description: "Orchestrate reviewed GitHub issues through merge"
+  default_prompt: "Use $github-issue-workflow to implement GitHub issues through dependency-aware worktrees, sequential QA, and merge."
