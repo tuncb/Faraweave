@@ -856,6 +856,8 @@ fn verify_sources_and_origins(program: &RawProgram) -> Result<(), VerifyError> {
             || end.column == 0
             || begin.offset > end.offset
             || end.offset > source_end
+            || end.line < begin.line
+            || (end.line == begin.line && end.column < begin.column)
         {
             return Err(malformed(
                 Invariant::InvalidRecord,
@@ -3452,6 +3454,40 @@ mod tests {
         constant.constants[0] =
             ConstantRecord::Scalar(ScalarConstant::DoubleBits(0x7ff0_0000_0000_0001));
         verify_error(constant, Invariant::InvalidRecord);
+    }
+
+    fn verify_origin_span_error(program: RawProgram) {
+        assert_eq!(
+            program.verify(),
+            Err(VerifyError::MalformedProgram(MalformedProgram {
+                invariant: Invariant::InvalidRecord,
+                record: RecordKind::Origin,
+                index: Some(0),
+                field: "span",
+            }))
+        );
+    }
+
+    #[test]
+    fn origin_spans_follow_semantic_source_position_order() {
+        let mut line_reversal = scalar_program();
+        line_reversal.origins[0].span.begin.line = 2;
+        line_reversal.origins[0].span.begin.column = 8;
+        verify_origin_span_error(line_reversal);
+
+        let mut column_reversal = scalar_program();
+        column_reversal.origins[0].span.begin.column = 3;
+        verify_origin_span_error(column_reversal);
+
+        let mut cross_line_reset = scalar_program();
+        cross_line_reset.origins[0].span.begin.column = 8;
+        cross_line_reset.origins[0].span.end.line = 2;
+        cross_line_reset.origins[0].span.end.column = 1;
+        assert!(cross_line_reset.verify().is_ok());
+
+        let mut empty = scalar_program();
+        empty.origins[0].span.end = empty.origins[0].span.begin;
+        assert!(empty.verify().is_ok());
     }
 
     #[test]
