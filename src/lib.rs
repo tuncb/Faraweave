@@ -8,6 +8,7 @@ mod native_builder;
 mod parser;
 mod primitive;
 mod resources;
+mod semantic_registry;
 mod strict_float;
 mod value;
 

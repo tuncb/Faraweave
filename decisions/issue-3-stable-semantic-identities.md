@@ -1,0 +1,3 @@
+# Issue #3 — stable semantic identities
+
+Primitive IDs are `1=inc`, `2=dec`, `3=neg`, `4=abs`, `5=add`, `6=sub`, `7=mul`, `8=equals`, `9=not_equals`, `10=not`, `11=and`, `12=or`, `13=odd`, `14=even`, `15=is_positive`, `16=is_negative`, `17=less_than`, `18=greater_than`, and `19=iota`; zero is deliberately invalid. Signature and scalar-kernel implementation IDs are both 1 through 34 in registry row order, with distinct identity domains even though each current signature selects one implementation. These compact positive values are stable for serialization and backend dispatch, while the C emitter's legacy zero-based tags remain temporary and explicitly non-semantic until issue #9 removes them.
