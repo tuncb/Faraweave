@@ -4,6 +4,7 @@
 mod c_emitter;
 mod error;
 mod evaluator;
+mod interpreter;
 mod lowering;
 mod native_builder;
 mod parser;
@@ -26,6 +27,7 @@ pub use evaluator::{
     evaluate_runner_source, evaluate_source, evaluate_source_with_arguments,
     evaluate_source_with_arguments_and_observer, evaluate_source_with_configuration,
 };
+pub use interpreter::{evaluate_verified_program, evaluate_verified_program_with_observer};
 pub use native_builder::{
     CompilerConfiguration, CompilerSelection, NativeBuildRequest, NativeBuildResult,
     NativePlatform, build_native, make_c_compiler_arguments, native_platform,
