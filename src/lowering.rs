@@ -1,4 +1,6 @@
-use crate::parser::{CallSyntax, Expr, ExprKind, Program, parse, validate_parameter_declarations};
+#[cfg(test)]
+use crate::parser::parse;
+use crate::parser::{CallSyntax, Expr, ExprKind, Program, validate_parameter_declarations};
 use crate::primitive::analyze_for_lowering;
 use crate::semantic_registry::{
     Conversion as RegistryConversion, SemanticDescriptor, StructuralBehavior, conversion,
@@ -33,6 +35,30 @@ impl std::fmt::Display for CompileError {
 }
 
 impl std::error::Error for CompileError {}
+
+impl CompileError {
+    pub(crate) fn into_evaluation_error(self) -> Error {
+        match self {
+            Self::Source(error) => error,
+            Self::Build(BuildError::CountOverflow { .. }) => Error::new(
+                ErrorKind::ResourceError,
+                SourceLocation::start(),
+                "source compilation failed: size_overflow",
+            ),
+            Self::Build(BuildError::AllocationUnavailable { .. })
+            | Self::Verify(VerifyError::AllocationUnavailable { .. }) => Error::new(
+                ErrorKind::ResourceError,
+                SourceLocation::start(),
+                "source compilation failed: allocation_unavailable",
+            ),
+            Self::Verify(VerifyError::MalformedProgram(_)) => Error::new(
+                ErrorKind::TypeError,
+                SourceLocation::start(),
+                "source compilation produced an invalid verified program",
+            ),
+        }
+    }
+}
 
 impl From<Error> for CompileError {
     fn from(error: Error) -> Self {
@@ -84,16 +110,24 @@ struct TupleElement {
     origin: OriginIndex,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn compile_source(source: &str) -> Result<VerifiedProgram, CompileError> {
     compile(source)
 }
 
+#[cfg(test)]
 fn compile(source: &str) -> Result<VerifiedProgram, LowerError> {
     let program = parse(source)?;
-    validate_parameter_declarations(&program)?;
-    let _ = analyze_for_lowering(&program)?;
-    lower_program(source, &program)
+    compile_parsed_source(source, &program)
+}
+
+pub(crate) fn compile_parsed_source(
+    source: &str,
+    program: &Program,
+) -> Result<VerifiedProgram, CompileError> {
+    validate_parameter_declarations(program)?;
+    let _ = analyze_for_lowering(program)?;
+    lower_program(source, program)
 }
 
 fn lower_program(source: &str, program: &Program) -> Result<VerifiedProgram, LowerError> {
