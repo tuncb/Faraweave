@@ -858,6 +858,8 @@ fn verify_sources_and_origins(program: &RawProgram) -> Result<(), VerifyError> {
             || end.offset > source_end
             || end.line < begin.line
             || (end.line == begin.line && end.column < begin.column)
+            || (begin.offset == end.offset
+                && (begin.line != end.line || begin.column != end.column))
         {
             return Err(malformed(
                 Invariant::InvalidRecord,
@@ -3484,6 +3486,17 @@ mod tests {
         cross_line_reset.origins[0].span.end.line = 2;
         cross_line_reset.origins[0].span.end.column = 1;
         assert!(cross_line_reset.verify().is_ok());
+
+        let mut empty_cross_line = scalar_program();
+        empty_cross_line.origins[0].span.end.offset = empty_cross_line.origins[0].span.begin.offset;
+        empty_cross_line.origins[0].span.end.line = 2;
+        empty_cross_line.origins[0].span.end.column = 1;
+        verify_origin_span_error(empty_cross_line);
+
+        let mut empty_column_mismatch = scalar_program();
+        empty_column_mismatch.origins[0].span.end.offset =
+            empty_column_mismatch.origins[0].span.begin.offset;
+        verify_origin_span_error(empty_column_mismatch);
 
         let mut empty = scalar_program();
         empty.origins[0].span.end = empty.origins[0].span.begin;
