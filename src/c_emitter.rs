@@ -3,6 +3,11 @@ use crate::parser::{
     validate_parameter_declarations,
 };
 use crate::primitive::{analyze, resolve_names};
+use crate::semantic_registry::{SEMANTIC_REGISTRY, ScalarKernel, implementation_from_numeric};
+use crate::typed_program::{
+    ConstantRecord, Conversion as IrConversion, Feature, IndexRange, LiftMode, Node, NodeKind,
+    Origin, RawProgram, ScalarConstant, TypeRecord, ValueAccess, VerifiedProgram,
+};
 use crate::{
     Error, ErrorKind, EvaluationConfiguration, ProgramResult, ScalarType, Type, Value,
     evaluate_source_with_configuration, format_value,
@@ -12,6 +17,702 @@ use std::fmt::Write;
 #[derive(Clone, Debug, PartialEq)]
 pub struct CEmissionResult {
     pub source: String,
+}
+
+/// Internal test seam for the IR-driven generator. Public source routing remains
+/// on the legacy generator until issue #9 performs the backend cutover.
+#[allow(dead_code)]
+pub(crate) fn emit_verified_c_program(
+    program: &VerifiedProgram,
+    configuration: EvaluationConfiguration,
+) -> Result<CEmissionResult, Error> {
+    validate_ir_emission_configuration(program.as_raw(), configuration)?;
+    IrCGenerator::new(program.as_raw(), configuration).emit()
+}
+
+fn validate_ir_emission_configuration(
+    program: &RawProgram,
+    configuration: EvaluationConfiguration,
+) -> Result<(), Error> {
+    let resources = crate::resources::ResourceContext::new(
+        configuration.profile,
+        configuration.limits,
+        configuration.allocation_failure,
+    )?;
+    if !program.features.contains(&Feature::Tuples.numeric()) {
+        return Ok(());
+    }
+    let location = program
+        .nodes
+        .iter()
+        .filter(|node| {
+            program
+                .types
+                .get(node.result_type.0 as usize)
+                .is_some_and(|record| matches!(record, TypeRecord::Tuple { .. }))
+        })
+        .filter_map(|node| program.origins.get(node.origin.0 as usize))
+        .min_by_key(|origin| origin.span.begin.offset)
+        .map(|origin| crate::SourceLocation {
+            offset: origin.span.begin.offset as usize,
+            line: origin.span.begin.line as usize,
+            column: origin.span.begin.column as usize,
+        })
+        .unwrap_or_else(crate::SourceLocation::start);
+    resources.require_tuple_profile(location)
+}
+
+struct IrCGenerator<'a> {
+    program: &'a RawProgram,
+    configuration: EvaluationConfiguration,
+    definitions: String,
+}
+
+impl<'a> IrCGenerator<'a> {
+    fn new(program: &'a RawProgram, configuration: EvaluationConfiguration) -> Self {
+        Self {
+            program,
+            configuration,
+            definitions: String::new(),
+        }
+    }
+
+    fn emit(mut self) -> Result<CEmissionResult, Error> {
+        self.emit_selected_implementation_wrappers()?;
+        for (index, node) in self.program.nodes.iter().copied().enumerate() {
+            self.emit_node(index, node)?;
+        }
+
+        let mut source = ir_parameter_runtime()?;
+        source.push_str("\n/* VerifiedProgram-driven definitions. */\n");
+        source.push_str("FWV fw_parameters[");
+        write!(source, "{}", self.program.parameters.len().max(1)).map_err(|_| emission_error())?;
+        source.push_str("];\nconst int fw_parameter_types[] = {");
+        for parameter in &self.program.parameters {
+            write!(source, "{},", scalar_tag(parameter.scalar_type))
+                .map_err(|_| emission_error())?;
+        }
+        source.push_str("0};\nconst char *const fw_parameter_names[] = {");
+        for parameter in &self.program.parameters {
+            write!(source, "{},", c_string(&parameter.name)).map_err(|_| emission_error())?;
+        }
+        source.push_str("\"\"};\nconst size_t fw_parameter_spans[][6] = {");
+        for parameter in &self.program.parameters {
+            let origin = self.origin(parameter.declaration_origin.0)?;
+            write!(
+                source,
+                "{{{}U,{}U,{}U,{}U,{}U,{}U}},",
+                origin.span.begin.offset,
+                origin.span.begin.line,
+                origin.span.begin.column,
+                origin.span.end.offset,
+                origin.span.end.line,
+                origin.span.end.column
+            )
+            .map_err(|_| emission_error())?;
+        }
+        source.push_str("{0U,0U,0U,0U,0U,0U}};\n");
+        source.push_str(&self.definitions);
+        self.emit_configuration(&mut source)?;
+        source.push_str("static const FWExpr fw_roots[] = {");
+        for root in &self.program.roots {
+            write!(source, "fw_ir_node_{},", root.node.0).map_err(|_| emission_error())?;
+        }
+        source.push_str("NULL};\n");
+        writeln!(
+            source,
+            "int main(int argc, char **argv) {{ return fw_main(argc, argv, {}U, fw_roots); }}",
+            self.program.roots.len()
+        )
+        .map_err(|_| emission_error())?;
+        Ok(CEmissionResult { source })
+    }
+
+    fn emit_configuration(&self, source: &mut String) -> Result<(), Error> {
+        writeln!(
+            source,
+            "const size_t fw_required = {}U;\n\
+             const int fw_profile = {};\n\
+             const int fw_has_vector_limit = {};\n\
+             const size_t fw_vector_limit = {}U;\n\
+             const int fw_has_tuple_limit = {};\n\
+             const size_t fw_tuple_limit = {}U;\n\
+             const int fw_has_live_limit = {};\n\
+             const size_t fw_live_limit = {}U;\n\
+             const int fw_has_work_limit = {};\n\
+             const size_t fw_work_limit = {}U;\n\
+             const int fw_has_failure_ordinal = {};\n\
+             const size_t fw_failure_ordinal = {}U;",
+            self.program.parameters.len(),
+            match self.configuration.profile {
+                crate::ExecutionProfile::TrustedLocalV1 => 0,
+                crate::ExecutionProfile::BoundedV1 => 1,
+                crate::ExecutionProfile::TrustedLocalV2 => 2,
+                crate::ExecutionProfile::BoundedV2 => 3,
+            },
+            i32::from(self.configuration.limits.max_vector_bytes.is_some()),
+            self.configuration.limits.max_vector_bytes.unwrap_or(0),
+            i32::from(self.configuration.limits.max_tuple_table_bytes.is_some()),
+            self.configuration.limits.max_tuple_table_bytes.unwrap_or(0),
+            i32::from(
+                self.configuration
+                    .limits
+                    .max_live_evaluation_bytes
+                    .is_some()
+            ),
+            self.configuration
+                .limits
+                .max_live_evaluation_bytes
+                .unwrap_or(0),
+            i32::from(self.configuration.limits.max_work_units.is_some()),
+            self.configuration.limits.max_work_units.unwrap_or(0),
+            i32::from(
+                self.configuration
+                    .allocation_failure
+                    .fail_at_ordinal
+                    .is_some()
+            ),
+            self.configuration
+                .allocation_failure
+                .fail_at_ordinal
+                .unwrap_or(0),
+        )
+        .map_err(|_| emission_error())
+    }
+
+    fn emit_selected_implementation_wrappers(&mut self) -> Result<(), Error> {
+        for descriptor in SEMANTIC_REGISTRY {
+            let used = self.program.nodes.iter().any(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::SelectedApply {
+                        implementation_id,
+                        ..
+                    } if implementation_id == descriptor.implementation_id.numeric()
+                )
+            });
+            if !used {
+                continue;
+            }
+            let implementation = descriptor.implementation_id.numeric();
+            if descriptor.kernel == ScalarKernel::IotaInt {
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_iota({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
+            self.emit_selected_kernel(implementation, descriptor.kernel)?;
+            writeln!(
+                self.definitions,
+                "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ return fw_apply_selected(fw_kernel_{implementation}, {}, {}, args, count, out, line, column, origins, origin_count, static_anchor, shape_checks, shape_count, conversions, lift); }}",
+                c_string(descriptor.primitive_name),
+                scalar_tag(descriptor.result),
+            )
+            .map_err(|_| emission_error())?;
+        }
+        Ok(())
+    }
+
+    fn emit_selected_kernel(
+        &mut self,
+        implementation: u16,
+        kernel: ScalarKernel,
+    ) -> Result<(), Error> {
+        let body = match kernel {
+            ScalarKernel::IncInt => {
+                "if(args[0].i==INT64_MAX)return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,args[0].i+INT64_C(1));return 1;"
+            }
+            ScalarKernel::DecInt => {
+                "if(args[0].i==INT64_MIN)return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,args[0].i-INT64_C(1));return 1;"
+            }
+            ScalarKernel::NegInt => {
+                "if(args[0].i==INT64_MIN)return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,-args[0].i);return 1;"
+            }
+            ScalarKernel::AbsInt => {
+                "if(args[0].i==INT64_MIN)return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,args[0].i<0?-args[0].i:args[0].i);return 1;"
+            }
+            ScalarKernel::AddInt => {
+                "int64_t a=args[0].i,b=args[1].i;if((b>0&&a>INT64_MAX-b)||(b<0&&a<INT64_MIN-b))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a+b);return 1;"
+            }
+            ScalarKernel::SubInt => {
+                "int64_t a=args[0].i,b=args[1].i;if((b<0&&a>INT64_MAX+b)||(b>0&&a<INT64_MIN+b))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a-b);return 1;"
+            }
+            ScalarKernel::MulInt => {
+                "int64_t a=args[0].i,b=args[1].i;if(a!=0&&((a==-1&&b==INT64_MIN)||(b==-1&&a==INT64_MIN)||(a>0&&((b>0&&a>INT64_MAX/b)||(b<0&&b<INT64_MIN/a)))||(a<0&&((b>0&&a<INT64_MIN/b)||(b<0&&a<INT64_MAX/b)))))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a*b);return 1;"
+            }
+            ScalarKernel::IncDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,1.0,FW_DOUBLE_ADD));return 1;"
+            }
+            ScalarKernel::DecDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,1.0,FW_DOUBLE_SUB));return 1;"
+            }
+            ScalarKernel::NegDouble => {
+                "fw_set_double(out,fw_double_from_bits(fw_double_bits(args[0].d)^UINT64_C(0x8000000000000000)));return 1;"
+            }
+            ScalarKernel::AbsDouble => {
+                "fw_set_double(out,fw_double_from_bits(fw_double_bits(args[0].d)&UINT64_C(0x7fffffffffffffff)));return 1;"
+            }
+            ScalarKernel::AddDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_ADD));return 1;"
+            }
+            ScalarKernel::SubDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_SUB));return 1;"
+            }
+            ScalarKernel::MulDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_MUL));return 1;"
+            }
+            ScalarKernel::EqualsBool => "fw_set_bool(out,args[0].b==args[1].b);return 1;",
+            ScalarKernel::EqualsInt => "fw_set_bool(out,args[0].i==args[1].i);return 1;",
+            ScalarKernel::EqualsDouble => {
+                "fw_set_bool(out,fw_double_equal(args[0].d,args[1].d));return 1;"
+            }
+            ScalarKernel::NotEqualsBool => "fw_set_bool(out,args[0].b!=args[1].b);return 1;",
+            ScalarKernel::NotEqualsInt => "fw_set_bool(out,args[0].i!=args[1].i);return 1;",
+            ScalarKernel::NotEqualsDouble => {
+                "fw_set_bool(out,!fw_double_equal(args[0].d,args[1].d));return 1;"
+            }
+            ScalarKernel::NotBool => "fw_set_bool(out,!args[0].b);return 1;",
+            ScalarKernel::AndBool => "fw_set_bool(out,args[0].b&&args[1].b);return 1;",
+            ScalarKernel::OrBool => "fw_set_bool(out,args[0].b||args[1].b);return 1;",
+            ScalarKernel::OddInt => "fw_set_bool(out,args[0].i%2!=0);return 1;",
+            ScalarKernel::EvenInt => "fw_set_bool(out,args[0].i%2==0);return 1;",
+            ScalarKernel::IsPositiveInt => "fw_set_bool(out,args[0].i>0);return 1;",
+            ScalarKernel::IsNegativeInt => "fw_set_bool(out,args[0].i<0);return 1;",
+            ScalarKernel::IsPositiveDouble => {
+                "fw_set_bool(out,!fw_double_is_nan(args[0].d)&&!fw_double_is_zero(args[0].d)&&(fw_double_bits(args[0].d)&UINT64_C(0x8000000000000000))==0U);return 1;"
+            }
+            ScalarKernel::IsNegativeDouble => {
+                "fw_set_bool(out,!fw_double_is_nan(args[0].d)&&!fw_double_is_zero(args[0].d)&&(fw_double_bits(args[0].d)&UINT64_C(0x8000000000000000))!=0U);return 1;"
+            }
+            ScalarKernel::LessThanInt => "fw_set_bool(out,args[0].i<args[1].i);return 1;",
+            ScalarKernel::LessThanDouble => {
+                "fw_set_bool(out,fw_double_less_than(args[0].d,args[1].d));return 1;"
+            }
+            ScalarKernel::GreaterThanInt => "fw_set_bool(out,args[0].i>args[1].i);return 1;",
+            ScalarKernel::GreaterThanDouble => {
+                "fw_set_bool(out,fw_double_less_than(args[1].d,args[0].d));return 1;"
+            }
+            ScalarKernel::IotaInt => return Err(emission_error()),
+        };
+        writeln!(
+            self.definitions,
+            "static int fw_kernel_{implementation}(const FWV *args,FWV *out,const char *name,size_t line,size_t column,size_t index,int vector_result) {{ (void)name;(void)line;(void)column;(void)index;(void)vector_result; {body} }}"
+        )
+        .map_err(|_| emission_error())
+    }
+
+    fn emit_node(&mut self, index: usize, node: Node) -> Result<(), Error> {
+        writeln!(
+            self.definitions,
+            "static int fw_ir_node_{index}(const FWV *hole, FWV *out) {{"
+        )
+        .map_err(|_| emission_error())?;
+        match node.kind {
+            NodeKind::Constant { constant } => self.emit_ir_constant(constant.0, node)?,
+            NodeKind::ParameterBorrow { parameter } => {
+                writeln!(
+                    self.definitions,
+                    "  (void)hole; return fw_borrow(&fw_parameters[{}U], out);",
+                    parameter.0
+                )
+                .map_err(|_| emission_error())?;
+            }
+            NodeKind::TupleConstruct => self.emit_ir_tuple(node)?,
+            NodeKind::PrefixSpreadPrepare => self.emit_ir_spread_prepare(node)?,
+            NodeKind::SelectedApply {
+                implementation_id,
+                primitive_origin: _,
+                lift,
+                result_element_type: _,
+                shape,
+                ..
+            } => self.emit_ir_selected(node, implementation_id, lift, shape)?,
+            NodeKind::FanOut { branches, .. } => self.emit_ir_fan_out(node, branches)?,
+        }
+        self.definitions.push_str("}\n");
+        Ok(())
+    }
+
+    fn emit_ir_constant(&mut self, constant: u32, node: Node) -> Result<(), Error> {
+        let record = self
+            .program
+            .constants
+            .get(to_usize(constant)?)
+            .copied()
+            .ok_or_else(emission_error)?;
+        let origin = self.origin(node.origin.0)?;
+        self.definitions.push_str("  (void)hole; ");
+        match record {
+            ConstantRecord::Scalar(value) => {
+                self.emit_ir_scalar_assignment("out", value)?;
+                self.definitions.push_str("; return 1;\n");
+            }
+            ConstantRecord::Vector {
+                element_type,
+                elements,
+            } => {
+                writeln!(
+                    self.definitions,
+                    "if (!fw_make_vector(out, {}, {}U, 0U, \"vector_literal\", {}U, {}U)) return 0;",
+                    scalar_tag(element_type),
+                    elements.count,
+                    origin.span.begin.line,
+                    origin.span.begin.column
+                )
+                .map_err(|_| emission_error())?;
+                let values = range_slice(&self.program.constant_elements, elements)?;
+                for (index, value) in values.iter().copied().enumerate() {
+                    write!(self.definitions, "  ").map_err(|_| emission_error())?;
+                    self.emit_ir_vector_assignment(index, value)?;
+                }
+                self.definitions.push_str("  return 1;\n");
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_ir_scalar_assignment(
+        &mut self,
+        output: &str,
+        value: ScalarConstant,
+    ) -> Result<(), Error> {
+        match value {
+            ScalarConstant::Bool(value) => {
+                write!(
+                    self.definitions,
+                    "fw_set_bool({output}, {})",
+                    i32::from(value)
+                )
+            }
+            ScalarConstant::Int(value) => {
+                write!(self.definitions, "fw_set_int({output}, {})", c_int64(value))
+            }
+            ScalarConstant::DoubleBits(bits) => write!(
+                self.definitions,
+                "fw_set_double({output}, fw_double_from_bits(UINT64_C(0x{bits:016x})))"
+            ),
+        }
+        .map_err(|_| emission_error())
+    }
+
+    fn emit_ir_vector_assignment(
+        &mut self,
+        index: usize,
+        value: ScalarConstant,
+    ) -> Result<(), Error> {
+        match value {
+            ScalarConstant::Bool(value) => writeln!(
+                self.definitions,
+                "((unsigned char *)out->data)[{index}U] = {}U;",
+                u8::from(value)
+            ),
+            ScalarConstant::Int(value) => writeln!(
+                self.definitions,
+                "((int64_t *)out->data)[{index}U] = {};",
+                c_int64(value)
+            ),
+            ScalarConstant::DoubleBits(bits) => writeln!(
+                self.definitions,
+                "((double *)out->data)[{index}U] = fw_double_from_bits(UINT64_C(0x{bits:016x}));"
+            ),
+        }
+        .map_err(|_| emission_error())
+    }
+
+    fn emit_ir_tuple(&mut self, node: Node) -> Result<(), Error> {
+        let edges = range_slice(&self.program.edges, node.edges)?;
+        let origin = self.origin(node.origin.0)?;
+        writeln!(
+            self.definitions,
+            "  FWV children[{}U]; size_t initialized = 0U;",
+            edges.len().max(1)
+        )
+        .map_err(|_| emission_error())?;
+        self.definitions
+            .push_str("  (void)memset(children, 0, sizeof(children));\n");
+        for (position, edge) in edges.iter().copied().enumerate() {
+            self.emit_edge_call(edge, &format!("&children[{position}U]"), "tuple_cleanup")?;
+            writeln!(self.definitions, "  initialized = {}U;", position + 1)
+                .map_err(|_| emission_error())?;
+        }
+        writeln!(
+            self.definitions,
+            "  if (!fw_make_tuple(out, {}U, \"tuple_literal\", {}U, {}U)) goto tuple_cleanup;",
+            edges.len(),
+            origin.span.begin.line,
+            origin.span.begin.column
+        )
+        .map_err(|_| emission_error())?;
+        for position in 0..edges.len() {
+            writeln!(
+                self.definitions,
+                "  out->items[{position}U] = children[{position}U]; (void)memset(&children[{position}U], 0, sizeof(children[{position}U]));"
+            )
+            .map_err(|_| emission_error())?;
+        }
+        self.definitions.push_str(
+            "  return 1;\ntuple_cleanup:\n  while (initialized != 0U) fw_free(&children[--initialized]);\n  return 0;\n",
+        );
+        Ok(())
+    }
+
+    fn emit_ir_spread_prepare(&mut self, node: Node) -> Result<(), Error> {
+        let edges = range_slice(&self.program.edges, node.edges)?;
+        let edge = edges.first().copied().ok_or_else(emission_error)?;
+        self.emit_edge_call(edge, "out", "spread_failure")?;
+        self.definitions
+            .push_str("  return 1;\nspread_failure:\n  return 0;\n");
+        Ok(())
+    }
+
+    fn emit_ir_selected(
+        &mut self,
+        node: Node,
+        implementation_id: u16,
+        lift: LiftMode,
+        shape: crate::ShapePlan,
+    ) -> Result<(), Error> {
+        let _ = implementation_from_numeric(implementation_id).map_err(|_| emission_error())?;
+        let edges = range_slice(&self.program.edges, node.edges)?;
+        let origin = self.origin(node.origin.0)?;
+        writeln!(
+            self.definitions,
+            "  FWV args[{}U]; FWV spread = {{0}}; size_t initialized = 0U; int has_spread = 0; int ok;",
+            edges.len().max(1)
+        )
+        .map_err(|_| emission_error())?;
+        self.definitions
+            .push_str("  (void)memset(args, 0, sizeof(args));\n");
+        write!(
+            self.definitions,
+            "  static const size_t origins[{}U][2] = {{",
+            edges.len().max(1)
+        )
+        .map_err(|_| emission_error())?;
+        for edge in edges {
+            let edge_origin = self.origin(edge.origin.0)?;
+            write!(
+                self.definitions,
+                "{{{}U,{}U}},",
+                edge_origin.span.begin.line, edge_origin.span.begin.column
+            )
+            .map_err(|_| emission_error())?;
+        }
+        if edges.is_empty() {
+            self.definitions.push_str("{0U,0U}");
+        }
+        self.definitions
+            .push_str("};\n  static const int conversions[] = {");
+        for edge in edges {
+            write!(
+                self.definitions,
+                "{},",
+                match edge.conversion {
+                    IrConversion::Identity => 0,
+                    IrConversion::PromoteIntToDouble => 1,
+                }
+            )
+            .map_err(|_| emission_error())?;
+        }
+        self.definitions.push_str("0};\n");
+
+        let mut spread_producer = None;
+        for (position, edge) in edges.iter().copied().enumerate() {
+            match edge.access {
+                ValueAccess::WholeValue => {
+                    writeln!(
+                        self.definitions,
+                        "  if (!fw_ir_node_{}(hole, &args[{position}U])) goto apply_cleanup;",
+                        edge.producer.0
+                    )
+                    .map_err(|_| emission_error())?;
+                }
+                ValueAccess::FanOutOperandBorrow => {
+                    writeln!(
+                        self.definitions,
+                        "  if (!fw_borrow(hole, &args[{position}U])) goto apply_cleanup;"
+                    )
+                    .map_err(|_| emission_error())?;
+                }
+                ValueAccess::TupleElement(element) => {
+                    if spread_producer.is_none() {
+                        writeln!(
+                            self.definitions,
+                            "  if (!fw_ir_node_{}(hole, &spread)) goto apply_cleanup;\n  has_spread = 1;",
+                            edge.producer.0
+                        )
+                        .map_err(|_| emission_error())?;
+                        spread_producer = Some(edge.producer.0);
+                    }
+                    if spread_producer != Some(edge.producer.0) {
+                        return Err(emission_error());
+                    }
+                    writeln!(
+                        self.definitions,
+                        "  if (!fw_borrow(&spread.items[{element}U], &args[{position}U])) goto apply_cleanup;"
+                    )
+                    .map_err(|_| emission_error())?;
+                }
+            }
+            writeln!(self.definitions, "  initialized = {}U;", position + 1)
+                .map_err(|_| emission_error())?;
+        }
+
+        let shape_checks = range_slice(&self.program.shape_checks, shape.dynamic_checks)?;
+        self.definitions
+            .push_str("  static const size_t shape_checks[] = {");
+        for global_edge in shape_checks {
+            let relative = global_edge
+                .checked_sub(node.edges.start)
+                .ok_or_else(emission_error)?;
+            write!(self.definitions, "{relative}U,").map_err(|_| emission_error())?;
+        }
+        self.definitions.push_str("0U};\n");
+        writeln!(
+            self.definitions,
+            "  ok = fw_impl_{implementation_id}(args, {}U, out, {}U, {}U, origins, {}U, {}, shape_checks, {}U, conversions, {});",
+            edges.len(),
+            origin.span.begin.line,
+            origin.span.begin.column,
+            edges.len(),
+            shape
+                .static_anchor
+                .map_or_else(|| "SIZE_MAX".to_owned(), |value| format!("{value}U")),
+            shape_checks.len(),
+            match lift {
+                LiftMode::Scalar => 0,
+                LiftMode::Vector => 1,
+                LiftMode::DynamicVector => 2,
+            }
+        )
+        .map_err(|_| emission_error())?;
+        self.definitions.push_str(
+            "  while (initialized != 0U) fw_free(&args[--initialized]);\n  if (has_spread) fw_free(&spread);\n  return ok;\napply_cleanup:\n  while (initialized != 0U) fw_free(&args[--initialized]);\n  if (has_spread) fw_free(&spread);\n  return 0;\n",
+        );
+        Ok(())
+    }
+
+    fn emit_ir_fan_out(&mut self, node: Node, branches: IndexRange) -> Result<(), Error> {
+        let edges = range_slice(&self.program.edges, node.edges)?;
+        let operand = edges.first().copied().ok_or_else(emission_error)?;
+        let branch_records = range_slice(&self.program.branches, branches)?;
+        let origin = self.origin(node.origin.0)?;
+        self.definitions
+            .push_str("  FWV operand = {0}; size_t initialized = 0U;\n");
+        match operand.access {
+            ValueAccess::WholeValue => writeln!(
+                self.definitions,
+                "  if (!fw_ir_node_{}(hole, &operand)) return 0;",
+                operand.producer.0
+            ),
+            ValueAccess::FanOutOperandBorrow => {
+                writeln!(
+                    self.definitions,
+                    "  if (!fw_borrow(hole, &operand)) return 0;"
+                )
+            }
+            ValueAccess::TupleElement(_) => return Err(emission_error()),
+        }
+        .map_err(|_| emission_error())?;
+        writeln!(
+            self.definitions,
+            "  if (!fw_make_tuple(out, {}U, \"fanout\", {}U, {}U)) {{ fw_free(&operand); return 0; }}",
+            branch_records.len(),
+            origin.span.begin.line,
+            origin.span.begin.column
+        )
+        .map_err(|_| emission_error())?;
+        for (position, branch) in branch_records.iter().enumerate() {
+            writeln!(
+                self.definitions,
+                "  if (!fw_ir_node_{}(&operand, &out->items[{position}U])) goto fanout_cleanup;\n  initialized = {}U;",
+                branch.root.0,
+                position + 1
+            )
+            .map_err(|_| emission_error())?;
+        }
+        self.definitions
+            .push_str("  (void)initialized; fw_free(&operand); return 1;\n");
+        if !branch_records.is_empty() {
+            self.definitions.push_str(
+                "fanout_cleanup:\n  (void)initialized; fw_free(out); fw_free(&operand); return 0;\n",
+            );
+        }
+        Ok(())
+    }
+
+    fn emit_edge_call(
+        &mut self,
+        edge: crate::Edge,
+        output: &str,
+        failure: &str,
+    ) -> Result<(), Error> {
+        match edge.access {
+            ValueAccess::WholeValue => writeln!(
+                self.definitions,
+                "  if (!fw_ir_node_{}(hole, {output})) goto {failure};",
+                edge.producer.0
+            ),
+            ValueAccess::FanOutOperandBorrow => writeln!(
+                self.definitions,
+                "  if (!fw_borrow(hole, {output})) goto {failure};"
+            ),
+            ValueAccess::TupleElement(_) => return Err(emission_error()),
+        }
+        .map_err(|_| emission_error())
+    }
+
+    fn origin(&self, index: u32) -> Result<Origin, Error> {
+        self.program
+            .origins
+            .get(to_usize(index)?)
+            .copied()
+            .ok_or_else(emission_error)
+    }
+}
+
+fn to_usize(value: u32) -> Result<usize, Error> {
+    usize::try_from(value).map_err(|_| emission_error())
+}
+
+fn range_slice<T>(values: &[T], range: IndexRange) -> Result<&[T], Error> {
+    let start = to_usize(range.start)?;
+    let end = range
+        .checked_end()
+        .ok_or_else(emission_error)
+        .and_then(to_usize)?;
+    values.get(start..end).ok_or_else(emission_error)
+}
+
+fn ir_parameter_runtime() -> Result<String, Error> {
+    const LEGACY_APPLY: &str = "enum {\n  FW_INC";
+    const SELECTED_APPLY: &str = "typedef int (*FWSelectedKernel)";
+    const LEGACY_REFERENCE: &str = "  (void)fw_apply;\n";
+    let legacy_start = PARAMETER_RUNTIME
+        .find(LEGACY_APPLY)
+        .ok_or_else(emission_error)?;
+    let selected_start = PARAMETER_RUNTIME[legacy_start..]
+        .find(SELECTED_APPLY)
+        .and_then(|offset| legacy_start.checked_add(offset))
+        .ok_or_else(emission_error)?;
+    let legacy_reference = PARAMETER_RUNTIME[selected_start..]
+        .find(LEGACY_REFERENCE)
+        .and_then(|offset| selected_start.checked_add(offset))
+        .ok_or_else(emission_error)?;
+    let after_reference = legacy_reference
+        .checked_add(LEGACY_REFERENCE.len())
+        .ok_or_else(emission_error)?;
+    let mut runtime = String::new();
+    runtime
+        .try_reserve(PARAMETER_RUNTIME.len())
+        .map_err(|_| emission_error())?;
+    runtime.push_str(&PARAMETER_RUNTIME[..legacy_start]);
+    runtime.push_str(&PARAMETER_RUNTIME[selected_start..legacy_reference]);
+    runtime.push_str(&PARAMETER_RUNTIME[after_reference..]);
+    Ok(runtime)
 }
 
 pub fn emit_c_source(source: &str) -> Result<CEmissionResult, Error> {
@@ -1165,6 +1866,67 @@ static int fw_apply(int primitive, int result_type, const FWV *args, size_t coun
   }
   return 1;
 }
+typedef int (*FWSelectedKernel)(const FWV *,FWV *,const char *,size_t,size_t,size_t,int);
+static int fw_selected_integer_overflow(const char *name,size_t line,size_t column,
+                                        size_t index,int vector_result) {
+  if(vector_result){
+    (void)snprintf(fw_error_storage,sizeof(fw_error_storage),
+                   "%s failed: integer_overflow at result index %zu",name,index);
+    return fw_fail("DomainError",fw_error_storage,line,column);
+  }
+  return fw_fail_primitive("DomainError",name,"integer_overflow",line,column);
+}
+static FWV fw_scalar_at_selected(const FWV *value,size_t index,int conversion) {
+  FWV result=fw_scalar_at(value,index);
+  if(conversion!=0){int64_t integer=result.i;fw_set_double(&result,fw_int_to_double(integer));}
+  return result;
+}
+static int fw_apply_selected(FWSelectedKernel kernel,const char *name,int result_type,
+                             const FWV *args,size_t count,FWV *out,
+                             size_t line,size_t column,const size_t (*origins)[2],
+                             size_t origin_count,size_t static_anchor,
+                             const size_t *shape_checks,size_t shape_count,
+                             const int *conversions,int lift) {
+  size_t i,length=1U,anchor=static_anchor;
+  if(lift!=0){
+    if(anchor==SIZE_MAX){
+      if(shape_count==0U)return fw_fail("ValueError","selected vector plan has no anchor",line,column);
+      anchor=shape_checks[0];
+    }
+    length=args[anchor].len;
+    for(i=0U;i<shape_count;++i){
+      size_t position=shape_checks[i];
+      if(position!=anchor&&args[position].len!=length){
+        size_t origin_line=position<origin_count?origins[position][0]:line;
+        size_t origin_column=position<origin_count?origins[position][1]:column;
+        return fw_fail_shape(name,position+1U,length,args[position].len,
+                             origin_line,origin_column);
+      }
+    }
+    if(!fw_make_vector(out,result_type,length,length,name,line,column))return 0;
+  }else{
+    (void)memset(out,0,sizeof(*out));out->type=result_type;
+    if(!fw_charge_work(1U,name,line,column))return 0;
+  }
+  for(i=0U;i<length;++i){
+    FWV scalar_args[2]={{0}};FWV scalar_out={0};size_t j;
+    for(j=0U;j<count;++j)
+      scalar_args[j]=fw_scalar_at_selected(&args[j],i,conversions[j]);
+    if(!kernel(scalar_args,&scalar_out,name,line,column,i,lift!=0)){
+      fw_free(out);return 0;
+    }
+    (void)fw_put_scalar(out,i,scalar_out);
+  }
+  return 1;
+}
+static int fw_apply_selected_iota(const char *name,const FWV *args,FWV *out,
+                                  size_t line,size_t column) {
+  int64_t bound=args[0].i;
+  size_t i,length=bound>0?(size_t)bound:0U;
+  if(!fw_make_vector(out,1,length,length,name,line,column))return 0;
+  for(i=0U;i<length;++i)((int64_t *)out->data)[i]=(int64_t)i+1;
+  return 1;
+}
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
 static int fw_append(FWBuffer *buffer,const char *text) {
   size_t n=strlen(text),needed; char *grown;
@@ -1332,6 +2094,15 @@ static int fw_report_argument(const char *reason,size_t supplied,size_t position
 static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   size_t supplied=argc>0?(size_t)argc-1U:0U,i,initialized=0U;FWV *values=NULL;FWBuffer output={0};int decoded;
   (void)fw_apply;
+  (void)fw_apply_selected;
+  (void)fw_apply_selected_iota;
+  (void)fw_selected_integer_overflow;
+  (void)fw_as_double;
+  (void)fw_borrow;
+  (void)fw_double_arithmetic;
+  (void)fw_double_equal;
+  (void)fw_double_less_than;
+  (void)fw_set_int;
   (void)fw_make_tuple;
 #ifdef _WIN32
   if (_setmode(_fileno(stdout), _O_BINARY) == -1 || _setmode(_fileno(stderr), _O_BINARY) == -1) return 1;
@@ -1359,3 +2130,433 @@ failure:
   (void)fprintf(stderr,"<generated>:%zu:%zu: %s: %s\n",fw_error_line,fw_error_column,fw_error_kind?fw_error_kind:"FormattingError",fw_error_message?fw_error_message:"unable to format result");return 1;
 }
 "#;
+
+#[cfg(test)]
+mod ir_tests {
+    use super::*;
+    use crate::lowering::compile_source;
+
+    fn emit(source: &str) -> String {
+        emit_with_configuration(
+            source,
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::TrustedLocalV2,
+                ..EvaluationConfiguration::default()
+            },
+        )
+    }
+
+    fn emit_with_configuration(source: &str, configuration: EvaluationConfiguration) -> String {
+        let program = match compile_source(source) {
+            Ok(program) => program,
+            Err(error) => panic!("test source did not lower: {error}"),
+        };
+        match emit_verified_c_program(&program, configuration) {
+            Ok(emission) => emission.source,
+            Err(error) => panic!("verified program did not emit: {error}"),
+        }
+    }
+
+    #[test]
+    fn verified_generator_uses_ir_identities_conversions_shapes_and_provenance() {
+        let source = emit(
+            "parameters[left Int right Double]\n\
+             add[left right]\n\
+             add[(1 2) iota[left]]\n",
+        );
+        assert!(source.contains("fw_impl_10(args, 2U"));
+        assert!(source.contains("static const int conversions[] = {1,0,0};"));
+        assert!(source.contains("static const size_t shape_checks[] = {1U,0U};"));
+        assert!(source.contains("\"left\",\"right\",\"\""));
+        let spans = source
+            .lines()
+            .find(|line| line.starts_with("const size_t fw_parameter_spans"))
+            .unwrap_or("");
+        assert!(source.contains("{12U,1U,12U,20U,1U,20U}"), "{spans}");
+        assert!(source.contains("{21U,1U,21U,33U,1U,33U}"), "{spans}");
+        assert!(!source.contains("static_expression_type"));
+        assert!(!source.contains("known_vector_length"));
+        assert!(!source.contains("fw_apply("));
+    }
+
+    #[test]
+    fn verified_generator_emits_constants_tuples_prefix_spread_and_fan_out() {
+        let source = emit(
+            "parameters[count Int]\n\
+             [true 2 3.5]\n\
+             add [1 2]\n\
+             fanout[iota[count] {inc[_]} {add[_ 10]}]\n",
+        );
+        assert!(source.contains("fw_set_bool(out, 1)"));
+        assert!(source.contains("fw_set_double(out, fw_double_from_bits"));
+        assert!(source.contains("fw_make_tuple(out, 3U, \"tuple_literal\""));
+        assert!(source.contains("FWV spread = {0}"));
+        assert!(source.contains("fw_borrow(&spread.items[0U]"));
+        assert!(source.contains("fw_ir_node_"));
+        assert!(source.contains("(&operand, &out->items[0U])"));
+        assert!(source.contains("fw_impl_34(args, 1U"));
+    }
+
+    #[test]
+    fn verified_generation_is_byte_identical() {
+        let program = match compile_source("parameters[n Int]\ninc[iota[n]]\n") {
+            Ok(program) => program,
+            Err(error) => panic!("test source did not lower: {error}"),
+        };
+        let configuration = EvaluationConfiguration::default();
+        let first = match emit_verified_c_program(&program, configuration) {
+            Ok(emission) => emission.source,
+            Err(error) => panic!("first generation failed: {error}"),
+        };
+        let second = match emit_verified_c_program(&program, configuration) {
+            Ok(emission) => emission.source,
+            Err(error) => panic!("second generation failed: {error}"),
+        };
+        assert_eq!(first.as_bytes(), second.as_bytes());
+    }
+
+    #[test]
+    fn verified_generator_preflights_configuration_and_tuple_profile() {
+        let scalar = match compile_source("inc[1]\n") {
+            Ok(program) => program,
+            Err(error) => panic!("scalar source did not lower: {error}"),
+        };
+        let invalid_configuration = EvaluationConfiguration {
+            limits: crate::ResourceLimits {
+                max_work_units: Some(1),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        let error = match emit_verified_c_program(&scalar, invalid_configuration) {
+            Ok(_) => panic!("trusted profile with a limit unexpectedly emitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::InvalidExecutionProfile);
+
+        let tuple = match compile_source("parameters[x Int]\n[inc[x] 2]\n") {
+            Ok(program) => program,
+            Err(error) => panic!("tuple source did not lower: {error}"),
+        };
+        let error = match emit_verified_c_program(
+            &tuple,
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::TrustedLocalV1,
+                ..EvaluationConfiguration::default()
+            },
+        ) {
+            Ok(_) => panic!("V1 tuple program unexpectedly emitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::ProfileError);
+        assert_eq!((error.location.line, error.location.column), (2, 1));
+    }
+
+    #[test]
+    fn tuple_children_precede_outer_table_admission_in_generated_code() {
+        let source = emit("[iota[3] iota[2]]\n");
+        let tuple = match source.find("static int fw_ir_node_4") {
+            Some(index) => &source[index..],
+            None => panic!("missing tuple node"),
+        };
+        let first_child = tuple.find("fw_ir_node_1(hole, &children[0U])");
+        let second_child = tuple.find("fw_ir_node_3(hole, &children[1U])");
+        let admission = tuple.find("fw_make_tuple(out, 2U");
+        assert!(
+            matches!(
+                (first_child, second_child, admission),
+                (Some(first), Some(second), Some(admit)) if first < second && second < admit
+            ),
+            "tuple node did not execute children before admission"
+        );
+    }
+
+    #[test]
+    fn every_selected_id_emits_a_direct_kernel_symbol_without_type_redispatch() {
+        let source = emit(
+            "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
+             abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
+             mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
+             not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
+             and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
+             is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
+             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n",
+        );
+        for implementation in 1..34 {
+            assert!(
+                source.contains(&format!("static int fw_kernel_{implementation}(")),
+                "missing kernel {implementation}"
+            );
+            assert!(
+                source.contains(&format!("fw_apply_selected(fw_kernel_{implementation},")),
+                "implementation {implementation} is not direct"
+            );
+        }
+        assert!(source.contains("static int fw_impl_34("));
+        assert!(source.contains("return fw_apply_selected_iota(\"iota\""));
+        assert!(!source.contains("fw_apply_scalar"));
+        assert!(!source.contains("primitive=="));
+    }
+
+    #[cfg(not(windows))]
+    fn compile_and_run(source: &str, arguments: &[&str]) -> std::process::Output {
+        compile_and_run_with_diagnostics(source, arguments, true)
+    }
+
+    #[cfg(not(windows))]
+    fn compile_and_run_with_diagnostics(
+        source: &str,
+        arguments: &[&str],
+        warnings_as_errors: bool,
+    ) -> std::process::Output {
+        use std::fs;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos(),
+            Err(error) => panic!("test clock is invalid: {error}"),
+        };
+        let directory =
+            std::env::temp_dir().join(format!("faraweave-ir-c11-{}-{nonce}", std::process::id()));
+        if let Err(error) = fs::create_dir(&directory) {
+            panic!("unable to create test directory: {error}");
+        }
+        let c_path = directory.join("program.c");
+        let executable = directory.join("program");
+        if let Err(error) = fs::write(&c_path, source) {
+            panic!("unable to write generated C: {error}");
+        }
+        let mut compiler = Command::new("cc");
+        compiler.args([
+            "-std=c11",
+            "-frounding-math",
+            "-ffp-contract=off",
+            "-fno-fast-math",
+            "-Wall",
+            "-Wextra",
+            "-pedantic-errors",
+        ]);
+        if warnings_as_errors {
+            compiler.arg("-Werror");
+        }
+        let compile = match compiler
+            .arg(&c_path)
+            .arg("-o")
+            .arg(&executable)
+            .arg("-lm")
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => panic!("unable to launch strict C11 compiler: {error}"),
+        };
+        if !compile.status.success() {
+            panic!(
+                "strict C11 compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let output = match Command::new(&executable).args(arguments).output() {
+            Ok(output) => output,
+            Err(error) => panic!("unable to execute generated program: {error}"),
+        };
+        if let Err(error) = fs::remove_dir_all(&directory) {
+            panic!("unable to remove test directory: {error}");
+        }
+        output
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn verified_generated_c_compiles_strictly_and_executes_success_and_failure_paths() {
+        let successful = emit(
+            "parameters[count Int]\n\
+             add[count 2.0]\n\
+             inc[(1 2 3)]\n\
+             add [1 2]\n\
+             fanout[iota[count] {inc[_]} {add[_ 10]}]\n",
+        );
+        let output = compile_and_run(&successful, &["3"]);
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "5.0\n(2 3 4)\n3\n[(2 3 4) (11 12 13)]\n"
+        );
+        assert!(output.stderr.is_empty());
+
+        let failing = emit("parameters[count Int]\nadd[iota[count] iota[2]]\n");
+        let output = compile_and_run(&failing, &["3"]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("ShapeMismatch: add argument 2 expected shape [3], got [2]")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn verified_generated_c_matches_legacy_backend_for_success_and_failure_corpus() {
+        let configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::TrustedLocalV2,
+            ..EvaluationConfiguration::default()
+        };
+        let corpus: &[(&str, &[&str])] = &[
+            ("parameters[x Int]\nadd[x 2.0]\n", &["3"]),
+            (
+                "parameters[n Int]\nadd [1 2]\nfanout[iota[n] {inc[_]} {add[_ 10]}]\n",
+                &["3"],
+            ),
+            ("parameters[x Int]\ninc[x]\n", &["9223372036854775807"]),
+            ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
+        ];
+        for (source, arguments) in corpus {
+            let verified =
+                compile_and_run(&emit_with_configuration(source, configuration), arguments);
+            let legacy_source = match emit_c_source_with_configuration(source, configuration) {
+                Ok(emission) => emission.source,
+                Err(error) => panic!("legacy generator failed: {error}"),
+            };
+            let legacy = compile_and_run_with_diagnostics(&legacy_source, arguments, false);
+            assert_eq!(
+                verified.status.success(),
+                legacy.status.success(),
+                "{source}"
+            );
+            assert_eq!(verified.stdout, legacy.stdout, "{source}");
+            assert_eq!(verified.stderr, legacy.stderr, "{source}");
+        }
+
+        let resource_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_vector_bytes: Some(16),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        let source = "parameters[n Int]\n1\niota[n]\n";
+        let verified = compile_and_run(
+            &emit_with_configuration(source, resource_configuration),
+            &["3"],
+        );
+        let legacy_source = match emit_c_source_with_configuration(source, resource_configuration) {
+            Ok(emission) => emission.source,
+            Err(error) => panic!("legacy resource generator failed: {error}"),
+        };
+        let legacy = compile_and_run_with_diagnostics(&legacy_source, &["3"], false);
+        assert!(!verified.status.success());
+        assert!(verified.stdout.is_empty());
+        assert_eq!(verified.stdout, legacy.stdout);
+        assert_eq!(verified.stderr, legacy.stderr);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tuple_resource_and_fault_order_matches_legacy_backend() {
+        let source = "[iota[3] iota[2]]\n";
+        let configurations = [
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_vector_bytes: Some(16),
+                    ..crate::ResourceLimits::default()
+                },
+                ..EvaluationConfiguration::default()
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_live_evaluation_bytes: Some(32),
+                    ..crate::ResourceLimits::default()
+                },
+                ..EvaluationConfiguration::default()
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_work_units: Some(4),
+                    ..crate::ResourceLimits::default()
+                },
+                ..EvaluationConfiguration::default()
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_tuple_table_bytes: Some(16),
+                    ..crate::ResourceLimits::default()
+                },
+                ..EvaluationConfiguration::default()
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_vector_bytes: Some(128),
+                    max_tuple_table_bytes: Some(128),
+                    max_live_evaluation_bytes: Some(256),
+                    max_work_units: Some(256),
+                },
+                allocation_failure: crate::AllocationFailureInjection {
+                    fail_at_ordinal: Some(0),
+                },
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_vector_bytes: Some(128),
+                    max_tuple_table_bytes: Some(128),
+                    max_live_evaluation_bytes: Some(256),
+                    max_work_units: Some(256),
+                },
+                allocation_failure: crate::AllocationFailureInjection {
+                    fail_at_ordinal: Some(1),
+                },
+            },
+            EvaluationConfiguration {
+                profile: crate::ExecutionProfile::BoundedV2,
+                limits: crate::ResourceLimits {
+                    max_vector_bytes: Some(128),
+                    max_tuple_table_bytes: Some(128),
+                    max_live_evaluation_bytes: Some(256),
+                    max_work_units: Some(256),
+                },
+                allocation_failure: crate::AllocationFailureInjection {
+                    fail_at_ordinal: Some(2),
+                },
+            },
+        ];
+        for configuration in configurations {
+            let verified = compile_and_run(&emit_with_configuration(source, configuration), &[]);
+            let legacy_source = match emit_c_source_with_configuration(source, configuration) {
+                Ok(emission) => emission.source,
+                Err(error) => panic!("legacy tuple generator failed: {error}"),
+            };
+            let legacy = compile_and_run_with_diagnostics(&legacy_source, &[], false);
+            assert_eq!(verified.status.success(), legacy.status.success());
+            assert_eq!(verified.stdout, legacy.stdout);
+            assert_eq!(verified.stderr, legacy.stderr);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn all_direct_selected_kernels_compile_strictly_and_match_legacy_results() {
+        let source = "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
+             abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
+             mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
+             not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
+             and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
+             is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
+             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n";
+        let configuration = EvaluationConfiguration::default();
+        let verified = compile_and_run(&emit_with_configuration(source, configuration), &[]);
+        let legacy_source = match emit_c_source_with_configuration(source, configuration) {
+            Ok(emission) => emission.source,
+            Err(error) => panic!("legacy all-kernel generator failed: {error}"),
+        };
+        let legacy = compile_and_run_with_diagnostics(&legacy_source, &[], false);
+        assert!(verified.status.success());
+        assert_eq!(verified.stdout, legacy.stdout);
+        assert_eq!(verified.stderr, legacy.stderr);
+    }
+}
