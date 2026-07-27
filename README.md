@@ -40,6 +40,10 @@ partial result on overflow. Double results canonicalize NaNs; signed zero,
 infinities, gradual underflow, and IEEE unordered comparisons are preserved.
 Canonical output includes visible `.0` for integral Doubles.
 
+The accepted [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md)
+defines the normative verified boundary that the interpreter and generated-C
+backend will share. Its physical encoding is intentionally deferred.
+
 ## Build and use
 
 Rust 1.97.1 is pinned in `rust-toolchain.toml`.
