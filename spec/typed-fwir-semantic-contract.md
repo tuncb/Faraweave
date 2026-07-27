@@ -139,6 +139,21 @@ binary64 bits. A vector constant stores its scalar element type, checked
 length, and ordered canonical scalar payload. Empty vector constants retain
 their authored element type.
 
+Executing a vector `Constant` performs one canonical semantic vector admission
+and produces an owned result; it is not an uncharged borrow of the module
+payload. Bool elements have a canonical accounting width of 1 byte and Int and
+Double elements each have a width of 8 bytes. For length `n`, the request has
+zero work and a byte charge computed by checked `n * width`, with the stable
+producer descriptor `vector_literal`; overflow is the request's
+`SizeOverflow`. A positive request is one semantic allocation attempt and its
+reservation follows the owned result until failure cleanup or logical last
+use, when the live bytes are released. A zero-length vector still performs the
+zero-byte admission and produces an owned, typed empty result, but has no live
+charge, allocation attempt/ordinal, or reservation release. These accounting
+facts are part of `FWIR-SEM-005` and follow the canonical request order and
+events in `FWIR-SEM-014`; a backend may elide physical storage only while
+preserving them exactly.
+
 Tuple literals are node constructions, not opaque tuple constants, because
 their element evaluation, provenance, ownership transfer, table admission,
 allocation ordinal, and cleanup are observable. Compact parser forms such as a
@@ -254,10 +269,27 @@ order. The first domain failure is returned with the lowest failing result
 index, no partial vector result is published, and admitted result bytes are
 released without refunding monotonic work.
 
+Every ordinary `SelectedApply` charges exactly one work unit for a scalar
+result and exactly `n` work units for a lifted vector result of length `n`,
+including zero work for an empty vector. The work is part of the result
+admission: a scalar result makes a zero-byte, one-work request, while a lifted
+result makes one combined vector-byte and `n`-work request. That request follows
+`FWIR-SEM-014` and commits before physical allocation/materialization and before
+the first scalar or element kernel; after it commits, a domain failure retains
+all of the charged work.
+
 `iota` receives one scalar Int. A bound at or below zero yields an empty Int
 vector; a positive bound yields `1..=bound`. Its length conversion, vector
 admission, work charge, allocation, and construction are dynamic even for a
-literal bound.
+literal bound. Its one result-admission request charges exactly its result
+length in work units, including zero for an empty result, and the canonical Int
+vector byte charge; the admission commits before construction begins.
+
+These exact units, combined result requests, and commit points are part of
+`FWIR-SEM-008`, not backend cost estimates. Together with `FWIR-SEM-005` and
+`FWIR-SEM-014`, they prevent an interpreter, generated runtime, or other
+backend from selecting different work-limit failures, allocation ordinals, or
+resource events for the same verified program and execution policy.
 
 Integer arithmetic is checked. Binary64 arithmetic, comparisons, conversion,
 NaN, infinities, signed zero, and gradual underflow retain the current strict
@@ -477,6 +509,12 @@ semantic admission refunds the refused result's live charge without changing
 the ordinal stream. Work is monotonic and never refunded; live bytes release at
 logical last use; allocation-attempt count is monotonic.
 
+The vector-constant rules in `FWIR-SEM-005` and the ordinary
+`SelectedApply`/`iota` work rules in `FWIR-SEM-008` are canonical inputs to this
+request sequence. Backends must not split, combine, defer, omit, or add those
+requests in a way that changes a refusal winner, committed usage, allocation
+ordinal, admission/refusal/release event, or post-cleanup usage.
+
 On failure, cleanup runs in reverse ownership order, is allocation-free and
 infallible, and cannot replace the selected failure. The returned usage
 snapshot is taken after cleanup, so live bytes reflect releases while work and
@@ -615,10 +653,10 @@ and hostile-input evidence.
 | `FWIR-SEM-002` | `src/parser.rs`, `src/error.rs`, `src/resources.rs`, `src/value.rs` record audit | #4 model/verifier |
 | `FWIR-SEM-003` | `typed_public_api_parameter_contract`; `parameter_header_reason_and_span_contract_is_structured`; `cli_parameters_and_diagnostics_contract` | #5 lowering, #6 interpreter |
 | `FWIR-SEM-004` | `s16_empty_singleton_promotion_and_shape_contracts`; `deep_structural_values_and_types_format_and_drop_iteratively` | #4 model, #5 lowering |
-| `FWIR-SEM-005` | `canonical_binary64_format_boundaries`; `typed_api_rejects_noncanonical_nan_without_normalizing_it`; `v1_tuple_refusal_precedes_type_and_runtime_work` | #4 verifier, #5 lowering |
+| `FWIR-SEM-005` | `canonical_binary64_format_boundaries`; `typed_api_rejects_noncanonical_nan_without_normalizing_it`; `v1_tuple_refusal_precedes_type_and_runtime_work`; `resource_observer_reports_commit_refusal_and_cleanup_order` | #4 verifier, #5 lowering |
 | `FWIR-SEM-006` | `parses_literals_calls_tuples_parameters_and_fanout`; `deep_unary_programs_use_iterative_parse_analysis_and_evaluation` | #4 node/edge verifier |
 | `FWIR-SEM-007` | `s16_complete_elementwise_matrix`; `generated_runtime_embeds_profile_and_typed_primitive_selection` | #3 identities, #5 lowering |
-| `FWIR-SEM-008` | `s16_empty_singleton_promotion_and_shape_contracts`; `checked_arithmetic_has_no_partial_result`; authored golden corpus IDs `S16-16`, `S16-17`, `S16-19`, `S16-22` | #5 lowering, #6 interpreter |
+| `FWIR-SEM-008` | `s16_empty_singleton_promotion_and_shape_contracts`; `checked_arithmetic_has_no_partial_result`; `vector_tuple_and_work_limits_cover_zero_exact_and_one_past`; authored golden corpus IDs `S16-16`, `S16-17`, `S16-19`, `S16-22` | #5 lowering, #6 interpreter |
 | `FWIR-SEM-009` | `tup_structural_format_spread_and_direct_preservation`; `lifting_and_tuples_are_canonical` | #5 lowering, #6/#8 backends |
 | `FWIR-SEM-010` | `tuple_allocation_ordinals_exclude_empty_tables_and_cleanup_failures`; `live_limit_observes_children_before_outer_tuple_admission`; deep tuple journeys | #6/#8 resource traces |
 | `FWIR-SEM-011` | `fan_stable_id_matrix`; fan-out fixtures; generated C fan-out path inspection | #5 lowering, #6/#8 differential fan-out traces |
