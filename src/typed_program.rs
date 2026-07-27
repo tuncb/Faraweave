@@ -72,7 +72,7 @@ impl Feature {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct SourceUnit {
     pub diagnostic_name: String,
     pub byte_length: u32,
@@ -97,7 +97,7 @@ pub struct Origin {
     pub span: OriginSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Parameter {
     pub slot: u32,
     pub name: String,
@@ -242,7 +242,7 @@ pub struct Root {
     pub origin: OriginIndex,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct RawProgram {
     pub module: ModuleMetadata,
     pub features: Vec<u16>,
@@ -276,7 +276,7 @@ impl RawProgram {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct VerifiedProgram {
     raw: RawProgram,
 }
@@ -340,6 +340,7 @@ pub enum VerifyAllocationSite {
     DynamicShapeScratch,
     ReachabilityBits,
     ReachabilityWorklist,
+    FanOutBorrowContext,
     OwnershipSinks,
     OwnershipLastUse,
     OwnershipRootOwner,
@@ -1861,45 +1862,79 @@ fn verify_apply(
     Ok(())
 }
 
-fn fan_out_borrow_has_context(program: &RawProgram, consumer: u32, producer: NodeIndex) -> bool {
+#[derive(Debug, Default, Eq, PartialEq)]
+struct FanOutContextVisits {
+    fan_outs: u64,
+    branch_nodes: u64,
+    edges: u64,
+}
+
+fn build_fan_out_borrow_context(
+    program: &RawProgram,
+    injection: VerifyAllocationFailureInjection,
+    visits: &mut FanOutContextVisits,
+) -> Result<Vec<bool>, VerifyError> {
+    injected(injection, VerifyAllocationSite::FanOutBorrowContext)?;
+    let mut context = filled_verify_vec(
+        program.edges.len(),
+        false,
+        VerifyAllocationSite::FanOutBorrowContext,
+    )?;
     for (fan_out_index, node) in program.nodes.iter().copied().enumerate() {
         let NodeKind::FanOut { branches, .. } = node.kind else {
             continue;
         };
-        let Ok(edge_bounds) = range_bounds(
+        visits.fan_outs = visits.fan_outs.saturating_add(1);
+        let edge_bounds = range_bounds(
             node.edges,
             program.edges.len(),
             RecordKind::Node,
             fan_out_index as u32,
             "edges",
-        ) else {
-            continue;
-        };
+        )?;
         let Some(operand) = program.edges[edge_bounds].first() else {
             continue;
         };
-        if operand.producer != producer {
-            continue;
-        }
-        let Ok(branch_bounds) = range_bounds(
+        let branch_bounds = range_bounds(
             branches,
             program.branches.len(),
             RecordKind::Node,
             fan_out_index as u32,
             "branches",
-        ) else {
-            continue;
-        };
-        if program.branches[branch_bounds].iter().any(|branch| {
-            branch
-                .nodes
-                .checked_end()
-                .is_some_and(|end| consumer >= branch.nodes.start && consumer < end)
-        }) {
-            return true;
+        )?;
+        for (branch_offset, branch) in program.branches[branch_bounds].iter().copied().enumerate() {
+            let branch_index = branches.start.saturating_add(branch_offset as u32);
+            let node_bounds = range_bounds(
+                branch.nodes,
+                program.nodes.len(),
+                RecordKind::Branch,
+                branch_index,
+                "nodes",
+            )?;
+            for (node_offset, branch_node) in program.nodes[node_bounds].iter().copied().enumerate()
+            {
+                visits.branch_nodes = visits.branch_nodes.saturating_add(1);
+                let branch_node_index = branch.nodes.start.saturating_add(node_offset as u32);
+                let edge_bounds = range_bounds(
+                    branch_node.edges,
+                    program.edges.len(),
+                    RecordKind::Node,
+                    branch_node_index,
+                    "edges",
+                )?;
+                for edge_index in edge_bounds {
+                    visits.edges = visits.edges.saturating_add(1);
+                    let edge = program.edges[edge_index];
+                    if edge.access == ValueAccess::FanOutOperandBorrow
+                        && edge.producer == operand.producer
+                    {
+                        context[edge_index] = true;
+                    }
+                }
+            }
         }
     }
-    false
+    Ok(context)
 }
 
 fn verify_fan_out(
@@ -2195,6 +2230,9 @@ fn verify_semantic_ownership(
     program: &RawProgram,
     injection: VerifyAllocationFailureInjection,
 ) -> Result<(), VerifyError> {
+    let mut fan_out_visits = FanOutContextVisits::default();
+    let fan_out_borrow_context =
+        build_fan_out_borrow_context(program, injection, &mut fan_out_visits)?;
     for (consumer_index, node) in program.nodes.iter().copied().enumerate() {
         let bounds = range_bounds(
             node.edges,
@@ -2230,7 +2268,10 @@ fn verify_semantic_ownership(
                 }
                 (NodeKind::SelectedApply { .. }, ValueAccess::FanOutOperandBorrow) => {
                     edge.ownership == OwnershipMode::ImmutableBorrow
-                        && fan_out_borrow_has_context(program, consumer_index as u32, edge.producer)
+                        && fan_out_borrow_context
+                            .get(node.edges.start as usize + offset)
+                            .copied()
+                            .unwrap_or(false)
                 }
                 (NodeKind::FanOut { .. }, ValueAccess::WholeValue) => {
                     if parameter {
@@ -3142,7 +3183,15 @@ mod tests {
         let mut stray_fan_out_borrow = iota_program();
         stray_fan_out_borrow.edges[0].access = ValueAccess::FanOutOperandBorrow;
         stray_fan_out_borrow.edges[0].ownership = OwnershipMode::ImmutableBorrow;
-        verify_error(stray_fan_out_borrow, Invariant::AmbiguousOwnership);
+        assert_eq!(
+            stray_fan_out_borrow.verify(),
+            Err(VerifyError::MalformedProgram(MalformedProgram {
+                invariant: Invariant::AmbiguousOwnership,
+                record: RecordKind::Edge,
+                index: Some(0),
+                field: "ownership",
+            }))
+        );
 
         let mut cycle = scalar_program();
         cycle.edges.push(Edge {
@@ -3488,6 +3537,7 @@ mod tests {
             VerifyAllocationSite::DynamicShapeScratch,
             VerifyAllocationSite::ReachabilityBits,
             VerifyAllocationSite::ReachabilityWorklist,
+            VerifyAllocationSite::FanOutBorrowContext,
             VerifyAllocationSite::OwnershipSinks,
             VerifyAllocationSite::OwnershipLastUse,
             VerifyAllocationSite::OwnershipRootOwner,
@@ -3500,47 +3550,67 @@ mod tests {
         }
     }
 
+    fn parameterized_tuple_program(ownership: OwnershipMode) -> RawProgram {
+        let mut program = tuple_program();
+        program.module.parameter_header_origin = Some(OriginIndex(0));
+        program.parameters.push(Parameter {
+            slot: 0,
+            name: "input".to_owned(),
+            scalar_type: ScalarType::Int,
+            declaration_origin: OriginIndex(0),
+            name_origin: OriginIndex(0),
+        });
+        program.module.ranges.parameters.count = 1;
+        program.nodes[0].kind = NodeKind::ParameterBorrow {
+            parameter: ParameterIndex(0),
+        };
+        program.edges[0].ownership = ownership;
+        program.ownership.remove(0);
+        program.module.ranges.ownership.count -= 1;
+        program
+    }
+
+    fn parameterized_fan_out_program(ownership: OwnershipMode) -> RawProgram {
+        let mut program = fan_out_program();
+        program.module.parameter_header_origin = Some(OriginIndex(0));
+        program.parameters.push(Parameter {
+            slot: 0,
+            name: "input".to_owned(),
+            scalar_type: ScalarType::Int,
+            declaration_origin: OriginIndex(0),
+            name_origin: OriginIndex(0),
+        });
+        program.module.ranges.parameters.count = 1;
+        program.nodes[0].kind = NodeKind::ParameterBorrow {
+            parameter: ParameterIndex(0),
+        };
+        program.edges[1].ownership = ownership;
+        program.ownership.remove(0);
+        program.module.ranges.ownership.count -= 1;
+        program
+    }
+
     #[test]
     fn parameter_borrows_materialize_in_tuples_and_feed_fan_out_without_ownership() {
-        let mut tuple = tuple_program();
-        tuple.module.parameter_header_origin = Some(OriginIndex(0));
-        tuple.parameters.push(Parameter {
-            slot: 0,
-            name: "input".to_owned(),
-            scalar_type: ScalarType::Int,
-            declaration_origin: OriginIndex(0),
-            name_origin: OriginIndex(0),
-        });
-        tuple.module.ranges.parameters.count = 1;
-        tuple.nodes[0].kind = NodeKind::ParameterBorrow {
-            parameter: ParameterIndex(0),
-        };
-        tuple.edges[0].ownership = OwnershipMode::ImmutableBorrow;
-        tuple.ownership.remove(0);
-        tuple.module.ranges.ownership.count -= 1;
-        assert!(tuple.clone().verify().is_ok());
-        tuple.edges[0].ownership = OwnershipMode::InfallibleTransfer;
-        verify_error(tuple, Invariant::AmbiguousOwnership);
+        assert!(
+            parameterized_tuple_program(OwnershipMode::ImmutableBorrow)
+                .verify()
+                .is_ok()
+        );
+        verify_error(
+            parameterized_tuple_program(OwnershipMode::InfallibleTransfer),
+            Invariant::AmbiguousOwnership,
+        );
 
-        let mut fan_out = fan_out_program();
-        fan_out.module.parameter_header_origin = Some(OriginIndex(0));
-        fan_out.parameters.push(Parameter {
-            slot: 0,
-            name: "input".to_owned(),
-            scalar_type: ScalarType::Int,
-            declaration_origin: OriginIndex(0),
-            name_origin: OriginIndex(0),
-        });
-        fan_out.module.ranges.parameters.count = 1;
-        fan_out.nodes[0].kind = NodeKind::ParameterBorrow {
-            parameter: ParameterIndex(0),
-        };
-        fan_out.edges[1].ownership = OwnershipMode::ImmutableBorrow;
-        fan_out.ownership.remove(0);
-        fan_out.module.ranges.ownership.count -= 1;
-        assert!(fan_out.clone().verify().is_ok());
-        fan_out.edges[1].ownership = OwnershipMode::OwnedInput;
-        verify_error(fan_out, Invariant::AmbiguousOwnership);
+        assert!(
+            parameterized_fan_out_program(OwnershipMode::ImmutableBorrow)
+                .verify()
+                .is_ok()
+        );
+        verify_error(
+            parameterized_fan_out_program(OwnershipMode::OwnedInput),
+            Invariant::AmbiguousOwnership,
+        );
     }
 
     #[test]
@@ -3835,6 +3905,40 @@ mod tests {
             origin,
         }));
         must(builder.finish())
+    }
+
+    #[test]
+    fn fan_out_context_construction_visits_wide_regions_linearly() {
+        for (width, expected) in [(64, 64_u64), (128, 128_u64)] {
+            let program = wide_fan_out_program(width);
+            let mut visits = FanOutContextVisits::default();
+            let context = build_fan_out_borrow_context(
+                &program,
+                VerifyAllocationFailureInjection::none(),
+                &mut visits,
+            );
+            assert!(context.is_ok());
+            assert_eq!(
+                visits,
+                FanOutContextVisits {
+                    fan_outs: 1,
+                    branch_nodes: expected,
+                    edges: expected,
+                }
+            );
+        }
+
+        let mut wrong_operand = wide_fan_out_program(2);
+        wrong_operand.edges[1].producer = NodeIndex(1);
+        assert_eq!(
+            wrong_operand.verify(),
+            Err(VerifyError::MalformedProgram(MalformedProgram {
+                invariant: Invariant::AmbiguousOwnership,
+                record: RecordKind::Edge,
+                index: Some(1),
+                field: "ownership",
+            }))
+        );
     }
 
     #[test]
