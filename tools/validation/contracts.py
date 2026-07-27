@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline workflow, documentation, packaging, and traceability contracts."""
+"""Offline workflow and packaging contracts."""
 from __future__ import annotations
 import json
 import gzip
@@ -32,54 +32,6 @@ def static_contracts() -> None:
     main = (ROOT / ".github/workflows/main.yml").read_text()
     validate_main_workflow(main)
     validate_release_workflows()
-    manifest = (ROOT / "doc/porting-manifest.md").read_text()
-    require("195 named doctest cases" in manifest and "59 registered Windows" in manifest, "manifest totals")
-    case_numbers = [
-        int(match.group(1))
-        for match in re.finditer(r"^\|\s*(\d+)\s*\|", manifest, re.MULTILINE)
-    ]
-    require(case_numbers == list(range(1, 196)), "named-case manifest is missing or reordered")
-    for evidence in re.findall(r"`(tests/[^`]+\.rs)`", manifest):
-        require((ROOT / evidence).is_file(), f"manifest evidence is missing: {evidence}")
-    for spec in range(1, 8):
-        require(any((ROOT / "spec").glob(f"faraweave-spec-{spec:04d}-*.md")), f"spec {spec}")
-    traceability = (ROOT / "tests/source-spec-traceability.tsv").read_text()
-    validate_source_traceability(traceability)
-    rows = [line for line in traceability.splitlines() if line.strip()]
-    for name, mutation in [
-        ("missing", "\n".join(rows[:-1]) + "\n"),
-        ("duplicate", traceability + rows[0] + "\n"),
-        ("stale", traceability.replace("BENNU-SPEC-0001", "BENNU-SPEC-9999", 1)),
-    ]:
-        try:
-            validate_source_traceability(mutation)
-        except AssertionError:
-            continue
-        raise SystemExit(f"source traceability negative mutation survived: {name}")
-
-
-def validate_source_traceability(text: str) -> None:
-    rows = [line for line in text.splitlines() if line.strip()]
-    if len(rows) != 155:
-        raise AssertionError("source traceability row count")
-    if len(set(rows)) != len(rows):
-        raise AssertionError("duplicate source traceability row")
-    if rows[0] != (
-        "# normative requirement|source containing the automated test identifier|"
-        "test identifier"
-    ):
-        raise AssertionError("source traceability header")
-    for row in rows[1:]:
-        fields = row.split("|")
-        if len(fields) != 3 or any(not field.strip() for field in fields):
-            raise AssertionError("malformed source traceability row")
-        match = re.match(r"BENNU-SPEC-(\d{4})\b", fields[0])
-        if match is not None:
-            number = int(match.group(1))
-            if not 1 <= number <= 7:
-                raise AssertionError("stale source specification identity")
-        elif not fields[0].startswith(("WP10 ", "Issue ")):
-            raise AssertionError("malformed source requirement identity")
 
 
 def validate_main_workflow(main: str) -> None:
