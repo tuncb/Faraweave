@@ -4,6 +4,7 @@
 mod c_emitter;
 mod error;
 mod evaluator;
+mod fwir_api;
 mod fwir_decoder;
 mod fwir_encoder;
 mod interpreter;
@@ -28,6 +29,11 @@ pub use evaluator::{
     evaluate_expression, evaluate_expression_with_configuration, evaluate_expression_with_observer,
     evaluate_runner_source, evaluate_source, evaluate_source_with_arguments,
     evaluate_source_with_arguments_and_observer, evaluate_source_with_configuration,
+};
+pub use fwir_api::{
+    CompileFwirError, FwirInspectError, build_native_from_verified_program, compile_source_to_fwir,
+    compile_source_to_fwir_with_name, compile_source_to_verified_program,
+    emit_c_from_verified_program, evaluate_verified_program_with_arguments, inspect_fwir,
 };
 pub use fwir_decoder::{
     FwirDecodeAllocationFailureInjection, FwirDecodeAllocationSite, FwirDecodeError,

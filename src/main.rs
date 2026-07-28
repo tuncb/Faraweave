@@ -1,7 +1,9 @@
 use faraweave::{
-    ArgumentErrorContext, Error, ErrorKind, NativeBuildRequest, VERSION, build_native,
-    emit_c_source, evaluate_expression, evaluate_runner_source, format_value,
-    publish_file_atomically,
+    ArgumentErrorContext, CompileFwirError, Error, ErrorKind, FwirDecodeLimits, FwirEncodeOptions,
+    NativeBuildRequest, VERSION, build_native, build_native_from_verified_program,
+    compile_source_to_fwir_with_name, decode_fwir, emit_c_from_verified_program, emit_c_source,
+    evaluate_expression, evaluate_runner_source, evaluate_verified_program_with_arguments,
+    format_value, inspect_fwir, publish_file_atomically,
 };
 use std::env;
 use std::ffi::OsString;
@@ -20,7 +22,17 @@ const HELP: &str = "Usage: faraweave <command> [arguments]\n\
                      \x20 run <source> [-- <arguments...>]\n\
                      \x20         Run a Faraweave source file\n\
                      \x20 emit-c  Emit C source for a Faraweave source file\n\
-                     \x20 build   Build a Faraweave source file\n";
+                     \x20 build   Build a Faraweave source file\n\
+                     \x20 compile-ir <source> -o <artifact.fwir>\n\
+                     \x20         Compile source to canonical FWIR v1\n\
+                     \x20 inspect-ir <artifact.fwir>\n\
+                     \x20         Inspect a verified FWIR artifact\n\
+                     \x20 run-ir <artifact.fwir> [-- <arguments...>]\n\
+                     \x20         Run a verified FWIR artifact\n\
+                     \x20 emit-c-ir <artifact.fwir> -o <output.c>\n\
+                     \x20         Emit C from a verified FWIR artifact\n\
+                     \x20 build-ir <artifact.fwir> -o <output> [--cc <compiler>]\n\
+                     \x20         Build a verified FWIR artifact\n";
 
 fn main() -> ExitCode {
     match run_cli(env::args_os().collect()) {
@@ -54,11 +66,200 @@ fn run_cli(arguments: Vec<OsString>) -> Result<(), ()> {
         "run" => run_command(&arguments),
         "emit-c" => emit_c_command(&arguments),
         "build" => build_command(&arguments),
+        "compile-ir" => compile_ir_command(&arguments),
+        "inspect-ir" => inspect_ir_command(&arguments),
+        "run-ir" => run_ir_command(&arguments),
+        "emit-c-ir" => emit_c_ir_command(&arguments),
+        "build-ir" => build_ir_command(&arguments),
         unknown => {
             eprintln!("error: unknown subcommand '{unknown}'");
             Err(())
         }
     }
+}
+
+fn compile_ir_command(arguments: &[OsString]) -> Result<(), ()> {
+    if arguments.len() != 5 || arguments.get(3).and_then(|value| value.to_str()) != Some("-o") {
+        eprintln!("error: expected 'compile-ir <source> -o <artifact.fwir>'");
+        return Err(());
+    }
+    let source_path = Path::new(&arguments[2]);
+    let output_path = Path::new(&arguments[4]);
+    reject_alias(source_path, output_path)?;
+    let source = read_source(source_path)?;
+    let logical_name = source_path.to_string_lossy();
+    let bytes =
+        compile_source_to_fwir_with_name(&source, &logical_name, &FwirEncodeOptions::default())
+            .map_err(|error| {
+                report_compile_fwir_error(&logical_name, &error);
+            })?;
+    write_atomically(output_path, &bytes).map_err(|message| {
+        eprintln!("{}:1:1: file error: {message}", output_path.display());
+    })
+}
+
+fn inspect_ir_command(arguments: &[OsString]) -> Result<(), ()> {
+    if arguments.len() != 3 {
+        eprintln!("error: expected 'inspect-ir <artifact.fwir>'");
+        return Err(());
+    }
+    let artifact_path = Path::new(&arguments[2]);
+    let program = read_verified_artifact(artifact_path)?;
+    let inspection = inspect_fwir(&program).map_err(|error| {
+        eprintln!("{}:1:1: inspection error: {error}", artifact_path.display());
+    })?;
+    publish_stdout(inspection.as_bytes())
+}
+
+fn run_ir_command(arguments: &[OsString]) -> Result<(), ()> {
+    if arguments.len() == 2 {
+        eprintln!("error: expected one artifact path after 'run-ir'");
+        return Err(());
+    }
+    if arguments.len() > 3 && arguments.get(3).and_then(|value| value.to_str()) != Some("--") {
+        eprintln!("error: expected 'run-ir <artifact.fwir> [-- <arguments...>]'");
+        return Err(());
+    }
+    let artifact_path = Path::new(&arguments[2]);
+    let program = read_verified_artifact(artifact_path)?;
+    let raw_arguments = arguments.get(4..).unwrap_or_default();
+    let argument_strings =
+        collect_command_line_arguments(raw_arguments, CommandLineArgumentFailureInjection::none())
+            .map_err(|failure| {
+                eprintln!("{}", failure.diagnostic());
+            })?;
+    match evaluate_verified_program_with_arguments(
+        &program,
+        &argument_strings,
+        faraweave::EvaluationConfiguration::default(),
+    ) {
+        Ok(result) => {
+            let mut output = String::new();
+            let output_length = result.formatted.iter().try_fold(0usize, |total, value| {
+                total.checked_add(value.len())?.checked_add(1)
+            });
+            output
+                .try_reserve_exact(output_length.ok_or_else(|| {
+                    eprintln!("error: unable to allocate formatted output");
+                })?)
+                .map_err(|_| {
+                    eprintln!("error: unable to allocate formatted output");
+                })?;
+            for formatted in result.formatted {
+                output.push_str(&formatted);
+                output.push('\n');
+            }
+            publish_runner_stdout(output.as_bytes())
+        }
+        Err(error) => {
+            report_error(logical_source_name(&program), &error);
+            Err(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandLineArgumentFailure {
+    AllocationUnavailable,
+    InvalidUnicode,
+}
+
+impl CommandLineArgumentFailure {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::AllocationUnavailable => "error: unable to allocate command-line arguments",
+            Self::InvalidUnicode => "error: unable to decode Unicode command line",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CommandLineArgumentFailureInjection {
+    refuse_reservation: bool,
+}
+
+impl CommandLineArgumentFailureInjection {
+    const fn none() -> Self {
+        Self {
+            refuse_reservation: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn refuse_reservation() -> Self {
+        Self {
+            refuse_reservation: true,
+        }
+    }
+}
+
+fn collect_command_line_arguments(
+    arguments: &[OsString],
+    injection: CommandLineArgumentFailureInjection,
+) -> Result<Vec<&str>, CommandLineArgumentFailure> {
+    let mut decoded = Vec::new();
+    if injection.refuse_reservation || decoded.try_reserve_exact(arguments.len()).is_err() {
+        return Err(CommandLineArgumentFailure::AllocationUnavailable);
+    }
+    for argument in arguments {
+        decoded.push(
+            argument
+                .to_str()
+                .ok_or(CommandLineArgumentFailure::InvalidUnicode)?,
+        );
+    }
+    Ok(decoded)
+}
+
+fn emit_c_ir_command(arguments: &[OsString]) -> Result<(), ()> {
+    if arguments.len() != 5 || arguments.get(3).and_then(|value| value.to_str()) != Some("-o") {
+        eprintln!("error: expected 'emit-c-ir <artifact.fwir> -o <output.c>'");
+        return Err(());
+    }
+    let artifact_path = Path::new(&arguments[2]);
+    let output_path = Path::new(&arguments[4]);
+    reject_alias(artifact_path, output_path)?;
+    let program = read_verified_artifact(artifact_path)?;
+    let emitted =
+        emit_c_from_verified_program(&program, faraweave::EvaluationConfiguration::default())
+            .map_err(|error| {
+                report_error(logical_source_name(&program), &error);
+            })?;
+    write_atomically(output_path, emitted.source.as_bytes()).map_err(|message| {
+        eprintln!("{}:1:1: file error: {message}", output_path.display());
+    })
+}
+
+fn build_ir_command(arguments: &[OsString]) -> Result<(), ()> {
+    if !matches!(arguments.len(), 5 | 7)
+        || arguments.get(3).and_then(|value| value.to_str()) != Some("-o")
+        || (arguments.len() == 7
+            && arguments.get(5).and_then(|value| value.to_str()) != Some("--cc"))
+    {
+        eprintln!("error: expected 'build-ir <artifact.fwir> -o <output> [--cc <compiler>]'");
+        return Err(());
+    }
+    let artifact_path = Path::new(&arguments[2]);
+    let output_path = Path::new(&arguments[4]);
+    reject_alias(artifact_path, output_path)?;
+    let program = read_verified_artifact(artifact_path)?;
+    let explicit = arguments.get(6).and_then(|value| value.to_str());
+    if arguments.len() == 7 && explicit.is_none_or(str::is_empty) {
+        eprintln!("error: --cc requires a nonempty compiler");
+        return Err(());
+    }
+    let environment = env::var("CC").ok();
+    build_native_from_verified_program(
+        &program,
+        output_path,
+        explicit,
+        environment.as_deref(),
+        faraweave::EvaluationConfiguration::default(),
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        report_error(logical_source_name(&program), &error);
+    })
 }
 
 fn run_command(arguments: &[OsString]) -> Result<(), ()> {
@@ -207,6 +408,74 @@ fn read_source(path: &Path) -> Result<String, ()> {
             path.display()
         );
     })
+}
+
+fn read_verified_artifact(path: &Path) -> Result<faraweave::VerifiedProgram, ()> {
+    let limits = FwirDecodeLimits::default();
+    let mut file = fs::File::open(path).map_err(|_| {
+        eprintln!(
+            "{}:1:1: file error: unable to read FWIR artifact",
+            path.display()
+        );
+    })?;
+    let mut bytes = Vec::new();
+    let initial = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or(0)
+        .min(limits.max_artifact_bytes.saturating_add(1));
+    bytes.try_reserve_exact(initial).map_err(|_| {
+        eprintln!(
+            "{}:1:1: artifact error: unable to allocate artifact input",
+            path.display()
+        );
+    })?;
+    let maximum_input = limits.max_artifact_bytes.saturating_add(1);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let remaining = maximum_input.saturating_sub(bytes.len());
+        if remaining == 0 {
+            break;
+        }
+        let read_count = remaining.min(buffer.len());
+        let count = file.read(&mut buffer[..read_count]).map_err(|_| {
+            eprintln!(
+                "{}:1:1: file error: unable to read FWIR artifact",
+                path.display()
+            );
+        })?;
+        if count == 0 {
+            break;
+        }
+        bytes.try_reserve_exact(count).map_err(|_| {
+            eprintln!(
+                "{}:1:1: artifact error: unable to allocate artifact input",
+                path.display()
+            );
+        })?;
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    decode_fwir(&bytes, &limits).map_err(|error| {
+        eprintln!("{}:1:1: artifact error: {error}", path.display());
+    })
+}
+
+fn logical_source_name(program: &faraweave::VerifiedProgram) -> &str {
+    program
+        .as_raw()
+        .source_units
+        .first()
+        .map_or("<artifact>", |source| source.diagnostic_name.as_str())
+}
+
+fn report_compile_fwir_error(source_name: &str, error: &CompileFwirError) {
+    match error {
+        CompileFwirError::Compile(error) => report_error(source_name, error),
+        CompileFwirError::Encode(error) => {
+            eprintln!("{source_name}:1:1: artifact error: {error}");
+        }
+    }
 }
 
 fn reject_alias(source: &Path, output: &Path) -> Result<(), ()> {
@@ -400,7 +669,11 @@ fn report_argument_error(argument: &ArgumentErrorContext) {
 
 #[cfg(test)]
 mod output_tests {
-    use super::{OutputFailureReason, OutputPublicationFailure, publish_to};
+    use super::{
+        CommandLineArgumentFailure, CommandLineArgumentFailureInjection, OutputFailureReason,
+        OutputPublicationFailure, collect_command_line_arguments, publish_to,
+    };
+    use std::ffi::OsString;
     use std::io::{self, Write};
 
     struct ShortWriter {
@@ -461,6 +734,47 @@ mod output_tests {
                 accepted_byte_count: 7,
                 output_position: 7,
             }
+        );
+    }
+
+    #[test]
+    fn command_line_argument_reservation_refusal_is_explicit_and_exact() {
+        let arguments = [OsString::from("3")];
+        let failure = collect_command_line_arguments(
+            &arguments,
+            CommandLineArgumentFailureInjection::refuse_reservation(),
+        )
+        .expect_err("injected reservation refusal");
+        assert_eq!(failure, CommandLineArgumentFailure::AllocationUnavailable);
+        assert_eq!(
+            failure.diagnostic(),
+            "error: unable to allocate command-line arguments"
+        );
+        assert_eq!(
+            collect_command_line_arguments(&arguments, CommandLineArgumentFailureInjection::none()),
+            Ok(vec!["3"])
+        );
+    }
+
+    #[test]
+    fn command_line_argument_unicode_failure_is_explicit_and_exact() {
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        let failure =
+            collect_command_line_arguments(&[invalid], CommandLineArgumentFailureInjection::none())
+                .expect_err("invalid Unicode");
+        assert_eq!(failure, CommandLineArgumentFailure::InvalidUnicode);
+        assert_eq!(
+            failure.diagnostic(),
+            "error: unable to decode Unicode command line"
         );
     }
 }
