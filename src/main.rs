@@ -123,18 +123,11 @@ fn run_ir_command(arguments: &[OsString]) -> Result<(), ()> {
     let artifact_path = Path::new(&arguments[2]);
     let program = read_verified_artifact(artifact_path)?;
     let raw_arguments = arguments.get(4..).unwrap_or_default();
-    let mut argument_strings = Vec::new();
-    argument_strings
-        .try_reserve_exact(raw_arguments.len())
-        .map_err(|_| {
-            eprintln!("error: unable to allocate command-line arguments");
-        })?;
-    for argument in raw_arguments {
-        let decoded = argument.to_str().ok_or_else(|| {
-            eprintln!("error: unable to decode Unicode command line");
-        })?;
-        argument_strings.push(decoded);
-    }
+    let argument_strings =
+        collect_command_line_arguments(raw_arguments, CommandLineArgumentFailureInjection::none())
+            .map_err(|failure| {
+                eprintln!("{}", failure.diagnostic());
+            })?;
     match evaluate_verified_program_with_arguments(
         &program,
         &argument_strings,
@@ -163,6 +156,59 @@ fn run_ir_command(arguments: &[OsString]) -> Result<(), ()> {
             Err(())
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandLineArgumentFailure {
+    AllocationUnavailable,
+    InvalidUnicode,
+}
+
+impl CommandLineArgumentFailure {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::AllocationUnavailable => "error: unable to allocate command-line arguments",
+            Self::InvalidUnicode => "error: unable to decode Unicode command line",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CommandLineArgumentFailureInjection {
+    refuse_reservation: bool,
+}
+
+impl CommandLineArgumentFailureInjection {
+    const fn none() -> Self {
+        Self {
+            refuse_reservation: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn refuse_reservation() -> Self {
+        Self {
+            refuse_reservation: true,
+        }
+    }
+}
+
+fn collect_command_line_arguments(
+    arguments: &[OsString],
+    injection: CommandLineArgumentFailureInjection,
+) -> Result<Vec<&str>, CommandLineArgumentFailure> {
+    let mut decoded = Vec::new();
+    if injection.refuse_reservation || decoded.try_reserve_exact(arguments.len()).is_err() {
+        return Err(CommandLineArgumentFailure::AllocationUnavailable);
+    }
+    for argument in arguments {
+        decoded.push(
+            argument
+                .to_str()
+                .ok_or(CommandLineArgumentFailure::InvalidUnicode)?,
+        );
+    }
+    Ok(decoded)
 }
 
 fn emit_c_ir_command(arguments: &[OsString]) -> Result<(), ()> {
@@ -623,7 +669,11 @@ fn report_argument_error(argument: &ArgumentErrorContext) {
 
 #[cfg(test)]
 mod output_tests {
-    use super::{OutputFailureReason, OutputPublicationFailure, publish_to};
+    use super::{
+        CommandLineArgumentFailure, CommandLineArgumentFailureInjection, OutputFailureReason,
+        OutputPublicationFailure, collect_command_line_arguments, publish_to,
+    };
+    use std::ffi::OsString;
     use std::io::{self, Write};
 
     struct ShortWriter {
@@ -684,6 +734,47 @@ mod output_tests {
                 accepted_byte_count: 7,
                 output_position: 7,
             }
+        );
+    }
+
+    #[test]
+    fn command_line_argument_reservation_refusal_is_explicit_and_exact() {
+        let arguments = [OsString::from("3")];
+        let failure = collect_command_line_arguments(
+            &arguments,
+            CommandLineArgumentFailureInjection::refuse_reservation(),
+        )
+        .expect_err("injected reservation refusal");
+        assert_eq!(failure, CommandLineArgumentFailure::AllocationUnavailable);
+        assert_eq!(
+            failure.diagnostic(),
+            "error: unable to allocate command-line arguments"
+        );
+        assert_eq!(
+            collect_command_line_arguments(&arguments, CommandLineArgumentFailureInjection::none()),
+            Ok(vec!["3"])
+        );
+    }
+
+    #[test]
+    fn command_line_argument_unicode_failure_is_explicit_and_exact() {
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        let failure =
+            collect_command_line_arguments(&[invalid], CommandLineArgumentFailureInjection::none())
+                .expect_err("invalid Unicode");
+        assert_eq!(failure, CommandLineArgumentFailure::InvalidUnicode);
+        assert_eq!(
+            failure.diagnostic(),
+            "error: unable to decode Unicode command line"
         );
     }
 }
