@@ -15,6 +15,87 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CORPUS: &str = include_str!("fixtures/fwir-v1-corpus.tsv");
 const TRACEABILITY: &str = include_str!("fixtures/fwir-v1-conformance.tsv");
 
+#[derive(Clone, Copy, Debug)]
+enum ExpectedDecodeError {
+    InvalidHeader(&'static str),
+    UnsupportedFormatVersion,
+    NonCanonicalDirectory(&'static str),
+    InvalidSectionLength,
+    InvalidUtf8,
+    NonCanonicalRecord(&'static str),
+    MalformedProgram,
+}
+
+#[derive(Debug)]
+struct MutationCase {
+    target_requirement: &'static str,
+    name: &'static str,
+    bytes: Vec<u8>,
+    expected: ExpectedDecodeError,
+    offset: u64,
+    section_id: Option<u16>,
+    record_index: Option<u32>,
+}
+
+fn mutation(
+    target_requirement: &'static str,
+    name: &'static str,
+    bytes: Vec<u8>,
+    expected: ExpectedDecodeError,
+    offset: usize,
+    section_id: Option<u16>,
+    record_index: Option<u32>,
+) -> MutationCase {
+    MutationCase {
+        target_requirement,
+        name,
+        bytes,
+        expected,
+        offset: offset as u64,
+        section_id,
+        record_index,
+    }
+}
+
+fn assert_expected_decode_error(case: &MutationCase, error: &faraweave::FwirDecodeError) {
+    assert_eq!(error.offset, case.offset, "{} offset", case.name);
+    assert_eq!(error.section_id, case.section_id, "{} section", case.name);
+    assert_eq!(
+        error.record_index, case.record_index,
+        "{} record",
+        case.name
+    );
+    let kind_matches = match (case.expected, &error.kind) {
+        (
+            ExpectedDecodeError::InvalidHeader(expected),
+            FwirDecodeErrorKind::InvalidHeader { field },
+        ) => expected == *field,
+        (
+            ExpectedDecodeError::UnsupportedFormatVersion,
+            FwirDecodeErrorKind::UnsupportedFormatVersion { .. },
+        ) => true,
+        (
+            ExpectedDecodeError::NonCanonicalDirectory(expected),
+            FwirDecodeErrorKind::NonCanonicalDirectory { field },
+        ) => expected == *field,
+        (ExpectedDecodeError::InvalidSectionLength, FwirDecodeErrorKind::InvalidSectionLength) => {
+            true
+        }
+        (ExpectedDecodeError::InvalidUtf8, FwirDecodeErrorKind::InvalidUtf8) => true,
+        (
+            ExpectedDecodeError::NonCanonicalRecord(expected),
+            FwirDecodeErrorKind::NonCanonicalRecord { field },
+        ) => expected == *field,
+        (ExpectedDecodeError::MalformedProgram, FwirDecodeErrorKind::MalformedProgram(_)) => true,
+        _ => false,
+    };
+    assert!(
+        kind_matches,
+        "{} category: expected {:?}, got {:?}",
+        case.name, case.expected, error.kind
+    );
+}
+
 fn example_bytes(name: &str) -> Vec<u8> {
     let text = match name {
         "empty" => include_str!("../spec/examples/fwir-v1-empty.hex"),
@@ -131,6 +212,60 @@ fn empty_with_feature(id: u16, class: u8) -> Vec<u8> {
     bytes
 }
 
+fn empty_with_duplicate_module_section() -> Vec<u8> {
+    let empty = example_bytes("empty");
+    let mut bytes = empty[..32].to_vec();
+    put_u32(&mut bytes, 20, 2);
+    let mut first = empty[32..56].to_vec();
+    put_u64(&mut first, 8, 80);
+    let mut second = first.clone();
+    put_u64(&mut second, 8, 88);
+    bytes.extend_from_slice(&first);
+    bytes.extend_from_slice(&second);
+    bytes.extend_from_slice(&empty[56..64]);
+    bytes.extend_from_slice(&empty[56..64]);
+    bytes
+}
+
+fn producer_artifact() -> Vec<u8> {
+    let empty = decode_fwir(&example_bytes("empty"), &FwirDecodeLimits::default())
+        .expect("canonical empty producer input");
+    encode_fwir(
+        &empty,
+        &FwirEncodeOptions {
+            producer_metadata: Some(FwirProducerMetadata::Sha256([0xa5; 32])),
+        },
+    )
+    .expect("canonical producer artifact")
+}
+
+fn producer_mutations() -> Vec<(&'static str, Vec<u8>)> {
+    let producer = producer_artifact();
+    let (entry, offset, length) = section(&producer, 32769);
+    let name_length = read_u32(&producer, offset) as usize;
+    let version_length_offset = offset + 4 + name_length;
+    let version_length = read_u32(&producer, version_length_offset) as usize;
+    let digest_header = version_length_offset + 4 + version_length;
+    let mutate_byte = |mutation_offset: usize, value: u8| {
+        let mut bytes = producer.clone();
+        bytes[mutation_offset] = value;
+        bytes
+    };
+    let mut truncated_digest = producer.clone();
+    put_u64(&mut truncated_digest, entry + 16, (length - 1) as u64);
+    truncated_digest.pop();
+    vec![
+        ("producer-name", mutate_byte(offset + 4, b'X')),
+        (
+            "producer-version",
+            mutate_byte(version_length_offset + 4, b'v'),
+        ),
+        ("producer-digest-algorithm", mutate_byte(digest_header, 2)),
+        ("producer-digest-length", mutate_byte(digest_header + 2, 31)),
+        ("producer-digest-truncated", truncated_digest),
+    ]
+}
+
 #[test]
 fn canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral() {
     let mut names = BTreeSet::new();
@@ -174,6 +309,7 @@ fn canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral() {
 fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
     let complete = example_bytes("complete");
     let empty = example_bytes("empty");
+    let (_, module, _) = section(&complete, 1);
     let (_, features, _) = section(&complete, 2);
     let (_, strings, _) = section(&complete, 3);
     let string_count = read_u32(&complete, strings) as usize;
@@ -206,6 +342,7 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
     let mut cases = vec![
         ("header-magic", mutate(&empty, 0, &[0])),
         ("format-major", mutate(&empty, 8, &2_u16.to_le_bytes())),
+        ("format-minor-current-extension", empty_with_extension(0, 0)),
         ("header-size", mutate(&empty, 12, &31_u32.to_le_bytes())),
         (
             "directory-entry-size",
@@ -231,6 +368,10 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
             mutate(&empty, 48, &7_u64.to_le_bytes()),
         ),
         (
+            "directory-known-section-duplicate",
+            empty_with_duplicate_module_section(),
+        ),
+        (
             "module-semantic-major",
             mutate(&complete, section(&complete, 1).1, &2_u16.to_le_bytes()),
         ),
@@ -241,6 +382,10 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
                 section(&complete, 1).1 + 2,
                 &u16::MAX.to_le_bytes(),
             ),
+        ),
+        (
+            "module-parameter-header-origin",
+            mutate(&complete, module + 4, &u32::MAX.to_le_bytes()),
         ),
         (
             "feature-zero",
@@ -265,6 +410,10 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
             mutate(&complete, sources, &u32::MAX.to_le_bytes()),
         ),
         (
+            "source-byte-length",
+            mutate(&complete, sources + 4, &u32::MAX.to_le_bytes()),
+        ),
+        (
             "parameter-slot",
             mutate(&complete, parameters, &u32::MAX.to_le_bytes()),
         ),
@@ -280,6 +429,14 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
             "parameter-reserved",
             mutate(&complete, parameters + 9, &[1]),
         ),
+        (
+            "parameter-declaration-origin",
+            mutate(&complete, parameters + 12, &u32::MAX.to_le_bytes()),
+        ),
+        (
+            "parameter-name-origin",
+            mutate(&complete, parameters + 16, &u32::MAX.to_le_bytes()),
+        ),
         ("type-kind", mutate(&complete, scalar_type, &[0])),
         ("type-scalar-type", mutate(&complete, scalar_type + 1, &[0])),
         (
@@ -287,7 +444,11 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
             mutate(&complete, scalar_type + 2, &1_u16.to_le_bytes()),
         ),
         (
-            "type-range",
+            "type-element-start",
+            mutate(&complete, scalar_type + 4, &1_u32.to_le_bytes()),
+        ),
+        (
+            "type-element-count",
             mutate(&complete, scalar_type + 8, &1_u32.to_le_bytes()),
         ),
         (
@@ -308,7 +469,11 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
             mutate(&complete, bool_constant + 12, &2_u64.to_le_bytes()),
         ),
         (
-            "constant-range",
+            "constant-element-start",
+            mutate(&complete, scalar_constant + 4, &1_u32.to_le_bytes()),
+        ),
+        (
+            "constant-element-count",
             mutate(&complete, scalar_constant + 8, &1_u32.to_le_bytes()),
         ),
         (
@@ -319,10 +484,11 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
             "constant-element-reserved",
             mutate(&complete, constant_elements + 1, &[1]),
         ),
-        (
-            "constant-element-payload",
-            mutate(&complete, constant_elements, &[0]),
-        ),
+        ("constant-element-payload", {
+            let mut bytes = mutate(&complete, constant_elements, &[1]);
+            put_u64(&mut bytes, constant_elements + 4, 2);
+            bytes
+        }),
         (
             "provenance-source",
             mutate(&complete, origins, &u32::MAX.to_le_bytes()),
@@ -330,6 +496,26 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
         (
             "provenance-origin",
             mutate(&complete, origins + 4, &u32::MAX.to_le_bytes()),
+        ),
+        (
+            "origin-begin-line",
+            mutate(&complete, origins + 8, &0_u32.to_le_bytes()),
+        ),
+        (
+            "origin-begin-column",
+            mutate(&complete, origins + 12, &0_u32.to_le_bytes()),
+        ),
+        (
+            "origin-end-offset",
+            mutate(&complete, origins + 16, &0_u32.to_le_bytes()),
+        ),
+        (
+            "origin-end-line",
+            mutate(&complete, origins + 20, &0_u32.to_le_bytes()),
+        ),
+        (
+            "origin-end-column",
+            mutate(&complete, origins + 24, &0_u32.to_le_bytes()),
         ),
         (
             "graph-edge-producer",
@@ -344,16 +530,32 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
         ("edge-conversion", mutate(&complete, edges + 10, &[0])),
         ("edge-ownership", mutate(&complete, edges + 11, &[0])),
         (
+            "edge-origin",
+            mutate(&complete, edges + 20, &u32::MAX.to_le_bytes()),
+        ),
+        (
             "shape-check-position",
             mutate(&complete, shape_checks, &u32::MAX.to_le_bytes()),
         ),
         (
-            "branch-range",
+            "branch-node-start",
             mutate(&complete, branches, &u32::MAX.to_le_bytes()),
+        ),
+        (
+            "branch-node-count",
+            mutate(&complete, branches + 4, &u32::MAX.to_le_bytes()),
         ),
         (
             "branch-root",
             mutate(&complete, branches + 8, &u32::MAX.to_le_bytes()),
+        ),
+        (
+            "branch-placeholder-origin",
+            mutate(&complete, branches + 12, &u32::MAX.to_le_bytes()),
+        ),
+        (
+            "branch-origin",
+            mutate(&complete, branches + 16, &u32::MAX.to_le_bytes()),
         ),
         ("node-kind", mutate(&complete, selected_apply, &[0])),
         (
@@ -374,8 +576,16 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
             mutate(&complete, selected_apply + 8, &1_u32.to_le_bytes()),
         ),
         (
-            "node-edge-range",
+            "node-edge-start",
             mutate(&complete, selected_apply + 12, &u32::MAX.to_le_bytes()),
+        ),
+        (
+            "node-edge-count",
+            mutate(&complete, selected_apply + 16, &u32::MAX.to_le_bytes()),
+        ),
+        (
+            "node-origin",
+            mutate(&complete, selected_apply + 20, &u32::MAX.to_le_bytes()),
         ),
         (
             "node-unused-variant",
@@ -410,6 +620,10 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
             "root-node",
             mutate(&complete, roots, &u32::MAX.to_le_bytes()),
         ),
+        (
+            "root-origin",
+            mutate(&complete, roots + 4, &u32::MAX.to_le_bytes()),
+        ),
     ];
 
     let mut combined = complete.clone();
@@ -442,27 +656,465 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
     cases
 }
 
+fn mutation_target(name: &str) -> &'static str {
+    match name {
+        "header-magic" => "header.magic",
+        "format-major" => "header.format_major",
+        "format-minor-current-extension" => "header.format_minor",
+        "header-size" => "header.header_size",
+        "directory-entry-size" => "header.directory_entry_size",
+        "header-reserved" => "header.reserved",
+        "directory-offset" => "header.directory_offset",
+        "directory-id" => "directory.section_id_order",
+        "directory-flags" => "directory.flags",
+        "directory-record-size" => "directory.record_size",
+        "directory-payload-offset" => "directory.payload_offset",
+        "directory-payload-length" => "directory.payload_length",
+        "directory-known-section-duplicate" => "directory.known_section_uniqueness",
+        "module-semantic-major" => "modl.semantic_major",
+        "module-semantic-minor" => "modl.semantic_minor",
+        "module-parameter-header-origin" => "modl.parameter_header_origin",
+        "feature-zero" => "feat.id",
+        "feature-reserved" => "feat.reserved",
+        "string-offset" => "strs.descriptor_offset",
+        "string-length" => "strs.descriptor_length",
+        "string-utf8" => "strs.utf8",
+        "string-order" => "strs.unique_ordered_used",
+        "source-name-index" => "srcu.diagnostic_name",
+        "source-byte-length" => "srcu.byte_length",
+        "parameter-slot" => "parm.slot",
+        "parameter-name-index" => "parm.name",
+        "parameter-scalar-type" => "parm.scalar_type",
+        "parameter-reserved" => "parm.reserved",
+        "parameter-declaration-origin" => "parm.declaration_origin",
+        "parameter-name-origin" => "parm.name_origin",
+        "type-kind" => "type.kind",
+        "type-scalar-type" => "type.scalar_type",
+        "type-reserved" => "type.reserved",
+        "type-element-start" => "type.element_start",
+        "type-element-count" => "type.element_count",
+        "type-element-index" => "tyel.type_index",
+        "constant-kind" => "cons.kind",
+        "constant-scalar-type" => "cons.scalar_type",
+        "constant-reserved" => "cons.reserved",
+        "constant-element-start" => "cons.element_start",
+        "constant-element-count" => "cons.element_count",
+        "constant-payload" => "cons.payload",
+        "constant-element-scalar-type" => "coel.scalar_type",
+        "constant-element-reserved" => "coel.reserved",
+        "constant-element-payload" => "coel.payload",
+        "provenance-source" => "orig.source_unit",
+        "provenance-origin" => "orig.begin_offset",
+        "origin-begin-line" => "orig.begin_line",
+        "origin-begin-column" => "orig.begin_column",
+        "origin-end-offset" => "orig.end_offset",
+        "origin-end-line" => "orig.end_line",
+        "origin-end-column" => "orig.end_column",
+        "graph-edge-producer" => "edge.producer",
+        "graph-edge-position" => "edge.argument_position",
+        "edge-access" => "edge.access",
+        "edge-cardinality" => "edge.cardinality_kind",
+        "edge-conversion" => "edge.conversion",
+        "edge-ownership" => "edge.ownership",
+        "graph-edge-access-index" => "edge.access_index",
+        "graph-edge-cardinality-length" => "edge.cardinality_length",
+        "edge-origin" => "edge.origin",
+        "shape-check-position" => "shck.argument_position",
+        "branch-node-start" => "bran.node_start",
+        "branch-node-count" => "bran.node_count",
+        "branch-root" => "bran.root",
+        "branch-placeholder-origin" => "bran.placeholder_origin",
+        "branch-origin" => "bran.origin",
+        "node-kind" => "node.kind",
+        "node-cardinality" => "node.cardinality_kind",
+        "node-lift" => "node.lift_mode",
+        "node-result-scalar" => "node.result_element_scalar_type",
+        "node-result-type" => "node.result_type",
+        "node-cardinality-length" => "node.cardinality_length",
+        "node-edge-start" => "node.edge_start",
+        "node-edge-count" => "node.edge_count",
+        "node-origin" => "node.origin",
+        "node-unused-variant" => "node.variant_words",
+        "primitive-id" => "node.primitive_id",
+        "signature-id" => "node.signature_id",
+        "implementation-id" => "node.implementation_id",
+        "ownership-owner" => "ownr.owner",
+        "ownership-release-kind" => "ownr.release_kind",
+        "ownership-reserved" => "ownr.reserved",
+        "ownership-release-index" => "ownr.release_index",
+        "root-node" => "root.node",
+        "root-origin" => "root.origin",
+        "trailing-byte" => "directory.contiguous_extents",
+        "combined-directory-record-error" => "decoder.deterministic_first_error",
+        "producer-name" => "prod.name",
+        "producer-version" => "prod.version",
+        "producer-digest-algorithm" => "prod.digest_algorithm",
+        "producer-digest-length" => "prod.digest_length",
+        "producer-digest-truncated" => "prod.digest",
+        _ => panic!("mutation {name} has no explicit target requirement"),
+    }
+}
+
+fn targeted_mutations() -> Vec<MutationCase> {
+    let complete = example_bytes("complete");
+    let (_, features, _) = section(&complete, 2);
+    let (_, strings, _) = section(&complete, 3);
+    let string_count = read_u32(&complete, strings) as usize;
+    let string_data = strings + 4 + string_count * 8;
+    let (_, sources, _) = section(&complete, 4);
+    let (_, parameters, _) = section(&complete, 5);
+    let scalar_type = record_with_tag(&complete, 6, 12, 1);
+    let scalar_constant = record_with_tag(&complete, 8, 20, 1);
+    let bool_constant = complete[section(&complete, 8).1..]
+        .chunks_exact(20)
+        .position(|record| record[0] == 1 && record[1] == 1)
+        .map(|index| section(&complete, 8).1 + index * 20)
+        .expect("scalar Bool constant");
+    let (_, constant_elements, _) = section(&complete, 9);
+    let (_, edges, edge_length) = section(&complete, 11);
+    let selected_apply = record_with_tag(&complete, 14, 56, 4);
+    let constant_node = record_with_tag(&complete, 14, 56, 1);
+    let (_, ownership, _) = section(&complete, 15);
+    let edge_records = &complete[edges..edges + edge_length];
+    let whole_edge = edge_records
+        .chunks_exact(24)
+        .position(|record| record[8] != 2)
+        .map(|index| edges + index * 24)
+        .expect("whole-value edge");
+    let non_static_vector_edge = edge_records
+        .chunks_exact(24)
+        .position(|record| record[9] != 2)
+        .map(|index| edges + index * 24)
+        .expect("non-static-vector edge");
+    let producer = producer_artifact();
+    let (_, producer_offset, _) = section(&producer, 32769);
+    let name_length = read_u32(&producer, producer_offset) as usize;
+    let version_length_offset = producer_offset + 4 + name_length;
+    let version_length = read_u32(&producer, version_length_offset) as usize;
+    let digest_header = version_length_offset + 4 + version_length;
+
+    let mut raw = named_mutations();
+    raw.extend(producer_mutations());
+    raw.into_iter()
+        .map(|(name, bytes)| {
+            let target = mutation_target(name);
+            let (expected, offset, section_id, record_index) = match name {
+                "header-magic" => (ExpectedDecodeError::InvalidHeader("magic"), 0, None, None),
+                "format-major" => (ExpectedDecodeError::UnsupportedFormatVersion, 8, None, None),
+                "format-minor-current-extension" => (
+                    ExpectedDecodeError::NonCanonicalDirectory("unknown_extension"),
+                    56,
+                    Some(100),
+                    Some(1),
+                ),
+                "header-size" => (
+                    ExpectedDecodeError::InvalidHeader("header_size"),
+                    12,
+                    None,
+                    None,
+                ),
+                "directory-entry-size" => (
+                    ExpectedDecodeError::InvalidHeader("directory_entry_size"),
+                    16,
+                    None,
+                    None,
+                ),
+                "header-reserved" => (
+                    ExpectedDecodeError::InvalidHeader("reserved"),
+                    18,
+                    None,
+                    None,
+                ),
+                "directory-offset" => (
+                    ExpectedDecodeError::InvalidHeader("directory_offset"),
+                    24,
+                    None,
+                    None,
+                ),
+                "directory-id" => (
+                    ExpectedDecodeError::NonCanonicalDirectory("order"),
+                    32,
+                    Some(0),
+                    Some(0),
+                ),
+                "directory-flags" | "combined-directory-record-error" => (
+                    ExpectedDecodeError::NonCanonicalDirectory("flags"),
+                    34,
+                    Some(1),
+                    Some(0),
+                ),
+                "directory-record-size" => (
+                    ExpectedDecodeError::NonCanonicalDirectory("record_size"),
+                    36,
+                    Some(1),
+                    Some(0),
+                ),
+                "directory-payload-offset" => (
+                    ExpectedDecodeError::NonCanonicalDirectory("contiguous_payload"),
+                    40,
+                    Some(1),
+                    Some(0),
+                ),
+                "directory-payload-length" => (
+                    ExpectedDecodeError::InvalidSectionLength,
+                    48,
+                    Some(1),
+                    Some(0),
+                ),
+                "directory-known-section-duplicate" => (
+                    ExpectedDecodeError::NonCanonicalDirectory("order"),
+                    56,
+                    Some(1),
+                    Some(1),
+                ),
+                "feature-zero" => (
+                    ExpectedDecodeError::NonCanonicalRecord("feature_order"),
+                    features,
+                    Some(2),
+                    Some(0),
+                ),
+                "feature-reserved" => (
+                    ExpectedDecodeError::NonCanonicalRecord("reserved"),
+                    features + 3,
+                    Some(2),
+                    Some(0),
+                ),
+                "string-offset" | "string-order" => (
+                    ExpectedDecodeError::NonCanonicalRecord("string_extent"),
+                    strings + 4,
+                    Some(3),
+                    Some(0),
+                ),
+                "string-length" => (
+                    ExpectedDecodeError::InvalidSectionLength,
+                    strings + 4,
+                    Some(3),
+                    Some(0),
+                ),
+                "string-utf8" => (
+                    ExpectedDecodeError::InvalidUtf8,
+                    string_data,
+                    Some(3),
+                    Some(0),
+                ),
+                "source-name-index" => (
+                    ExpectedDecodeError::NonCanonicalRecord("diagnostic_name"),
+                    sources,
+                    Some(4),
+                    Some(0),
+                ),
+                "parameter-name-index" => (
+                    ExpectedDecodeError::NonCanonicalRecord("name"),
+                    parameters + 4,
+                    Some(5),
+                    Some(0),
+                ),
+                "parameter-scalar-type" => (
+                    ExpectedDecodeError::NonCanonicalRecord("scalar_type"),
+                    parameters + 8,
+                    Some(5),
+                    Some(0),
+                ),
+                "parameter-reserved" => (
+                    ExpectedDecodeError::NonCanonicalRecord("reserved"),
+                    parameters + 9,
+                    Some(5),
+                    Some(0),
+                ),
+                "type-kind" => (
+                    ExpectedDecodeError::NonCanonicalRecord("kind"),
+                    scalar_type,
+                    Some(6),
+                    Some(((scalar_type - section(&complete, 6).1) / 12) as u32),
+                ),
+                "type-scalar-type" | "type-element-start" | "type-element-count" => (
+                    ExpectedDecodeError::NonCanonicalRecord("unused_type_range"),
+                    scalar_type + 1,
+                    Some(6),
+                    Some(((scalar_type - section(&complete, 6).1) / 12) as u32),
+                ),
+                "type-reserved" => (
+                    ExpectedDecodeError::NonCanonicalRecord("reserved"),
+                    scalar_type + 2,
+                    Some(6),
+                    Some(((scalar_type - section(&complete, 6).1) / 12) as u32),
+                ),
+                "constant-kind" => (
+                    ExpectedDecodeError::NonCanonicalRecord("kind"),
+                    scalar_constant,
+                    Some(8),
+                    Some(((scalar_constant - section(&complete, 8).1) / 20) as u32),
+                ),
+                "constant-scalar-type" | "constant-element-start" | "constant-element-count" => (
+                    ExpectedDecodeError::NonCanonicalRecord("scalar_payload"),
+                    scalar_constant + 1,
+                    Some(8),
+                    Some(((scalar_constant - section(&complete, 8).1) / 20) as u32),
+                ),
+                "constant-payload" => (
+                    ExpectedDecodeError::NonCanonicalRecord("scalar_payload"),
+                    bool_constant + 1,
+                    Some(8),
+                    Some(((bool_constant - section(&complete, 8).1) / 20) as u32),
+                ),
+                "constant-reserved" => (
+                    ExpectedDecodeError::NonCanonicalRecord("reserved"),
+                    scalar_constant + 2,
+                    Some(8),
+                    Some(((scalar_constant - section(&complete, 8).1) / 20) as u32),
+                ),
+                "constant-element-scalar-type" => (
+                    ExpectedDecodeError::NonCanonicalRecord("scalar_payload"),
+                    constant_elements,
+                    Some(9),
+                    Some(0),
+                ),
+                "constant-element-payload" => (
+                    ExpectedDecodeError::NonCanonicalRecord("scalar_payload"),
+                    constant_elements,
+                    Some(9),
+                    Some(0),
+                ),
+                "constant-element-reserved" => (
+                    ExpectedDecodeError::NonCanonicalRecord("reserved"),
+                    constant_elements + 1,
+                    Some(9),
+                    Some(0),
+                ),
+                "edge-access" => (
+                    ExpectedDecodeError::NonCanonicalRecord("access"),
+                    edges + 8,
+                    Some(11),
+                    Some(0),
+                ),
+                "edge-cardinality" => (
+                    ExpectedDecodeError::NonCanonicalRecord("cardinality"),
+                    edges + 9,
+                    Some(11),
+                    Some(0),
+                ),
+                "edge-conversion" => (
+                    ExpectedDecodeError::NonCanonicalRecord("conversion"),
+                    edges + 10,
+                    Some(11),
+                    Some(0),
+                ),
+                "edge-ownership" => (
+                    ExpectedDecodeError::NonCanonicalRecord("ownership"),
+                    edges + 11,
+                    Some(11),
+                    Some(0),
+                ),
+                "graph-edge-access-index" => (
+                    ExpectedDecodeError::NonCanonicalRecord("access"),
+                    whole_edge + 8,
+                    Some(11),
+                    Some(((whole_edge - edges) / 24) as u32),
+                ),
+                "graph-edge-cardinality-length" => (
+                    ExpectedDecodeError::NonCanonicalRecord("cardinality"),
+                    non_static_vector_edge + 9,
+                    Some(11),
+                    Some(((non_static_vector_edge - edges) / 24) as u32),
+                ),
+                "node-kind" => (
+                    ExpectedDecodeError::NonCanonicalRecord("kind"),
+                    selected_apply,
+                    Some(14),
+                    Some(((selected_apply - section(&complete, 14).1) / 56) as u32),
+                ),
+                "node-cardinality" => (
+                    ExpectedDecodeError::NonCanonicalRecord("cardinality"),
+                    selected_apply + 1,
+                    Some(14),
+                    Some(((selected_apply - section(&complete, 14).1) / 56) as u32),
+                ),
+                "node-lift" | "node-result-scalar" => (
+                    ExpectedDecodeError::NonCanonicalRecord("selected_apply"),
+                    selected_apply + 2,
+                    Some(14),
+                    Some(((selected_apply - section(&complete, 14).1) / 56) as u32),
+                ),
+                "node-unused-variant" => (
+                    ExpectedDecodeError::NonCanonicalRecord("unused_variant"),
+                    constant_node + 2,
+                    Some(14),
+                    Some(((constant_node - section(&complete, 14).1) / 56) as u32),
+                ),
+                "primitive-id" | "signature-id" | "implementation-id" => (
+                    ExpectedDecodeError::NonCanonicalRecord("semantic_id"),
+                    selected_apply + 24,
+                    Some(14),
+                    Some(((selected_apply - section(&complete, 14).1) / 56) as u32),
+                ),
+                "ownership-release-kind" => (
+                    ExpectedDecodeError::NonCanonicalRecord("release_kind"),
+                    ownership + 4,
+                    Some(15),
+                    Some(0),
+                ),
+                "ownership-reserved" => (
+                    ExpectedDecodeError::NonCanonicalRecord("reserved"),
+                    ownership + 5,
+                    Some(15),
+                    Some(0),
+                ),
+                "trailing-byte" => (
+                    ExpectedDecodeError::NonCanonicalDirectory("trailing_bytes"),
+                    64,
+                    None,
+                    None,
+                ),
+                "producer-name" => (
+                    ExpectedDecodeError::NonCanonicalRecord("producer_name"),
+                    producer_offset + 4,
+                    Some(32769),
+                    None,
+                ),
+                "producer-version" => (
+                    ExpectedDecodeError::NonCanonicalRecord("producer_version"),
+                    version_length_offset + 4,
+                    Some(32769),
+                    None,
+                ),
+                "producer-digest-algorithm" => (
+                    ExpectedDecodeError::NonCanonicalRecord("digest_algorithm"),
+                    digest_header,
+                    Some(32769),
+                    None,
+                ),
+                "producer-digest-length" | "producer-digest-truncated" => (
+                    ExpectedDecodeError::NonCanonicalRecord("digest_length"),
+                    digest_header + 2,
+                    Some(32769),
+                    None,
+                ),
+                _ => (ExpectedDecodeError::MalformedProgram, 0, None, None),
+            };
+            mutation(
+                target,
+                name,
+                bytes,
+                expected,
+                offset,
+                section_id,
+                record_index,
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn deterministic_mutation_corpus_is_rejected_without_panic_or_partial_program() {
-    let cases = named_mutations();
+    let cases = targeted_mutations();
     let mut names = BTreeSet::new();
-    for (name, bytes) in cases {
-        assert!(names.insert(name), "duplicate mutation {name}");
-        let first = decode_fwir(&bytes, &FwirDecodeLimits::default());
-        let second = decode_fwir(&bytes, &FwirDecodeLimits::default());
-        assert!(first.is_err(), "mutation {name} was accepted");
-        assert_eq!(first, second, "mutation {name} was nondeterministic");
-        if name == "combined-directory-record-error" {
-            assert!(matches!(
-                first,
-                Err(error)
-                    if error.offset == 34
-                        && matches!(
-                            error.kind,
-                            FwirDecodeErrorKind::NonCanonicalDirectory { field: "flags" }
-                        )
-            ));
-        }
+    for case in cases {
+        assert!(names.insert(case.name), "duplicate mutation {}", case.name);
+        let first = decode_fwir(&case.bytes, &FwirDecodeLimits::default());
+        let second = decode_fwir(&case.bytes, &FwirDecodeLimits::default());
+        assert!(first.is_err(), "mutation {} was accepted", case.name);
+        assert_eq!(first, second, "mutation {} was nondeterministic", case.name);
+        assert_expected_decode_error(&case, &first.expect_err("checked error"));
     }
 }
 
@@ -548,33 +1200,31 @@ fn same_major_optional_compatibility_and_mandatory_rejection_are_exact() {
 
 #[test]
 fn producer_metadata_corruption_is_rejected_and_identity_stays_host_neutral() {
-    let empty = decode_fwir(&example_bytes("empty"), &FwirDecodeLimits::default()).expect("empty");
-    let producer = encode_fwir(
-        &empty,
-        &FwirEncodeOptions {
-            producer_metadata: Some(FwirProducerMetadata::Sha256([0xa5; 32])),
-        },
-    )
-    .expect("producer");
-    let (_, offset, _) = section(&producer, 32769);
-    let name_length = read_u32(&producer, offset) as usize;
-    let version_length_offset = offset + 4 + name_length;
-    let version_length = read_u32(&producer, version_length_offset) as usize;
-    let digest_header = version_length_offset + 4 + version_length;
-    let cases = [
-        ("producer-name", offset + 4, b'X'),
-        ("producer-version", version_length_offset + 4, b'v'),
-        ("producer-digest-algorithm", digest_header, 2),
-        ("producer-digest-length", digest_header + 2, 31),
-    ];
-    for (name, mutation_offset, value) in cases {
-        let mut bytes = producer.clone();
-        bytes[mutation_offset] = value;
-        assert!(
-            decode_fwir(&bytes, &FwirDecodeLimits::default()).is_err(),
-            "{name}"
-        );
-    }
+    let canonical = example_bytes("empty");
+    let producer = producer_artifact();
+    let decoded =
+        decode_fwir(&producer, &FwirDecodeLimits::default()).expect("canonical producer decode");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default())
+            .expect("producer-free identity projection"),
+        canonical
+    );
+    assert_eq!(
+        encode_fwir(
+            &decoded,
+            &FwirEncodeOptions {
+                producer_metadata: Some(FwirProducerMetadata::Sha256([0xa5; 32])),
+            },
+        )
+        .expect("canonical producer reencode"),
+        producer
+    );
+    let inspection = inspect_fwir(&decoded).expect("producer inspection");
+    let canonical_hex = canonical
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert!(inspection.ends_with(&format!("canonical-hex {canonical_hex}\n")));
 }
 
 fn unique_directory(name: &str) -> PathBuf {
@@ -799,15 +1449,9 @@ fn source_memory_decoded_interpreter_c_resources_faults_and_cleanup_are_identica
 
 #[test]
 fn traceability_references_complete_executable_evidence_sets() {
-    let mutation_cases: BTreeSet<_> = named_mutations()
+    let mutation_cases: BTreeSet<_> = targeted_mutations()
         .into_iter()
-        .map(|(name, _)| name)
-        .chain([
-            "producer-name",
-            "producer-version",
-            "producer-digest-algorithm",
-            "producer-digest-length",
-        ])
+        .map(|case| (case.target_requirement, case.name))
         .collect();
     let positive_cases = BTreeSet::from([
         "canonical-empty",
@@ -818,23 +1462,39 @@ fn traceability_references_complete_executable_evidence_sets() {
         "compat-advisory-feature",
     ]);
     let behavioral_evidence = BTreeSet::from([
-        "all-truncations",
-        "artifact-byte-limit",
-        "corpus-hash",
-        "corpus-host-neutral",
-        "differential-resource-faults",
-        "differential-runtime",
-        "known-advisory-feature",
-        "public-backend-gate",
-        "record-count-limit",
-        "section-count-limit",
-        "strict-native-journey",
-        "string-byte-limit",
-        "string-count-limit",
-        "total-record-limit",
-        "unknown-mandatory",
-        "unknown-mandatory-feature",
-        "unknown-optional-current-minor",
+        ("header.section_count", "section-count-limit"),
+        ("compat.format_major", "format-major"),
+        (
+            "directory.unknown_optional",
+            "unknown-optional-current-minor",
+        ),
+        ("directory.unknown_mandatory", "unknown-mandatory"),
+        ("feat.class", "known-advisory-feature"),
+        ("strs.count", "string-count-limit"),
+        (
+            "compat.forward_minor_optional_section",
+            "unknown-optional-current-minor",
+        ),
+        (
+            "compat.forward_minor_mandatory_section",
+            "unknown-mandatory",
+        ),
+        ("compat.optional_feature", "unknown-mandatory-feature"),
+        ("limits.artifact_bytes", "artifact-byte-limit"),
+        ("limits.sections", "section-count-limit"),
+        ("limits.records_per_section", "record-count-limit"),
+        ("limits.total_records", "total-record-limit"),
+        ("limits.string_bytes", "string-byte-limit"),
+        ("decoder.truncation", "all-truncations"),
+        ("decoder.no_backend_before_verify", "public-backend-gate"),
+        ("canonical.byte_identity", "corpus-hash"),
+        ("canonical.host_neutral", "corpus-host-neutral"),
+        ("surfaces.source_memory_decoded", "differential-runtime"),
+        ("surfaces.c_native", "strict-native-journey"),
+        (
+            "surfaces.resources_faults_cleanup",
+            "differential-resource-faults",
+        ),
     ]);
     let mut requirements = BTreeSet::new();
     for (line_index, line) in TRACEABILITY.lines().enumerate().skip(1) {
@@ -851,9 +1511,11 @@ fn traceability_references_complete_executable_evidence_sets() {
             columns[1]
         );
         assert!(
-            mutation_cases.contains(columns[2]) || behavioral_evidence.contains(columns[2]),
-            "unknown negative evidence {}",
-            columns[2]
+            mutation_cases.contains(&(columns[0], columns[2]))
+                || behavioral_evidence.contains(&(columns[0], columns[2])),
+            "negative evidence {} does not target requirement {}",
+            columns[2],
+            columns[0]
         );
     }
     assert!(requirements.len() >= 100, "traceability is incomplete");
