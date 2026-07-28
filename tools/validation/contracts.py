@@ -33,6 +33,7 @@ def static_contracts() -> None:
     validate_main_workflow(main)
     validate_release_workflows()
     validate_fwir_conformance()
+    validate_product_cutover()
 
 
 def validate_main_workflow(main: str) -> None:
@@ -223,6 +224,109 @@ def validate_fwir_conformance() -> None:
         require(
             any(requirement.startswith(prefix) for requirement in requirements),
             f"FWIR conformance traceability family: {prefix}",
+        )
+
+
+def production_source(relative: str) -> str:
+    return (ROOT / relative).read_text(encoding="utf-8").split("#[cfg(test)]", 1)[0]
+
+
+def validate_product_cutover() -> None:
+    lowering = production_source("src/lowering.rs")
+    evaluator = production_source("src/evaluator.rs")
+    interpreter = production_source("src/interpreter.rs")
+    emitter = production_source("src/c_emitter.rs")
+    api = production_source("src/fwir_api.rs")
+    cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+
+    require("fn compile_source(" not in lowering, "temporary compile_source seam")
+    require(
+        "compile_source_with_name(" in lowering
+        and "compile_parsed_source_with_name(" in lowering
+        and "analyze_for_lowering(program)?" in lowering
+        and "lower_program(" in lowering,
+        "single source-to-verified-program lowerer",
+    )
+    require("[features]" not in cargo, "migration feature flags remain")
+
+    require(
+        "compile_parsed_source(" in evaluator
+        and "evaluate_verified_program(" in evaluator,
+        "source evaluation does not route through verified IR",
+    )
+    require(
+        "program: &VerifiedProgram" in interpreter,
+        "interpreter does not require VerifiedProgram",
+    )
+    require(
+        "emit_verified_c_program(" in emitter
+        and "program: &VerifiedProgram" in emitter
+        and "emit_c_from_verified_program(" in api,
+        "C/native generation does not route through verified IR",
+    )
+    for relative, source, forbidden in (
+        (
+            "src/evaluator.rs",
+            evaluator,
+            ("evaluate_expr(", "select_call(", "ApplicationArgument", "TypeInfo"),
+        ),
+        (
+            "src/interpreter.rs",
+            interpreter,
+            ("evaluate_expr(", "select_call(", "primitive_from_name(", "ExprKind"),
+        ),
+        (
+            "src/c_emitter.rs",
+            emitter,
+            (
+                "struct CGenerator",
+                "emit_parameterized_program(",
+                "emit_constant_program(",
+                "runtime_failure_program(",
+                "static_expression_type(",
+                "known_vector_length(",
+                "primitive_tag(",
+                "evaluate_source_with_configuration(",
+                "static int fw_apply(",
+                "fw_apply_scalar",
+                "FW_INC",
+            ),
+        ),
+    ):
+        for token in forbidden:
+            require(token not in source, f"legacy backend token {token} in {relative}")
+
+    semantic = (ROOT / "spec/typed-fwir-semantic-contract.md").read_text(
+        encoding="utf-8"
+    )
+    for number in range(1, 21):
+        key = f"FWIR-SEM-{number:03}"
+        require(
+            f"| `{key}` |" in semantic,
+            f"missing semantic traceability row {key}",
+        )
+    require(
+        "tests/fixtures/fwir-v1-conformance.tsv" in semantic,
+        "physical traceability is not linked from semantic traceability",
+    )
+
+    encoding = (ROOT / "spec/fwir-v1-encoding.md").read_text(encoding="utf-8")
+    for policy in (
+        "Accepted product, producer, and security policy",
+        "Faraweave is the authoritative v1 producer",
+        "FWIR is not confidential or encrypted",
+        "input-safety boundary, not a sandbox",
+    ):
+        require(policy in encoding, f"FWIR v1 policy missing {policy}")
+    examples = (ROOT / "spec/examples/README.md").read_text(encoding="utf-8")
+    for name in ("empty", "scalar-true", "complete"):
+        require(f"fwir-v1-{name}.hex" in examples, f"FWIR example inventory: {name}")
+    architecture = (ROOT / "doc/architecture.md").read_text(encoding="utf-8")
+    for number in range(1, 9):
+        key = f"FWIR-CUTOVER-{number:03}"
+        require(
+            f"| `{key}`" in architecture,
+            f"missing product-acceptance traceability row {key}",
         )
 
 def package(target: str) -> None:

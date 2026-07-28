@@ -40,9 +40,11 @@ partial result on overflow. Double results canonicalize NaNs; signed zero,
 infinities, gradual underflow, and IEEE unordered comparisons are preserved.
 Canonical output includes visible `.0` for integral Doubles.
 
-The accepted [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md)
-defines the normative verified boundary that the interpreter and generated-C
-backend will share. Its physical encoding is intentionally deferred.
+The accepted [architecture](doc/architecture.md) and
+[typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md) define
+one verified boundary shared by the interpreter and generated-C/native
+backends. [FWIR v1](spec/fwir-v1-encoding.md) is the stable canonical artifact
+format for that boundary.
 
 ## Build and use
 
@@ -83,6 +85,22 @@ bounded `decode_fwir`, `inspect_fwir`,
 and `build_native_from_verified_program`. Named compilation retains a logical
 source name inside the artifact so later execution diagnostics do not depend
 on the artifact's filesystem path.
+
+FWIR v1 commits to physical format 1.0, semantic contract 1.0, `.fwir`, and
+the documented API and CLI spellings. Same-major forward-minor artifacts are
+accepted only when every addition is explicitly optional and advisory;
+unknown mandatory semantics and unsupported current-minor extensions are
+rejected before a backend runs. Faraweave is the authoritative producer;
+accepted canonical bytes do not become trusted because of `PROD` metadata,
+and third-party producer support is not promised.
+
+Artifacts are deterministic but not confidential: they can expose diagnostic
+source names, literal values, graph structure, provenance spans, and producer
+metadata. Decoding is bounded, checked, and fully verified, but it is not a
+sandbox; apply limits to untrusted bytes, do not put secrets in artifacts, and
+run generated C or native executables only under an appropriate trust policy.
+The complete compatibility, unsupported-feature, security, and identity rules
+are normative in the [FWIR v1 specification](spec/fwir-v1-encoding.md).
 
 The parser is extension-agnostic. New examples use `.faraweave`; retained
 `.bennu` fixtures prove arbitrary extensions continue to work.
@@ -146,6 +164,10 @@ The supported release targets are Ubuntu 24.04 x64, Windows 2022 x64, and
 macOS 15 arm64. Only `faraweave build` needs an external C11 compiler. The
 complete focused/review/full/strict/sanitize/QA ladder and host-specific
 adaptations are documented in [doc/validation-ladder.md](doc/validation-ladder.md).
+
+Canonical example artifacts are inventoried in
+[spec/examples](spec/examples/README.md); their exact byte identities and
+executable evidence are checked by the conformance suite.
 
 ## Packaging and release verification
 

@@ -39,7 +39,11 @@ impl std::fmt::Display for FwirInspectError {
 
 impl std::error::Error for FwirInspectError {}
 
-/// Compiles source into a verified program with a retained logical source name.
+/// Compiles source through the sole typed lowerer into a verified program.
+///
+/// `diagnostic_name` is retained as provenance and must be nonempty. No
+/// backend receives a partial program when parsing, analysis, building, or
+/// verification fails.
 pub fn compile_source_to_verified_program(
     source: &str,
     diagnostic_name: &str,
@@ -55,7 +59,10 @@ pub fn compile_source_to_verified_program(
         .map_err(crate::lowering::CompileError::into_evaluation_error)
 }
 
-/// Compiles source and returns canonical FWIR v1 bytes.
+/// Compiles source and returns canonical FWIR v1.0 bytes.
+///
+/// The default logical source name is `<source>`; use
+/// [`compile_source_to_fwir_with_name`] when diagnostics need a stable name.
 pub fn compile_source_to_fwir(
     source: &str,
     options: &FwirEncodeOptions,
@@ -64,6 +71,9 @@ pub fn compile_source_to_fwir(
 }
 
 /// Compiles source while retaining a caller-selected logical diagnostic name.
+///
+/// The name and provenance positions participate in canonical program
+/// identity and can be visible to artifact recipients.
 pub fn compile_source_to_fwir_with_name(
     source: &str,
     diagnostic_name: &str,
@@ -75,6 +85,9 @@ pub fn compile_source_to_fwir_with_name(
 }
 
 /// Decodes textual arguments only after accepting an already verified program.
+///
+/// Argument count and complete argument decoding precede execution. Programs
+/// obtained from bytes must first come from [`crate::decode_fwir`].
 pub fn evaluate_verified_program_with_arguments(
     program: &VerifiedProgram,
     arguments: &[&str],
@@ -102,6 +115,9 @@ pub fn evaluate_verified_program_with_arguments(
 }
 
 /// Emits deterministic strict C11 from a verified program.
+///
+/// Selected implementations, conversions, lifting, shapes, ownership, and
+/// diagnostics come only from the verified records.
 pub fn emit_c_from_verified_program(
     program: &VerifiedProgram,
     configuration: EvaluationConfiguration,
@@ -110,6 +126,9 @@ pub fn emit_c_from_verified_program(
 }
 
 /// Emits C and builds a native executable from the same verified program.
+///
+/// The selected compiler is an external trusted process and the resulting
+/// executable is not a sandboxed form of FWIR.
 pub fn build_native_from_verified_program(
     program: &VerifiedProgram,
     output_path: &Path,
@@ -126,7 +145,10 @@ pub fn build_native_from_verified_program(
     })
 }
 
-/// Produces deterministic, non-executable text and retains exact canonical bits.
+/// Produces deterministic, non-executable text and exact canonical bits.
+///
+/// Inspection can reveal all artifact content and is not a confidentiality
+/// boundary.
 pub fn inspect_fwir(program: &VerifiedProgram) -> Result<String, FwirInspectError> {
     let canonical =
         encode_fwir(program, &FwirEncodeOptions::default()).map_err(FwirInspectError::Encode)?;

@@ -109,11 +109,6 @@ struct TupleElement {
     origin: OriginIndex,
 }
 
-#[cfg(test)]
-pub(crate) fn compile_source(source: &str) -> Result<VerifiedProgram, CompileError> {
-    compile_source_with_name(source, "<source>")
-}
-
 pub(crate) fn compile_source_with_name(
     source: &str,
     diagnostic_name: &str,
@@ -1349,14 +1344,14 @@ mod tests {
     }
 
     fn must_compile(source: &str) -> VerifiedProgram {
-        match compile_source(source) {
+        match compile_source_with_name(source, "<source>") {
             Ok(program) => program,
             Err(error) => panic!("compile failed: {error:?}"),
         }
     }
 
     fn must_source_error(source: &str) -> Error {
-        match compile_source(source) {
+        match compile_source_with_name(source, "<source>") {
             Err(CompileError::Source(error)) => error,
             Ok(_) => panic!("source unexpectedly compiled"),
             Err(error) => panic!("expected source diagnostic, got {error:?}"),

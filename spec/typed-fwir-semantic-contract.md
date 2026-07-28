@@ -633,42 +633,40 @@ before execution. Additive advisory metadata may be ignored only when declared
 non-semantic. A consumer must not guess an unknown operation from its source
 name or reinterpret unknown fields as defaults.
 
-The canonical encoding issue owns magic bytes, version field widths, integer
-widths, endianness, ordering, duplicate-field rules, checksums, and unknown
-field handling. Third-party FWIR production is not promised by this contract;
-the initial authoritative producer is Faraweave, while other systems may
-validate, inspect, translate, or execute a conforming artifact after the public
-format is accepted.
+The accepted [FWIR v1 encoding](fwir-v1-encoding.md) owns magic bytes, version
+field widths, integer widths, endianness, ordering, duplicate-field rules, and
+unknown-field handling. Faraweave is the authoritative producer; producer
+metadata is untrusted, and third-party production support is not promised.
 
 ## 19. Requirement-to-evidence map (`FWIR-SEM-019`)
 
-The identifiers below are the traceability keys for this contract. Existing
-tests establish the source behavior that FWIR must preserve; later IR issues
-must use the same keys in model, lowering, verifier, interpreter, C, encoding,
-and hostile-input evidence.
+The identifiers below are the traceability keys for this contract. Each maps
+to executable final-product evidence; the physical-format table separately
+maps every wire field and invariant in
+`tests/fixtures/fwir-v1-conformance.tsv`.
 
-| Requirement | Current evidence | Required IR evidence owner |
-| --- | --- | --- |
-| `FWIR-SEM-001` | `tests/parity_contracts.rs`, `tools/validation/c11_journey.py` cross-surface parity | #6 through #9 backend cutovers |
-| `FWIR-SEM-002` | `src/parser.rs`, `src/error.rs`, `src/resources.rs`, `src/value.rs` record audit | #4 model/verifier |
-| `FWIR-SEM-003` | `typed_public_api_parameter_contract`; `parameter_header_reason_and_span_contract_is_structured`; `cli_parameters_and_diagnostics_contract` | #5 lowering, #6 interpreter |
-| `FWIR-SEM-004` | `s16_empty_singleton_promotion_and_shape_contracts`; `deep_structural_values_and_types_format_and_drop_iteratively` | #4 model, #5 lowering |
-| `FWIR-SEM-005` | `canonical_binary64_format_boundaries`; `typed_api_rejects_noncanonical_nan_without_normalizing_it`; `v1_tuple_refusal_precedes_type_and_runtime_work`; `resource_observer_reports_commit_refusal_and_cleanup_order` | #4 verifier, #5 lowering |
-| `FWIR-SEM-006` | `parses_literals_calls_tuples_parameters_and_fanout`; `deep_unary_programs_use_iterative_parse_analysis_and_evaluation` | #4 node/edge verifier |
-| `FWIR-SEM-007` | `s16_complete_elementwise_matrix`; `generated_runtime_embeds_profile_and_typed_primitive_selection` | #3 identities, #5 lowering |
-| `FWIR-SEM-008` | `s16_empty_singleton_promotion_and_shape_contracts`; `checked_arithmetic_has_no_partial_result`; `vector_tuple_and_work_limits_cover_zero_exact_and_one_past`; authored golden corpus IDs `S16-16`, `S16-17`, `S16-19`, `S16-22` | #5 lowering, #6 interpreter |
-| `FWIR-SEM-009` | `tup_structural_format_spread_and_direct_preservation`; `lifting_and_tuples_are_canonical` | #5 lowering, #6/#8 backends |
-| `FWIR-SEM-010` | `tuple_allocation_ordinals_exclude_empty_tables_and_cleanup_failures`; `live_limit_observes_children_before_outer_tuple_admission`; deep tuple journeys | #6/#8 resource traces |
-| `FWIR-SEM-011` | `fan_stable_id_matrix`; fan-out fixtures; generated C fan-out path inspection | #5 lowering, #6/#8 differential fan-out traces |
-| `FWIR-SEM-012` | `parameter_header_reason_and_span_contract_is_structured`; golden corpus structured errors; CLI diagnostic contracts | #4 origins, #5 lowering, #6/#8 diagnostics |
-| `FWIR-SEM-013` | `profile_configuration_precedes_source_and_backend_analysis`; authored golden corpus `S16-16`; parameter and fan-out parser tests | #5 cross-root lowering goldens |
-| `FWIR-SEM-014` | `refusal_precedence_is_vector_then_live_then_work_then_allocation`; `failure_usage_is_post_cleanup_and_work_remains_monotonic`; `resource_observer_reports_commit_refusal_and_cleanup_order` | #6/#8 exact event differential |
-| `FWIR-SEM-015` | `resource_profiles_limits_and_ordinals`; `generated_runtime_embeds_profile_and_typed_primitive_selection` | #6 through #9 policy separation |
-| `FWIR-SEM-016` | Current typed public API rejects invalid caller values; no raw IR surface exists yet | #4 exhaustive malformed-program verifier |
-| `FWIR-SEM-017` | `evaluates_complete_primitive_surface`; parser expression audit; parity and resource suites | #5 exact source-to-IR goldens |
-| `FWIR-SEM-018` | No public FWIR encoding exists by design | #10 encoding decision, #12 decoder |
-| `FWIR-SEM-019` | Manual link/identifier audit and `git diff --check` | Every dependent issue |
-| `FWIR-SEM-020` | Scope comparison against issue #2 and the accepted implementation plan | Every extension issue |
+| Requirement | Final evidence |
+| --- | --- |
+| `FWIR-SEM-001` | `validate_product_cutover`; `public_source_artifact_execution_c_and_resource_traces_are_differential` |
+| `FWIR-SEM-002` | `valid_fixtures_cover_every_node_and_edge_family`; `verifier_category_winners_follow_the_normative_order` |
+| `FWIR-SEM-003` | `typed_public_api_parameter_contract`; `cli_parameters_and_diagnostics_contract` |
+| `FWIR-SEM-004` | `s16_empty_singleton_promotion_and_shape_contracts`; `deep_structural_values_and_types_format_and_drop_iteratively` |
+| `FWIR-SEM-005` | `canonical_binary64_format_boundaries`; `typed_api_rejects_noncanonical_nan_without_normalizing_it`; `resource_observer_reports_commit_refusal_and_cleanup_order` |
+| `FWIR-SEM-006` | `parses_literals_calls_tuples_parameters_and_fanout`; `deep_unary_programs_use_iterative_parse_analysis_and_evaluation` |
+| `FWIR-SEM-007` | `production_registry_is_complete_and_numeric_lookups_are_checked`; `every_selected_id_emits_a_direct_kernel_symbol_without_type_redispatch` |
+| `FWIR-SEM-008` | `checked_arithmetic_has_no_partial_result`; `vector_tuple_and_work_limits_cover_zero_exact_and_one_past`; golden IDs `S16-16/17/19/22` |
+| `FWIR-SEM-009` | `tup_structural_format_spread_and_direct_preservation`; `lifting_and_tuples_are_canonical` |
+| `FWIR-SEM-010` | `tuple_allocation_ordinals_exclude_empty_tables_and_cleanup_failures`; `live_limit_observes_children_before_outer_tuple_admission`; deep tuple journeys |
+| `FWIR-SEM-011` | `fan_stable_id_matrix`; `fan_out_prefix_placeholder_borrows_prepare_and_preserves_elements`; generated-C fan-out parity |
+| `FWIR-SEM-012` | `parameter_header_reason_and_span_contract_is_structured`; authored failure corpus; CLI diagnostics |
+| `FWIR-SEM-013` | `profile_configuration_precedes_source_and_backend_analysis`; `whole_program_static_precedence_is_arity_then_type_then_shape` |
+| `FWIR-SEM-014` | `refusal_precedence_is_vector_then_live_then_work_then_allocation`; `failure_usage_is_post_cleanup_and_work_remains_monotonic`; observer parity |
+| `FWIR-SEM-015` | `resource_profiles_limits_and_ordinals`; `generated_runtime_embeds_profile_and_verified_primitive_selection` |
+| `FWIR-SEM-016` | `identity_result_root_and_feature_invariants_are_rejected`; `deterministic_mutation_corpus_is_rejected_without_panic_or_partial_program` |
+| `FWIR-SEM-017` | `exact_ir_golden_digests_cover_every_source_construct`; `evaluates_complete_primitive_surface` |
+| `FWIR-SEM-018` | `same_major_optional_compatibility_and_mandatory_rejection_are_exact`; canonical decode/re-encode tests |
+| `FWIR-SEM-019` | `validate_product_cutover`; `traceability_references_complete_executable_evidence_sets` |
+| `FWIR-SEM-020` | `validate_product_cutover`; exact changed-file and decision review |
 
 The former parameter, tuple, and fan-out requirement families are represented
 respectively by `FWIR-SEM-003/004/007/008/012/013/014`,
@@ -679,11 +677,11 @@ above are the active compatibility evidence.
 
 ## 20. Non-goals (`FWIR-SEM-020`)
 
-This contract does not add an optimizer, arbitrary node sharing, reference
+FWIR v1 does not include an optimizer, arbitrary node sharing, reference
 counting, user functions, control flow, parallel fan-out, nested fan-out,
 tuple-aware primitive signatures, multidimensional arrays, third-party
-production guarantees, or a new execution backend. It does not choose
-serialized bytes or expose raw in-memory layout as an ABI.
+production guarantees, or a new execution backend. It does not expose raw
+in-memory layout as an ABI.
 
 No implementation issue may weaken results, diagnostics, precedence,
 provenance, resource events, ownership, releases, formatting, or publication

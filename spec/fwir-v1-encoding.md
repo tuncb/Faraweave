@@ -346,14 +346,14 @@ the same checked bounds and are fully validated even though the section is
 advisory. A source digest is compared only when a caller separately supplies
 the corresponding source bytes; mismatch is not a semantic-program failure.
 
-The provisional structured rejection categories are
+The stable structured rejection categories are
 `ArtifactTooLarge`, `Truncated`, `InvalidHeader`, `UnsupportedFormatVersion`,
 `UnknownMandatoryExtension`, `NonCanonicalDirectory`, `InvalidSectionLength`,
 `ResourceLimit`, `AllocationUnavailable`, `InvalidUtf8`, `NonCanonicalRecord`,
 and `MalformedProgram(VerifyError)`. Each physical error carries a byte offset
 and, once known, section ID and record index; semantic verifier errors retain
-their existing record and field identity. Issues #11 and #12 may refine Rust
-type names, but not this category separation or winner order.
+their existing record and field identity. The category separation and winner
+order are part of the accepted v1 behavior.
 
 ## 9. Exact representative bytes
 
@@ -380,15 +380,12 @@ python tools/validation/fwir_v1_measurements.py examples --examples-dir spec/exa
 The measurement model constructs these bytes while a separate decoder reads
 the header, directory, and every field used by the examples, proves exact
 extents, compares the decoded logical records with an independently stated
-program, and rejects trailing data. Issue #11 will convert them to encoder
-goldens and issue #12 will add the complete independently authored malformed
-corpus.
+program, and rejects trailing data. The encoder goldens and independently
+authored malformed corpus are executable in the Rust conformance suites.
 
-## 10. Provisional library and CLI boundaries
+## 10. Stable library and CLI boundaries
 
-Names are accepted for implementation by issues #11 through #13; ordinary
-Rust compatibility permits refining error type fields without changing the
-separation:
+The following names and phase separation are accepted v1 product boundaries:
 
 ```text
 encode_fwir(program: &VerifiedProgram, options: &FwirEncodeOptions)
@@ -438,3 +435,36 @@ and binary64 bits need additional string conventions.
 No dependency is added by this decision or measurement harness. An encoder or
 decoder proposal that adds one must make a new dependency decision in its own
 issue rather than treating this comparison as authorization.
+
+## 12. Accepted product, producer, and security policy
+
+Physical format 1.0, semantic contract 1.0, canonical program-identity bytes,
+the `.fwir` extension, and the library and CLI spellings above are the stable
+FWIR v1 product contract. A compatible addition uses the same-major
+forward-minor and explicitly optional advisory mechanisms in section 7;
+changing identity-participating meaning, a stable semantic ID, or a mandatory
+record requires a new incompatible version.
+
+Faraweave is the authoritative v1 producer. A consumer validates artifact
+bytes without trusting who produced them, and `PROD` is advisory provenance,
+not an authenticity assertion; third-party producer tooling and compatibility
+guarantees are unsupported. Authenticity, source-digest comparison, signing,
+distribution provenance, and release policy are caller or release-layer
+responsibilities outside the FWIR semantic identity.
+
+Unsupported v1 capabilities include optimizers, additional backends, user
+functions, general control flow, parallel or nested fan-out, tuple-aware
+primitive signatures, multidimensional arrays, and unknown mandatory
+features. Consumers reject unsupported mandatory semantics rather than
+guessing, defaulting, or redispatching by a source name.
+
+The decoder treats bytes as hostile, applies checked bounds and caller limits,
+and yields no backend input before complete verification. That is an
+input-safety boundary, not a sandbox: generated C, the selected C compiler,
+and native executables run with the invoking process's authority.
+
+FWIR is not confidential or encrypted. Canonical bytes and inspection output
+can reveal diagnostic source names, literal constants, type and node graphs,
+parameter names, provenance positions, and producer metadata; source digests
+can also support offline guessing. Producers must not place secrets in an
+artifact and must use a separate confidentiality mechanism when required.
