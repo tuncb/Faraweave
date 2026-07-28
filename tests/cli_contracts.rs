@@ -306,6 +306,45 @@ fn cli_repl_transcript_recovers_resets_and_rejects_program_headers() {
 }
 
 #[test]
+fn cli_repl_internal_reports_registry_without_evaluating_source() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut input = child.stdin.take().expect("REPL stdin");
+    input
+        .write_all(b".internal\r\ninc 5\r\n")
+        .expect("REPL internal transcript");
+    drop(input);
+
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert!(result.stderr.is_empty());
+    let stdout = String::from_utf8(result.stdout).expect("REPL stdout UTF-8");
+    assert!(stdout.starts_with(
+        "> Faraweave semantic registry (internal human-readable diagnostics; format is unstable)\n"
+    ));
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("primitive "))
+            .count(),
+        19
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("  signature "))
+            .count(),
+        34
+    );
+    assert!(stdout.ends_with("kernel=iota_int\n> 6\n> "));
+}
+
+#[test]
 fn cli_run_is_extension_agnostic_and_transactional() {
     let directory = unique("run");
     fs::create_dir_all(&directory).expect("mkdir");

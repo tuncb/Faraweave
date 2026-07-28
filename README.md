@@ -64,6 +64,11 @@ cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
 cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
+Within the REPL, `.internal` prints a read-only view of the production semantic
+registry for overload and lifting diagnosis. Its human-readable text is an
+internal troubleshooting aid, not a stable machine-readable format or
+compatibility contract.
+
 `emit-c` writes deterministic self-contained strict C11. `build` selects the C
 compiler in this order: explicit `--cc`, `CC`, then `cc` on Unix or `cl.exe` on
 Windows. Compiler values are executable names or paths, not shell fragments.
