@@ -1,3 +1,5 @@
+mod repl_terminal;
+
 use faraweave::{
     ArgumentErrorContext, CompileFwirError, Error, ErrorKind, FwirDecodeLimits, FwirEncodeOptions,
     NativeBuildRequest, VERSION, build_native, build_native_from_verified_program,
@@ -379,8 +381,13 @@ fn repl() -> Result<(), ()> {
                 line.pop();
             }
         }
-        if line.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
-            continue;
+        match repl_terminal::classify_repl_input(&line) {
+            repl_terminal::ReplInputKind::Blank => continue,
+            repl_terminal::ReplInputKind::Clear => {
+                clear_repl_terminal();
+                continue;
+            }
+            repl_terminal::ReplInputKind::Evaluate => {}
         }
         match evaluate_expression(&line) {
             Ok(result) => {
@@ -391,6 +398,21 @@ fn repl() -> Result<(), ()> {
             }
             Err(error) => report_error("<repl>", &error),
         }
+    }
+}
+
+fn clear_repl_terminal() {
+    let capability = repl_terminal::stdout_capability();
+    let mut stdout = io::stdout().lock();
+    let result = repl_terminal::clear_terminal(
+        capability,
+        &mut stdout,
+        repl_terminal::clear_windows_console,
+    );
+    drop(stdout);
+    if let Err(failure) = result {
+        let mut stderr = io::stderr().lock();
+        let _ = repl_terminal::report_clear_failure(failure, &mut stderr);
     }
 }
 

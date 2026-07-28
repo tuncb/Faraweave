@@ -64,6 +64,12 @@ cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
 cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
+Inside the REPL, the exact case-sensitive `.cls` meta-command clears and homes
+interactive Windows consoles or ANSI terminals with a nonempty, non-`dumb`
+`TERM`. Redirected output remains byte-clean, while unsupported terminals and
+terminal failures produce a deterministic diagnostic and leave the session
+running.
+
 `emit-c` writes deterministic self-contained strict C11. `build` selects the C
 compiler in this order: explicit `--cc`, `CC`, then `cc` on Unix or `cl.exe` on
 Windows. Compiler values are executable names or paths, not shell fragments.

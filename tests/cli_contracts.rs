@@ -306,6 +306,27 @@ fn cli_repl_transcript_recovers_resets_and_rejects_program_headers() {
 }
 
 #[test]
+fn cli_repl_cls_is_crlf_exact_non_evaluating_and_redirect_safe() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut input = child.stdin.take().expect("REPL stdin");
+    input
+        .write_all(b".cls\r\ninc 5\n")
+        .expect("REPL .cls transcript");
+    drop(input);
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > 6\n> ");
+    assert!(!result.stdout.contains(&0x1b));
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
 fn cli_run_is_extension_agnostic_and_transactional() {
     let directory = unique("run");
     fs::create_dir_all(&directory).expect("mkdir");
