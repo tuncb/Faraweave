@@ -360,6 +360,18 @@ fn build_command(arguments: &[OsString]) -> Result<(), ()> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplCommand {
+    Exit,
+}
+
+fn repl_command(line: &str) -> Option<ReplCommand> {
+    match line.trim_matches([' ', '\t']) {
+        ".exit" => Some(ReplCommand::Exit),
+        _ => None,
+    }
+}
+
 fn repl() -> Result<(), ()> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -392,6 +404,9 @@ fn repl() -> Result<(), ()> {
                     continue;
                 }
             }
+        }
+        if repl_command(&line) == Some(ReplCommand::Exit) {
+            return Ok(());
         }
         match evaluate_expression(&line) {
             Ok(result) => {
@@ -697,7 +712,8 @@ fn report_argument_error(argument: &ArgumentErrorContext) {
 mod output_tests {
     use super::{
         CommandLineArgumentFailure, CommandLineArgumentFailureInjection, OutputFailureReason,
-        OutputPublicationFailure, collect_command_line_arguments, publish_to,
+        OutputPublicationFailure, ReplCommand, collect_command_line_arguments, publish_to,
+        repl_command,
     };
     use std::ffi::OsString;
     use std::io::{self, Write};
@@ -802,5 +818,26 @@ mod output_tests {
             failure.diagnostic(),
             "error: unable to decode Unicode command line"
         );
+    }
+
+    #[test]
+    fn repl_command_dispatch_is_exact_and_case_sensitive() {
+        for accepted in [".exit", " .exit", "\t.exit", " \t.exit\t "] {
+            assert_eq!(repl_command(accepted), Some(ReplCommand::Exit));
+        }
+        for rejected in [
+            "",
+            " ",
+            ".EXIT",
+            ".Exit",
+            ".exit-now",
+            ".exit argument",
+            ".exit # trailing source comment",
+            ".exit#trailing-source-comment",
+            "\u{a0}.exit",
+            ".exit\u{a0}",
+        ] {
+            assert_eq!(repl_command(rejected), None);
+        }
     }
 }

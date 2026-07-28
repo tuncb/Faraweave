@@ -73,6 +73,12 @@ path. Redirected output remains byte-clean, while unsupported terminals and
 terminal failures produce a deterministic diagnostic and leave the session
 running.
 
+In the REPL, `.exit` ends the session successfully without evaluating source.
+Matching is case-sensitive and exact after removing the line ending and
+ignoring surrounding ASCII spaces or tabs; arguments, prefixes, and trailing
+source comments do not match the command. End-of-file also ends the session
+successfully.
+
 `emit-c` writes deterministic self-contained strict C11. `build` selects the C
 compiler in this order: explicit `--cc`, `CC`, then `cc` on Unix or `cl.exe` on
 Windows. Compiler values are executable names or paths, not shell fragments.
