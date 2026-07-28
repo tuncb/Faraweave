@@ -46,6 +46,10 @@ pub(crate) enum ExprKind {
         steps: Vec<UnaryStep>,
     },
     Parameter(usize),
+    OperationReference {
+        name: String,
+        name_span: SourceSpan,
+    },
     Call {
         name: String,
         syntax: CallSyntax,
@@ -85,6 +89,7 @@ enum TokenKind {
     LeftBrace,
     RightBrace,
     Placeholder,
+    At,
     Space,
     Comment,
     Newline,
@@ -417,6 +422,7 @@ fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
         | ExprKind::Parameter(_)
+        | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. }
         | ExprKind::Placeholder => None,
     }
@@ -430,6 +436,7 @@ fn expression_contains_tuple(expression: &Expr) -> bool {
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
         | ExprKind::Parameter(_)
+        | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. }
         | ExprKind::Placeholder => false,
     }
@@ -552,6 +559,7 @@ fn tokenize(source: &str) -> Vec<Token> {
             b')' => TokenKind::RightParenthesis,
             b'{' => TokenKind::LeftBrace,
             b'}' => TokenKind::RightBrace,
+            b'@' => TokenKind::At,
             _ => TokenKind::Invalid,
         };
         advance_ascii(&mut location);
@@ -948,6 +956,7 @@ impl Parser {
             TokenKind::LeftParenthesis => self.parse_vector(),
             TokenKind::LeftBracket => self.parse_tuple(),
             TokenKind::Name => self.parse_name_expr(),
+            TokenKind::At => self.parse_operation_reference(),
             TokenKind::Placeholder if self.branch_depth != 0 => {
                 self.index += 1;
                 Ok(Expr {
@@ -1182,6 +1191,32 @@ impl Parser {
             name.span,
             "primitive name requires bracketed or unary prefix application",
         ))
+    }
+
+    fn parse_operation_reference(&mut self) -> Result<Expr, Error> {
+        let marker = self
+            .take_kind(TokenKind::At)
+            .ok_or_else(|| self.eof_error("expected '@'"))?;
+        let Some(name) = self.take_kind(TokenKind::Name) else {
+            let span = self
+                .peek()
+                .map_or_else(|| self.insertion_span(), |token| token.span);
+            return Err(Error::at_span(
+                ErrorKind::SyntaxError,
+                span,
+                "expected an adjacent built-in operation name after '@'",
+            ));
+        };
+        Ok(Expr {
+            span: SourceSpan {
+                begin: marker.span.begin,
+                end: name.span.end,
+            },
+            kind: ExprKind::OperationReference {
+                name: name.spelling,
+                name_span: name.span,
+            },
+        })
     }
 
     fn parse_fanout(&mut self, keyword: Token) -> Result<Expr, Error> {
@@ -1564,6 +1599,7 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
             | ExprKind::DeepTuple { .. }
             | ExprKind::UnaryChain { .. }
             | ExprKind::Parameter(_)
+            | ExprKind::OperationReference { .. }
             | ExprKind::UnresolvedName { .. } => {}
         }
     }
@@ -1632,6 +1668,45 @@ mod tests {
     #[test]
     fn arbitrary_file_extension_is_outside_the_syntax() {
         assert!(parse("inc[1]\n").is_ok());
+    }
+
+    #[test]
+    fn operation_reference_syntax_is_explicit_adjacent_and_not_prefix_application() {
+        let program = parse("future[@add add[1 2] add 1]\n").expect("operation reference parses");
+        let ExprKind::Call { arguments, .. } = &program.roots[0].kind else {
+            panic!("expected outer call");
+        };
+        assert!(matches!(
+            &arguments[0].kind,
+            ExprKind::OperationReference { name, name_span }
+                if name == "add"
+                    && name_span.begin.offset == 9
+                    && name_span.end.offset == 12
+        ));
+        assert!(matches!(
+            arguments[1].kind,
+            ExprKind::Call {
+                syntax: CallSyntax::Direct,
+                ..
+            }
+        ));
+        assert!(matches!(
+            arguments[2].kind,
+            ExprKind::Call {
+                syntax: CallSyntax::Prefix,
+                ..
+            }
+        ));
+
+        for source in ["@ add", "@1", "@", "@@add"] {
+            let error = parse(source).expect_err(source);
+            assert_eq!(error.kind, ErrorKind::SyntaxError, "{source}");
+        }
+        let bare = parse("add").expect("bare name retains old parse");
+        assert!(matches!(
+            bare.roots[0].kind,
+            ExprKind::UnresolvedName { .. }
+        ));
     }
 
     #[test]

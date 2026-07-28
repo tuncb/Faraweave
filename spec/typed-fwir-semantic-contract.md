@@ -57,6 +57,7 @@ FWIR is a closed, finite, plain-data program. Its abstract records are:
 | Edge | Producer, semantic argument position, value access, conversion, ownership mode, and argument origin. |
 | Root | Source-order result node and root origin. |
 | Origin | Source unit and one-based, half-open byte span, with the derived line and column data needed by current diagnostics. |
+| OperationReference | Stable primitive, signature, and implementation identities plus the source origin of one closed registered built-in selected by a higher-order consumer. |
 | Feature | A mandatory semantic capability used by the module. |
 | Ownership | Owner, borrow, transfer, and logical release relationships. |
 
@@ -624,6 +625,7 @@ Every current parser expression maps without preserving parser-only variants:
 | Placeholder | One `FanOutOperandBorrow` edge in its validated branch region. |
 | Fanout | `FanOut` with operand, preadmission, branch regions/roots, transfers, result type, and releases. |
 | UnresolvedName | Source resolution failure; never valid FWIR. |
+| OperationReference (`@name`) | A parser-only reference accepted only in an explicitly declared operation-reference argument position; no current executable source construct declares such a position. |
 
 The current public value variants map exactly to section 4's values. Parser
 spans and call syntax are consumed by lowering; the smaller semantic origin and
@@ -635,6 +637,30 @@ This mapping is complete for the current language. Adding a new source
 construct, type, conversion, ownership mode, or dynamic operation requires a
 new mandatory feature and an amendment to this contract before a backend may
 accept it.
+
+### 17.1 Stable built-in operation references
+
+`@name` is a reserved, adjacent source token consisting of `@` followed by one
+lowercase built-in name. It is never a prefix call and a bare primitive name is
+never reinterpreted as a reference. An operation reference is not a
+first-class value: it is valid only in an argument position that its consuming
+higher-order primitive explicitly declares, and issue #38 introduces no such
+executable primitive, so every current source placement is rejected.
+
+The consumer supplies an arity plus parameter and result scalar constraints.
+Lowering considers only closed registered `Elementwise` descriptors, applies
+the ordinary identity-before-Int-promotion cost rule, rejects unknown names,
+unsupported structural behavior, incompatible signatures, and equal-cost
+ambiguity, then records the selected primitive, signature, and implementation
+IDs and the reference origin. Backends dispatch the recorded implementation
+identity; they never retain or look up `name` at runtime.
+
+Every operation-reference record must resolve to one registry descriptor whose
+three stable identities agree and whose behavior is `Elementwise`; its origin
+must be valid. A module with any such record requires semantic version 1.1 and
+mandatory feature `6=OperationReferences`. Semantic 1.0 programs and their
+meaning are unchanged, feature 5 is defined by issue #36, and this amendment
+does not reserve primitive, signature, or implementation IDs for fold or scan.
 
 ## 18. Compatibility without a physical encoding (`FWIR-SEM-018`)
 

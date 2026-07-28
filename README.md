@@ -91,8 +91,10 @@ FWIR v1 commits to physical formats 1.0 and 1.1, semantic contract 1.1,
 semantic/physical-1.0 corpus remains accepted and round-trips byte-for-byte.
 Artifacts that use explicit application plans carry mandatory feature
 `5=ApplicationPlans` and physical format 1.1; artifacts that use the
+stable operation-reference sidecar carry mandatory feature
+`6=OperationReferences` and physical format 1.1; artifacts that use the
 backend-native math identities carry mandatory feature
-`7=BackendNativeMathV1`. Artifacts without either capability need not carry
+`7=BackendNativeMathV1`. Artifacts without these capabilities need not carry
 the corresponding feature.
 Unknown class-1 advisory features and explicitly optional, non-identity
 forward-minor sections may be skipped. Unknown mandatory semantics,
