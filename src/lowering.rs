@@ -2682,6 +2682,67 @@ mod tests {
     }
 
     #[test]
+    fn any_of_records_scalar_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program =
+            must_compile("any_of[(false true)]\nany_of equals[iota 3 iota 3]\nany_of[Bool()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 25,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert!(
+            applies
+                .iter()
+                .all(|apply| (apply.1, apply.2, apply.3) == (46, 46, 7))
+        );
+        assert!(
+            applies.iter().all(|apply| {
+                apply.0.cardinality == Some(Cardinality::StaticScalar)
+                    && apply.4 == LiftMode::ContainerScalar
+                    && apply.5.static_anchor.is_none()
+                    && apply.5.dynamic_checks.count == 0
+            }),
+            "{applies:?}"
+        );
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    raw.edges
+                        .get(apply.0.edges.start as usize)
+                        .and_then(|edge| edge.cardinality)
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
     fn prefix_spread_preserves_immediate_element_metadata() {
         let program = must_compile("add [1 (2 3)]\n");
         let raw = program.as_raw();
@@ -3085,10 +3146,11 @@ mod tests {
              sort[(2 1)]\n\
              sum[(1 2)]\n\
              all_of[(true false)]\n\
+             any_of[(true false)]\n\
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 282_111_915_026_064_736);
+        assert_eq!(debug_digest(&matrix), 11_757_003_268_920_635_591);
 
         let depth = 256;
         let mut deep = String::new();

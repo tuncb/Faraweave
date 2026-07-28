@@ -3320,6 +3320,16 @@ mod tests {
         }
     }
 
+    fn any_of_program() -> RawProgram {
+        match crate::lowering::compile_source_with_name(
+            "any_of[(false true false)]\n",
+            "any-of.faraweave",
+        ) {
+            Ok(program) => program.raw,
+            Err(error) => panic!("any_of fixture did not lower: {error}"),
+        }
+    }
+
     fn dynamic_shape_program() -> RawProgram {
         let mut builder = RawProgramBuilder::new();
         must(builder.push_feature(Feature::StableSemanticIds.numeric()));
@@ -4833,6 +4843,90 @@ mod tests {
         verify_error(wrong_conversion, Invariant::InvalidRecord);
 
         let mut missing_feature = all_of_program();
+        missing_feature
+            .features
+            .retain(|feature| *feature != Feature::ApplicationPlans.numeric());
+        missing_feature.module.ranges.features.count =
+            u32::try_from(missing_feature.features.len()).unwrap_or(u32::MAX);
+        verify_error(missing_feature, Invariant::MissingFeature);
+    }
+
+    #[test]
+    fn any_of_plan_identity_container_mode_result_and_feature_are_verified() {
+        assert!(any_of_program().verify().is_ok());
+
+        let mut wrong_plan = any_of_program();
+        let Some(node) = wrong_plan.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 25,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing any_of node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut application_plan_id,
+            ..
+        } = node.kind
+        else {
+            panic!("any_of node kind changed");
+        };
+        *application_plan_id = 6;
+        verify_error(wrong_plan, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_lift = any_of_program();
+        let Some(node) = wrong_lift.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 25,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing any_of node");
+        };
+        let NodeKind::SelectedApply { ref mut lift, .. } = node.kind else {
+            panic!("any_of node kind changed");
+        };
+        *lift = LiftMode::Scalar;
+        verify_error(wrong_lift, Invariant::InconsistentResultMetadata);
+
+        let mut wrong_cardinality = any_of_program();
+        let Some(node) = wrong_cardinality.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 25,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing any_of node");
+        };
+        node.cardinality = Some(Cardinality::StaticVector(3));
+        verify_error(wrong_cardinality, Invariant::InconsistentResultMetadata);
+
+        let mut wrong_conversion = any_of_program();
+        let Some(edge_start) = wrong_conversion.nodes.iter().find_map(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 25,
+                    ..
+                }
+            )
+            .then_some(node.edges.start)
+        }) else {
+            panic!("missing any_of node");
+        };
+        wrong_conversion.edges[edge_start as usize].conversion = Conversion::PromoteIntToDouble;
+        verify_error(wrong_conversion, Invariant::InvalidRecord);
+
+        let mut missing_feature = any_of_program();
         missing_feature
             .features
             .retain(|feature| *feature != Feature::ApplicationPlans.numeric());

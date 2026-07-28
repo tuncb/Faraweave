@@ -166,6 +166,21 @@ observer events, or ownership cleanup. The scalar result has no byte admission
 or allocation attempt, while scalar, numeric-vector, and tuple operands fail
 during static signature selection.
 
+## Boolean any reduction (`FWIR-PLAN-009`)
+
+Primitive ID `25=any_of` has one whole-vector Bool signature and matching
+signature/implementation ID 46. It selects application-plan ID 7, whose
+`Scalar` result rule returns Bool and whose `OperandCardinality(1)` rule admits
+exactly one work unit per input element before inspection begins.
+
+The result is true exactly when at least one element is true, with false as the
+empty identity. An implementation may physically stop after the first true
+element, but the complete cardinality charge commits first; the decisive
+position therefore cannot affect work-limit outcomes, allocation ordinals,
+resource observer events, or ownership cleanup. The scalar result has no byte
+admission or allocation attempt, while scalar, numeric-vector, and tuple
+operands fail during static signature selection.
+
 ## Evidence (`FWIR-PLAN-004`)
 
 Registry unit tests cover stable plan lookup and changed operand/plan
@@ -197,4 +212,10 @@ Issue #43 maps `FWIR-PLAN-008` to
 `all_of_container_plan_roundtrips_and_dispatches_by_verified_identity`,
 `all_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_false_position`,
 `all_of_work_and_observer_trace_are_independent_of_the_decisive_position`, and
+the strict C11 success journey.
+Issue #44 maps `FWIR-PLAN-009` to
+`any_of_records_scalar_container_plan_for_static_dynamic_and_empty_vectors`,
+`any_of_container_plan_roundtrips_and_dispatches_by_verified_identity`,
+`any_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`,
+`any_of_work_and_observer_trace_are_independent_of_the_decisive_position`, and
 the strict C11 success journey.
