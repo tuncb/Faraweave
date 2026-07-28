@@ -653,6 +653,9 @@ fn repl() -> Result<(), ()> {
         if line.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
             continue;
         }
+        if line.trim_start_matches([' ', '\t']).starts_with('#') {
+            continue;
+        }
         if line.trim_matches([' ', '\t']) == ".history" {
             publish_history_stdout(&history)?;
             continue;

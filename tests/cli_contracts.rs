@@ -323,9 +323,12 @@ fn repl_output(transcript: &[u8]) -> std::process::Output {
 
 #[test]
 fn cli_repl_history_preserves_inclusion_text_numbering_and_crlf() {
-    let result = repl_output(b"\n \t\r\nadd[1]\r\n.history\r\n");
+    let result = repl_output(b"\n \t\r\n# comment\r\nadd[1]\r\n.history\r\n");
     assert!(result.status.success());
-    assert_eq!(result.stdout, b"> > > > 1\t \t\n2\tadd[1]\n3\t.history\n> ");
+    assert_eq!(
+        result.stdout,
+        b"> > > > > 1\t \t\n2\t# comment\n3\tadd[1]\n4\t.history\n> "
+    );
     let stderr = String::from_utf8(result.stderr).expect("REPL stderr UTF-8");
     assert!(stderr.contains("<repl>:1:1: ArityError:"));
 
@@ -383,6 +386,26 @@ fn cli_repl_history_discards_oversized_input_and_recovers() {
         result.stderr,
         b"error: REPL input exceeds 65536 retained bytes\n"
     );
+}
+
+#[test]
+fn cli_repl_ignores_comment_only_lines() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut input = child.stdin.take().expect("REPL stdin");
+    input
+        .write_all("# comment-only\n \t# utf8 🦀\r\ninc 5\n".as_bytes())
+        .expect("REPL transcript");
+    drop(input);
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > > 6\n> ");
+    assert!(result.stderr.is_empty());
 }
 
 #[test]
