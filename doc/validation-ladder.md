@@ -62,8 +62,10 @@ and release provenance. The package target is exactly one of `linux-x64`,
   archive journeys. PE identity, Windows long paths, Linux `/dev/full`, and
   the Linux sanitizer gate are exclusions.
 
-The GitHub Actions matrix runs all three hosts. A local run records other-host
-checks as assigned to that matrix, never as locally passed.
+The GitHub Actions matrix runs all three hosts and invokes
+`python tools/validation/contracts.py package ${{ matrix.target }}` after the
+full contract on each host. A local run records other-host checks as assigned
+to that matrix, never as locally passed.
 
 ## FWIR v1 acceptance run
 

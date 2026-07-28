@@ -21,7 +21,7 @@ VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
 
 COMMAND_EVIDENCE = {
     "command:contracts-review": "python tools/validation/contracts.py review",
-    "command:host-package-contract": "python tools/validation/contracts.py package <host-target>",
+    "command:host-package-contract": "python tools/validation/contracts.py package ${{ matrix.target }}",
     "command:main-ci-debug-tests": "cargo test --workspace --all-targets --all-features",
     "command:main-ci-full-contracts": "python tools/validation/contracts.py full",
     "command:main-ci-release-tests": "cargo test --workspace --all-targets --all-features --release",
@@ -194,6 +194,7 @@ def validate_main_workflow(main: str) -> None:
         "cargo test --workspace --all-targets --all-features",
         "cargo test --workspace --all-targets --all-features --release",
         "python tools/validation/contracts.py full",
+        "python tools/validation/contracts.py package ${{ matrix.target }}",
         "PR Gate",
         "if: always()",
         "needs: [validate]",
@@ -408,10 +409,18 @@ def validate_executable_evidence(identifier: str) -> None:
             ".github/workflows/main.yml",
         )
     )
-    require(
-        COMMAND_EVIDENCE[identifier] in command_sources,
-        f"{identifier}: exact command is not in the validation contract",
-    )
+    command = COMMAND_EVIDENCE[identifier]
+    if identifier == "command:host-package-contract":
+        workflow = (ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8")
+        require(
+            f"- run: {command}" in workflow,
+            f"{identifier}: exact command is not executed by Main CI",
+        )
+    else:
+        require(
+            command in command_sources,
+            f"{identifier}: exact command is not in the validation contract",
+        )
 
 
 def validate_traceability_evidence(
@@ -455,7 +464,7 @@ def validate_product_cutover() -> None:
         require(token not in production_tree, f"obsolete typed analyzer seam {token}")
     require(
         production_tree.count("fn select_descriptor(") == 1
-        and "let descriptor = select_descriptor(name, &operands, location)?" in lowering
+        and "select_descriptor(name, &operands, location, &mut self.diagnostics)?" in lowering
         and "primitive_id: descriptor.primitive_id.numeric()" in lowering
         and "signature_id: descriptor.signature_id.numeric()" in lowering
         and "implementation_id: descriptor.implementation_id.numeric()" in lowering,

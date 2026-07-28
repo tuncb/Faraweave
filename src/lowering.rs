@@ -90,6 +90,30 @@ struct Lowerer {
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
     first_shape_error: Option<Error>,
+    diagnostics: DiagnosticReservations,
+}
+
+#[derive(Default)]
+struct DiagnosticReservations {
+    refuse_next: bool,
+}
+
+impl DiagnosticReservations {
+    fn try_reserve(
+        &mut self,
+        message: &mut String,
+        capacity: usize,
+        arena: crate::Arena,
+    ) -> Result<(), LowerError> {
+        if std::mem::take(&mut self.refuse_next) {
+            return Err(LowerError::Build(BuildError::AllocationUnavailable {
+                arena,
+            }));
+        }
+        message
+            .try_reserve_exact(capacity)
+            .map_err(|_| LowerError::Build(BuildError::AllocationUnavailable { arena }))
+    }
 }
 
 #[derive(Clone)]
@@ -216,13 +240,14 @@ fn validate_expr_arities(
 }
 
 fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result<(), LowerError> {
-    let primitive = primitive_from_name(name).map_err(|_| {
-        LowerError::Source(Error::new(
-            ErrorKind::UnknownPrimitive,
-            location,
-            format!("unknown primitive '{name}'"),
-        ))
-    })?;
+    let primitive = match primitive_from_name(name) {
+        Ok(primitive) => primitive,
+        Err(_) => {
+            return Err(LowerError::Source(unknown_primitive_diagnostic(
+                name, location,
+            )?));
+        }
+    };
     if descriptors(primitive).any(|descriptor| descriptor.parameters.len() == actual) {
         return Ok(());
     }
@@ -290,6 +315,27 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
     Err(LowerError::Source(error))
 }
 
+fn unknown_primitive_diagnostic(name: &str, location: SourceLocation) -> Result<Error, LowerError> {
+    let capacity =
+        name.len()
+            .checked_add(32)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Node,
+            }))?;
+    let mut message = String::new();
+    message.try_reserve_exact(capacity).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    write!(&mut message, "unknown primitive '{name}'").map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    Ok(Error::new(ErrorKind::UnknownPrimitive, location, message))
+}
+
 fn lower_program(
     source: &str,
     diagnostic_name: &str,
@@ -303,7 +349,23 @@ fn lower_program_with_builder(
     source: &str,
     diagnostic_name: &str,
     program: &Program,
+    builder: RawProgramBuilder,
+) -> Result<VerifiedProgram, LowerError> {
+    lower_program_with_builder_and_diagnostics(
+        source,
+        diagnostic_name,
+        program,
+        builder,
+        DiagnosticReservations::default(),
+    )
+}
+
+fn lower_program_with_builder_and_diagnostics(
+    source: &str,
+    diagnostic_name: &str,
+    program: &Program,
     mut builder: RawProgramBuilder,
+    diagnostics: DiagnosticReservations,
 ) -> Result<VerifiedProgram, LowerError> {
     let byte_length = u32::try_from(source.len()).map_err(|_| {
         LowerError::Build(BuildError::CountOverflow {
@@ -326,6 +388,7 @@ fn lower_program_with_builder(
         placeholder: None,
         releases: Vec::new(),
         first_shape_error: None,
+        diagnostics,
     };
 
     if let Some(header) = program.parameter_header {
@@ -1013,7 +1076,7 @@ impl Lowerer {
         location: SourceLocation,
         operands: Vec<CallOperand>,
     ) -> Result<Lowered, LowerError> {
-        let descriptor = select_descriptor(name, &operands, location)?;
+        let descriptor = select_descriptor(name, &operands, location, &mut self.diagnostics)?;
         let edge_start = self.builder.finish_preview_edges()?;
         let mut static_anchor = None;
         let mut static_length = None;
@@ -1099,14 +1162,15 @@ impl Lowerer {
                 if let Some(Cardinality::StaticVector(actual)) = operand.parts().3
                     && actual != expected
                 {
-                    let mut error = Error::new(
-                        ErrorKind::ShapeMismatch,
-                        operand.parts().6,
-                        format!(
-                            "{name} argument {} expected shape [{expected}], got [{actual}]",
-                            index + 1
-                        ),
-                    );
+                    let message = static_shape_message(
+                        name,
+                        index + 1,
+                        expected,
+                        actual,
+                        &mut self.diagnostics,
+                    )?;
+                    let mut error =
+                        Error::new(ErrorKind::ShapeMismatch, operand.parts().6, message);
                     error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
                     error.argument_position = Some(index + 1);
                     let expected = usize::try_from(expected).map_err(|_| {
@@ -1437,18 +1501,72 @@ impl CallOperand {
     }
 }
 
+fn unsupported_signature_message(
+    name: &str,
+    first_unsupported: usize,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<String, LowerError> {
+    let capacity =
+        name.len()
+            .checked_add(128)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Type,
+            }))?;
+    let mut message = String::new();
+    diagnostics.try_reserve(&mut message, capacity, crate::Arena::Type)?;
+    write!(
+        &mut message,
+        "{name} arguments do not match an accepted signature; first unsupported argument is {first_unsupported}"
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Type,
+        })
+    })?;
+    Ok(message)
+}
+
+fn static_shape_message(
+    name: &str,
+    argument_position: usize,
+    expected: u32,
+    actual: u32,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<String, LowerError> {
+    let capacity =
+        name.len()
+            .checked_add(128)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::ShapeCheck,
+            }))?;
+    let mut message = String::new();
+    diagnostics.try_reserve(&mut message, capacity, crate::Arena::ShapeCheck)?;
+    write!(
+        &mut message,
+        "{name} argument {argument_position} expected shape [{expected}], got [{actual}]"
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::ShapeCheck,
+        })
+    })?;
+    Ok(message)
+}
+
 fn select_descriptor(
     name: &str,
     operands: &[CallOperand],
     location: SourceLocation,
+    diagnostics: &mut DiagnosticReservations,
 ) -> Result<&'static SemanticDescriptor, LowerError> {
-    let primitive = primitive_from_name(name).map_err(|_| {
-        LowerError::Source(Error::new(
-            ErrorKind::UnknownPrimitive,
-            location,
-            format!("unknown primitive '{name}'"),
-        ))
-    })?;
+    let primitive = match primitive_from_name(name) {
+        Ok(primitive) => primitive,
+        Err(_) => {
+            return Err(LowerError::Source(unknown_primitive_diagnostic(
+                name, location,
+            )?));
+        }
+    };
     if !descriptors(primitive).any(|descriptor| descriptor.parameters.len() == operands.len()) {
         return validate_arity(name, operands.len(), location).and_then(|()| {
             Err(LowerError::Source(Error::new(
@@ -1517,12 +1635,11 @@ fn select_descriptor(
             .max()
             .unwrap_or(0);
         let first_unsupported = (matched_prefix + 1).min(operands.len());
+        let message = unsupported_signature_message(name, first_unsupported, diagnostics)?;
         let mut error = Error::new(
             ErrorKind::TypeError,
             operands[first_unsupported - 1].parts().6,
-            format!(
-                "{name} arguments do not match an accepted signature; first unsupported argument is {first_unsupported}"
-            ),
+            message,
         );
         error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
         error.argument_position = Some(first_unsupported);
@@ -2041,6 +2158,50 @@ mod tests {
         let deep_tuple = must_source_error("inc [[[[1]]]]\n");
         assert_eq!(deep_tuple.kind, ErrorKind::TypeError);
         assert_eq!(deep_tuple.argument_position, Some(1));
+    }
+
+    #[test]
+    fn unsupported_signature_diagnostic_allocation_refusal_is_explicit() {
+        let source = "inc[true]\n";
+        let program = match parse(source) {
+            Ok(program) => program,
+            Err(error) => panic!("parse failed: {error:?}"),
+        };
+        let result = lower_program_with_builder_and_diagnostics(
+            source,
+            "<source>",
+            &program,
+            RawProgramBuilder::new(),
+            DiagnosticReservations { refuse_next: true },
+        );
+        assert!(matches!(
+            result,
+            Err(LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Type,
+            }))
+        ));
+    }
+
+    #[test]
+    fn static_shape_diagnostic_allocation_refusal_is_explicit() {
+        let source = "add[(1 2) (3 4 5)]\n";
+        let program = match parse(source) {
+            Ok(program) => program,
+            Err(error) => panic!("parse failed: {error:?}"),
+        };
+        let result = lower_program_with_builder_and_diagnostics(
+            source,
+            "<source>",
+            &program,
+            RawProgramBuilder::new(),
+            DiagnosticReservations { refuse_next: true },
+        );
+        assert!(matches!(
+            result,
+            Err(LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::ShapeCheck,
+            }))
+        ));
     }
 
     #[test]
