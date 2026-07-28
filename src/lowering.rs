@@ -260,14 +260,30 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
             })
         })?;
     }
-    let mut error = Error::new(
-        ErrorKind::ArityError,
-        location,
-        format!(
-            "{name} received {actual} argument(s); accepted arity{} {accepted_text}",
-            if accepted.len() == 1 { "" } else { " values" },
-        ),
-    );
+    let message_capacity = name
+        .len()
+        .checked_add(accepted_text.len())
+        .and_then(|length| length.checked_add(128))
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::Node,
+        }))?;
+    let mut message = String::new();
+    message.try_reserve_exact(message_capacity).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    write!(
+        &mut message,
+        "{name} received {actual} argument(s); accepted arity{} {accepted_text}",
+        if accepted.len() == 1 { "" } else { " values" },
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    let mut error = Error::new(ErrorKind::ArityError, location, message);
     error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
     error.actual_arity = Some(actual);
     error.expected_arity = accepted;
