@@ -2,7 +2,7 @@ use crate::ScalarType;
 use std::collections::TryReserveError;
 
 pub const SUPPORTED_SEMANTIC_MAJOR: u16 = 1;
-pub const SUPPORTED_SEMANTIC_MINOR: u16 = 0;
+pub const SUPPORTED_SEMANTIC_MINOR: u16 = 1;
 
 macro_rules! index_type {
     ($name:ident) => {
@@ -64,6 +64,7 @@ pub enum Feature {
     Tuples = 2,
     PrefixSpread = 3,
     FanOut = 4,
+    BackendNativeMathV1 = 7,
 }
 
 impl Feature {
@@ -481,7 +482,7 @@ impl RawProgramBuilder {
             raw: RawProgram {
                 module: ModuleMetadata {
                     semantic_major: SUPPORTED_SEMANTIC_MAJOR,
-                    semantic_minor: SUPPORTED_SEMANTIC_MINOR,
+                    semantic_minor: 0,
                     parameter_header_origin: None,
                     ranges: ProgramRanges::default(),
                 },
@@ -514,6 +515,10 @@ impl RawProgramBuilder {
 
     pub fn set_parameter_header_origin(&mut self, origin: OriginIndex) {
         self.raw.module.parameter_header_origin = Some(origin);
+    }
+
+    pub(crate) fn set_semantic_minor(&mut self, semantic_minor: u16) {
+        self.raw.module.semantic_minor = semantic_minor;
     }
 
     pub(crate) fn finish_preview_type_elements(&self) -> Result<u32, BuildError> {
@@ -643,6 +648,7 @@ fn verify_program(
             Feature::Tuples.numeric(),
             Feature::PrefixSpread.numeric(),
             Feature::FanOut.numeric(),
+            Feature::BackendNativeMathV1.numeric(),
         ]
         .contains(&feature)
         {
@@ -662,6 +668,19 @@ fn verify_program(
             ));
         }
         previous_feature = Some(feature);
+    }
+    if program.module.semantic_minor == 0
+        && program
+            .features
+            .binary_search(&Feature::BackendNativeMathV1.numeric())
+            .is_ok()
+    {
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "semantic_version",
+        ));
     }
     verify_module_ranges(program)?;
     verify_parameters(program)?;
@@ -2681,11 +2700,27 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             .edges
             .iter()
             .any(|edge| matches!(edge.access, ValueAccess::FanOutOperandBorrow));
+    let needs_backend_native_math = program.nodes.iter().any(|node| {
+        matches!(
+            node.kind,
+            NodeKind::SelectedApply {
+                primitive_id,
+                ..
+            } if crate::semantic_registry::is_backend_native_math_primitive(
+                primitive_id
+            )
+        )
+    });
     for (required, needed, field) in [
         (Feature::StableSemanticIds, needs_ids, "stable_semantic_ids"),
         (Feature::Tuples, needs_tuples, "tuples"),
         (Feature::PrefixSpread, needs_spread, "prefix_spread"),
         (Feature::FanOut, needs_fan_out, "fan_out"),
+        (
+            Feature::BackendNativeMathV1,
+            needs_backend_native_math,
+            "backend_native_math_v1",
+        ),
     ] {
         if needed && !has_feature(program, required) {
             return Err(malformed(

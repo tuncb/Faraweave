@@ -297,6 +297,13 @@ floating-point behavior. These kernel semantics belong to the selected
 implementation identity; a backend must not infer them from the primitive
 source name.
 
+The identities reserved by the
+[backend-native math v1 policy](backend-native-math-v1.md) are the sole narrow
+exception to exact finite-result bit parity. Their portable special values,
+operation-specific finite envelopes, direct Rust/C calls, mandatory feature,
+floating-state isolation, and exact surrounding nonnumeric behavior are
+normative parts of `FWIR-SEM-008`.
+
 ## 9. Direct calls and one-level tuple spreading (`FWIR-SEM-009`)
 
 Direct bracket calls preserve every syntactic argument as one semantic
@@ -654,7 +661,7 @@ maps every wire field and invariant in
 | `FWIR-SEM-005` | `rust:tests/parity_contracts.rs::canonical_binary64_format_boundaries`<br>`rust:tests/resource_contracts.rs::typed_api_rejects_noncanonical_nan_without_normalizing_it`<br>`rust:tests/resource_contracts.rs::resource_observer_reports_commit_refusal_and_cleanup_order` |
 | `FWIR-SEM-006` | `rust:src/parser.rs::parses_literals_calls_tuples_parameters_and_fanout`<br>`rust:tests/parity_contracts.rs::deep_unary_programs_use_iterative_parse_analysis_and_evaluation` |
 | `FWIR-SEM-007` | `rust:src/semantic_registry.rs::production_registry_is_complete_and_numeric_lookups_are_checked`<br>`rust:src/c_emitter.rs::every_selected_id_emits_a_direct_kernel_symbol_without_type_redispatch` |
-| `FWIR-SEM-008` | `rust:tests/parity_contracts.rs::checked_arithmetic_has_no_partial_result`<br>`rust:tests/resource_contracts.rs::vector_tuple_and_work_limits_cover_zero_exact_and_one_past`<br>`rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct` |
+| `FWIR-SEM-008` | `rust:tests/parity_contracts.rs::checked_arithmetic_has_no_partial_result`<br>`rust:tests/resource_contracts.rs::vector_tuple_and_work_limits_cover_zero_exact_and_one_past`<br>`rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_rust_reference_vectors_meet_policy`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_special_values_and_rounding_are_exact`<br>`command:strict-c11-journey` |
 | `FWIR-SEM-009` | `rust:tests/parity_contracts.rs::tup_structural_format_spread_and_direct_preservation`<br>`rust:src/evaluator.rs::lifting_and_tuples_are_canonical` |
 | `FWIR-SEM-010` | `rust:tests/resource_contracts.rs::tuple_allocation_ordinals_exclude_empty_tables_and_cleanup_failures`<br>`rust:tests/resource_contracts.rs::live_limit_observes_children_before_outer_tuple_admission`<br>`rust:tests/parity_contracts.rs::deep_structural_values_and_types_format_and_drop_iteratively` |
 | `FWIR-SEM-011` | `rust:tests/parity_contracts.rs::fan_stable_id_matrix`<br>`rust:src/lowering.rs::fan_out_prefix_placeholder_borrows_prepare_and_preserves_elements`<br>`rust:src/c_emitter.rs::public_generated_c_matches_direct_ir_for_success_and_failure_corpus` |
