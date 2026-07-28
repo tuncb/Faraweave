@@ -409,6 +409,64 @@ fn cli_repl_ignores_comment_only_lines() {
 }
 
 #[test]
+fn cli_repl_exit_accepts_exact_whitespace_crlf_and_preserves_eof_success() {
+    for input in [
+        b".exit\n".as_slice(),
+        b" \t.exit\t \r\n".as_slice(),
+        b".exit\r\ninc 5\r\n".as_slice(),
+        b"".as_slice(),
+    ] {
+        let mut child = Command::new(binary())
+            .arg("repl")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn REPL");
+        let mut stdin = child.stdin.take().expect("REPL stdin");
+        stdin.write_all(input).expect("REPL transcript");
+        drop(stdin);
+
+        let result = child.wait_with_output().expect("REPL output");
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"> ");
+        assert!(result.stderr.is_empty());
+    }
+}
+
+#[test]
+fn cli_repl_exit_rejects_case_arguments_prefixes_and_source_comments() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut stdin = child.stdin.take().expect("REPL stdin");
+    stdin
+        .write_all(
+            b"# .exit is comment text\n.EXIT\n.Exit\n.exit-now\n.exit argument\n\
+              .exit # trailing comment\n.exit#adjacent-comment\ninc 5\n.exit\ninc 6\n",
+        )
+        .expect("REPL transcript");
+    drop(stdin);
+
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > > > > > > > 6\n> ");
+    assert_eq!(
+        result.stderr,
+        b"<repl>:1:1: MalformedLiteral: malformed scalar literal\n\
+          <repl>:1:1: MalformedLiteral: malformed scalar literal\n\
+          <repl>:1:1: MalformedLiteral: malformed scalar literal\n\
+          <repl>:1:1: MalformedLiteral: malformed scalar literal\n\
+          <repl>:1:1: MalformedLiteral: malformed scalar literal\n\
+          <repl>:1:1: MalformedLiteral: malformed scalar literal\n"
+    );
+}
+
+#[test]
 fn cli_run_is_extension_agnostic_and_transactional() {
     let directory = unique("run");
     fs::create_dir_all(&directory).expect("mkdir");
