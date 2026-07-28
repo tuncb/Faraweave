@@ -390,6 +390,17 @@ def decode_sectioned_example(data: bytes) -> dict:
             struct.unpack("<HHI", payloads["MODL"]),
         )
     )
+    features = []
+    for feature_id, feature_class, feature_reserved in struct.iter_unpack(
+        "<HBB", payloads.get("FEAT", b"")
+    ):
+        if feature_reserved != 0 or feature_class not in (0, 1):
+            raise ValueError("noncanonical feature record")
+        if feature_id in (1, 2, 3, 4) and feature_class != 0:
+            raise ValueError("known feature must use mandatory class")
+        if feature_class == 0:
+            features.append({"id": feature_id, "class": feature_class})
+    semantic["features"] = features
     strings = []
     if "STRS" in payloads:
         value = payloads["STRS"]
@@ -681,6 +692,7 @@ def main() -> int:
         )
         comparable_keys = (
             "module",
+            "features",
             "strings",
             "source_units",
             "types",
@@ -701,6 +713,16 @@ def main() -> int:
             if file_bytes != value:
                 raise ValueError(f"{expected} differs from the specification model")
             decode_sectioned_example(file_bytes)
+    hostile = empty_program()
+    hostile["features"] = [{"id": 1, "class": 1}]
+    try:
+        decode_sectioned_example(encode_sectioned(hostile))
+    except ValueError as error:
+        if str(error) != "known feature must use mandatory class":
+            raise
+        print("hostile-known-feature-as-advisory: rejected")
+    else:
+        raise ValueError("known feature ID with advisory class was accepted")
     return 0
 
 

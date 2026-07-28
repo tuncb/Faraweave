@@ -116,7 +116,9 @@ mandatory semantic feature and class `1` is optional advisory metadata.
 Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`, and
-`4=FanOut`; zero is invalid.
+`4=FanOut`; zero is invalid. IDs 1 through 4 are semantic capabilities and
+MUST have class `0`: pairing a known current ID with class `1` is a
+`NonCanonicalRecord` error rather than an advisory feature.
 
 `STRS` begins with `count:u32`, followed by `count` descriptors
 `offset:u32, length:u32`, followed by one concatenated byte area. Offsets are
@@ -286,8 +288,10 @@ Unknown mandatory feature IDs are rejected before `RawProgram` construction.
 Unknown class-1 advisory feature IDs may be skipped. Unknown feature classes,
 node kinds, type kinds, scalar types, access modes, conversions, ownership
 modes, release kinds, primitive IDs, signature IDs, or implementation IDs are
-always rejected. Optionality is granted only by the feature/section class, not
-by an unknown enum value inside a known semantic record.
+always rejected. A known feature ID with class `1` is likewise rejected as
+`NonCanonicalRecord`; optionality is granted only to an unknown feature ID
+explicitly marked class `1`, not to a known semantic capability or an unknown
+enum value inside a known semantic record.
 
 The v1 public decoder is strict for every known v1.0 field: wrong order,
 redundant empty known sections, unused strings, or a known advisory section
@@ -322,7 +326,8 @@ deterministic physical-validation sequence:
    total-record limits;
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
-7. validate every reserved byte, tag, boolean, optional sentinel, unused
+7. validate every reserved byte, feature ID/class pair (including rejecting
+   class `1` on known IDs 1 through 4), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after

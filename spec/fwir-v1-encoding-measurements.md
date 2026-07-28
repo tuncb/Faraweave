@@ -20,8 +20,8 @@ an estimate, but excludes schema and generated/runtime code from the artifact.
 | scalar-true | 422 | 840 | 121 |
 | 1,000 scalar roots | 76,346 | 245,271 | 55,684 |
 
-The sectioned example decoder in the harness has 141 nonblank source lines and
-11 explicit branch/loop AST nodes. That proxy deliberately excludes the
+The sectioned example decoder in the harness has 152 nonblank source lines and
+15 explicit branch/loop AST nodes. That proxy deliberately excludes the
 semantic verifier shared by all three choices and excludes library internals
 for JSON and Protobuf, so it is not presented as total production LOC.
 Fixed-width records let a Rust or strict-C11 decoder validate each
@@ -57,3 +57,8 @@ uses the published wire algorithm so reproduction does not depend on it;
 used to choose the format because a complete hostile-input decoder does not
 exist until issue #12; comparing partial decoders would create misleading
 performance evidence.
+
+The `examples` command also constructs a hostile `FEAT{id=1,class=1}` artifact
+and confirms that the independent decoder rejects the known semantic feature
+masquerading as advisory. This is executable decision evidence, not a
+production codec or documentation test.
