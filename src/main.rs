@@ -387,7 +387,11 @@ fn repl() -> Result<(), ()> {
                 clear_repl_terminal();
                 continue;
             }
-            repl_terminal::ReplInputKind::Evaluate => {}
+            repl_terminal::ReplInputKind::Evaluate => {
+                if line.trim_start_matches([' ', '\t']).starts_with('#') {
+                    continue;
+                }
+            }
         }
         match evaluate_expression(&line) {
             Ok(result) => {

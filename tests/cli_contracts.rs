@@ -327,6 +327,26 @@ fn cli_repl_cls_is_crlf_exact_non_evaluating_and_redirect_safe() {
 }
 
 #[test]
+fn cli_repl_ignores_comment_only_lines() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut input = child.stdin.take().expect("REPL stdin");
+    input
+        .write_all("# comment-only\n \t# utf8 🦀\r\ninc 5\n".as_bytes())
+        .expect("REPL transcript");
+    drop(input);
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > > 6\n> ");
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
 fn cli_run_is_extension_agnostic_and_transactional() {
     let directory = unique("run");
     fs::create_dir_all(&directory).expect("mkdir");

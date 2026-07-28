@@ -91,6 +91,7 @@ enum TokenKind {
     Placeholder,
     At,
     Space,
+    Comment,
     Newline,
     MalformedLiteral,
     RangeLiteral,
@@ -119,10 +120,7 @@ pub(crate) fn parse(source: &str) -> Result<Program, Error> {
 fn parse_deep_unary_chain(tokens: &[Token]) -> Option<Result<Program, Error>> {
     const COMPACT_DEPTH: usize = 128;
     let mut first = 0usize;
-    while matches!(
-        tokens.get(first).map(|token| token.kind),
-        Some(TokenKind::Space | TokenKind::Newline)
-    ) {
+    while tokens.get(first).is_some_and(|token| is_trivia(token.kind)) {
         first += 1;
     }
 
@@ -152,10 +150,7 @@ fn parse_prefix_chain(
     let leaf_token = tokens.get(index)?;
     let leaf = leaf_token.value.clone()?;
     index += 1;
-    while matches!(
-        tokens.get(index).map(|token| token.kind),
-        Some(TokenKind::Space | TokenKind::Newline)
-    ) {
+    while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
         index += 1;
     }
     if index != tokens.len() {
@@ -199,10 +194,7 @@ fn parse_bracket_chain(
     {
         names.push(tokens[index].clone());
         index += 2;
-        while matches!(
-            tokens.get(index).map(|token| token.kind),
-            Some(TokenKind::Space | TokenKind::Newline)
-        ) {
+        while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
             index += 1;
         }
     }
@@ -223,10 +215,7 @@ fn parse_bracket_chain(
         return Some(Err(parser_allocation_error(leaf_token.span.begin)));
     }
     for name in names.into_iter().rev() {
-        while matches!(
-            tokens.get(index).map(|token| token.kind),
-            Some(TokenKind::Space | TokenKind::Newline)
-        ) {
+        while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
             index += 1;
         }
         let Some(close) = tokens.get(index) else {
@@ -259,10 +248,7 @@ fn parse_bracket_chain(
         });
         index += 1;
     }
-    while matches!(
-        tokens.get(index).map(|token| token.kind),
-        Some(TokenKind::Space | TokenKind::Newline)
-    ) {
+    while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
         index += 1;
     }
     if index != tokens.len() {
@@ -323,10 +309,7 @@ fn single_root_unary_program(
 fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>> {
     const COMPACT_DEPTH: usize = 128;
     let mut index = 0usize;
-    while matches!(
-        tokens.get(index).map(|token| token.kind),
-        Some(TokenKind::Space | TokenKind::Newline)
-    ) {
+    while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
         index += 1;
     }
     let first = index;
@@ -334,10 +317,7 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
     while tokens.get(index).map(|token| token.kind) == Some(TokenKind::LeftBracket) {
         depth += 1;
         index += 1;
-        while matches!(
-            tokens.get(index).map(|token| token.kind),
-            Some(TokenKind::Space | TokenKind::Newline)
-        ) {
+        while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
             index += 1;
         }
     }
@@ -362,10 +342,7 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
     let mut closed = 0usize;
     let mut closing_end = leaf_token.span.end;
     while closed < depth {
-        while matches!(
-            tokens.get(index).map(|token| token.kind),
-            Some(TokenKind::Space | TokenKind::Newline)
-        ) {
+        while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
             index += 1;
         }
         match tokens.get(index) {
@@ -402,10 +379,7 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
             Some(_) => return None,
         }
     }
-    while matches!(
-        tokens.get(index).map(|token| token.kind),
-        Some(TokenKind::Space | TokenKind::Newline)
-    ) {
+    while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
         index += 1;
     }
     if index != tokens.len() {
@@ -488,6 +462,19 @@ fn tokenize(source: &str) -> Vec<Token> {
                 &source[begin.offset - 1..location.offset - 1],
                 None,
             ));
+            continue;
+        }
+        if byte == b'#' {
+            advance_ascii(&mut location);
+            index += 1;
+            while index < bytes.len()
+                && bytes[index] != b'\n'
+                && !(bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n'))
+            {
+                advance_ascii(&mut location);
+                index += 1;
+            }
+            tokens.push(token(TokenKind::Comment, begin, location, "", None));
             continue;
         }
         if byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) == Some(&b'\n')) {
@@ -1014,6 +1001,7 @@ impl Parser {
             ));
         }
         self.index += 1;
+        self.skip_comment_trivia();
         let close = self
             .take()
             .ok_or_else(|| self.eof_error("missing closing delimiter"))?;
@@ -1176,7 +1164,8 @@ impl Parser {
         if matches!(
             self.peek_kind(),
             None | Some(
-                TokenKind::Newline
+                TokenKind::Comment
+                    | TokenKind::Newline
                     | TokenKind::RightParenthesis
                     | TokenKind::RightBracket
                     | TokenKind::RightBrace
@@ -1372,14 +1361,13 @@ impl Parser {
     }
 
     fn skip_spaces(&mut self) {
-        while self.take_if(TokenKind::Space) {}
+        while self.peek_kind().is_some_and(is_horizontal_trivia) {
+            self.index += 1;
+        }
     }
 
     fn skip_newlines_and_spaces(&mut self) {
-        while matches!(
-            self.peek_kind(),
-            Some(TokenKind::Space | TokenKind::Newline)
-        ) {
+        while self.peek_kind().is_some_and(is_trivia) {
             self.index += 1;
         }
     }
@@ -1388,11 +1376,20 @@ impl Parser {
         self.skip_newlines_and_spaces();
     }
 
+    fn skip_comment_trivia(&mut self) {
+        let mut index = self.index;
+        let mut saw_comment = false;
+        while let Some(token) = self.tokens.get(index).filter(|token| is_trivia(token.kind)) {
+            saw_comment |= token.kind == TokenKind::Comment;
+            index += 1;
+        }
+        if saw_comment {
+            self.index = index;
+        }
+    }
+
     fn has_separator(&self) -> bool {
-        matches!(
-            self.peek_kind(),
-            Some(TokenKind::Space | TokenKind::Newline)
-        )
+        self.peek_kind().is_some_and(is_trivia)
     }
 
     fn require_sibling_separator_or_close(&self, close: TokenKind) -> Result<(), Error> {
@@ -1460,6 +1457,14 @@ fn token_scalar_type(kind: TokenKind) -> Option<ScalarType> {
         TokenKind::DoubleType => Some(ScalarType::Double),
         _ => None,
     }
+}
+
+fn is_horizontal_trivia(kind: TokenKind) -> bool {
+    matches!(kind, TokenKind::Space | TokenKind::Comment)
+}
+
+fn is_trivia(kind: TokenKind) -> bool {
+    is_horizontal_trivia(kind) || kind == TokenKind::Newline
 }
 
 fn parameter_syntax_error(
@@ -1693,10 +1698,20 @@ mod tests {
             }
         ));
 
-        for source in ["@ add", "@1", "@", "@@add"] {
+        for source in ["@ add", "@1", "@", "@@add", "@# split\nadd"] {
             let error = parse(source).expect_err(source);
             assert_eq!(error.kind, ErrorKind::SyntaxError, "{source}");
+            assert_eq!(
+                error.message, "expected an adjacent built-in operation name after '@'",
+                "{source}"
+            );
         }
+        let trailing_comment =
+            parse("@add# trailing\n").expect("adjacent reference before comment");
+        assert!(matches!(
+            trailing_comment.roots[0].kind,
+            ExprKind::OperationReference { ref name, .. } if name == "add"
+        ));
         let bare = parse("add").expect("bare name retains old parse");
         assert!(matches!(
             bare.roots[0].kind,
@@ -1760,5 +1775,128 @@ mod tests {
         for source in ["01", "-0", "+1", "1.", ".5"] {
             assert!(parse(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn tokenizes_utf8_comments_without_retaining_their_text() {
+        let source = "1# café\r\n2#終";
+        let tokens = tokenize(source);
+        assert_eq!(
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![
+                TokenKind::Int,
+                TokenKind::Comment,
+                TokenKind::Newline,
+                TokenKind::Int,
+                TokenKind::Comment,
+            ]
+        );
+        let comments = tokens
+            .iter()
+            .filter(|token| token.kind == TokenKind::Comment)
+            .collect::<Vec<_>>();
+        assert!(comments.iter().all(|token| token.spelling.is_empty()));
+        assert_eq!(
+            comments[0].span.begin.offset,
+            source.find('#').unwrap_or(0) + 1
+        );
+        assert_eq!(
+            comments[0].span.end.offset,
+            source.find('\r').unwrap_or(0) + 1
+        );
+        assert_eq!(comments[1].span.end.offset, source.len() + 1);
+        assert_eq!(tokens[2].span.begin.line, 1);
+        assert_eq!(tokens[3].span.begin.line, 2);
+    }
+
+    #[test]
+    fn comments_are_trivia_in_headers_delimiters_fanout_and_at_eof() {
+        let source = "# prologue\r\n\
+                      parameters[# header\n\
+                      n# name\n\
+                       Int # type\n\
+                      ]# header tail\n\
+                      add[# arguments\n\
+                      n# adjacent\n\
+                       1]# root tail\n\
+                      fanout[# operand\n\
+                      n # branch separator\n\
+                       {inc[# branch body\n\
+                      _]} # fanout tail\n\
+                      ]\n\
+                      # comentário final";
+        let program = parse(source).expect("comments are accepted as trivia");
+        assert_eq!(program.parameters.len(), 1);
+        assert_eq!(program.roots.len(), 2);
+    }
+
+    #[test]
+    fn typed_empty_vectors_accept_comment_trivia_and_preserve_close_diagnostics() {
+        for (source, expected_type) in [
+            ("Bool(# LF\n)", ScalarType::Bool),
+            ("Int( # CRLF\r\n )", ScalarType::Int),
+            ("Double(\n# UTF-8 🦀\n)", ScalarType::Double),
+        ] {
+            let program = parse(source).expect("commented typed empty");
+            let root = program.roots.first().expect("typed empty root");
+            match &root.kind {
+                ExprKind::Vector(actual_type, values) => {
+                    assert_eq!(*actual_type, expected_type);
+                    assert!(values.is_empty());
+                }
+                _ => panic!("expected typed empty vector"),
+            }
+            assert_eq!(root.span.begin.offset, 1);
+            assert_eq!(root.span.end.offset, source.len() + 1);
+        }
+
+        let eof_source = "Int(# no close";
+        let eof_error = parse(eof_source).expect_err("commented typed empty missing close");
+        assert_eq!(eof_error.kind, ErrorKind::SyntaxError);
+        assert_eq!(eof_error.message, "missing closing delimiter");
+        let eof_span = eof_error.span.expect("missing close insertion span");
+        assert_eq!(eof_span.begin.offset, eof_source.len() + 1);
+        assert_eq!(eof_span.begin, eof_span.end);
+
+        let invalid_close = parse("Bool(# comment\r\n]").expect_err("invalid typed empty close");
+        assert_eq!(invalid_close.kind, ErrorKind::SyntaxError);
+        assert_eq!(
+            invalid_close.message,
+            "vector elements must be scalar literals"
+        );
+        let invalid_span = invalid_close.span.expect("invalid close type span");
+        assert_eq!(invalid_span.begin.offset, 1);
+        assert_eq!(invalid_span.end.offset, 5);
+
+        let whitespace_only = parse("Int( )").expect_err("whitespace-only typed empty");
+        assert_eq!(whitespace_only.kind, ErrorKind::SyntaxError);
+        assert_eq!(
+            whitespace_only.message,
+            "vector elements must be scalar literals"
+        );
+        let whitespace_span = whitespace_only.span.expect("whitespace type span");
+        assert_eq!(whitespace_span.begin.offset, 1);
+        assert_eq!(whitespace_span.end.offset, 4);
+    }
+
+    #[test]
+    fn eof_comment_preserves_missing_delimiter_insertion_span() {
+        let source = "inc[1# no close 🦀";
+        let error = parse(source).expect_err("missing close");
+        assert_eq!(error.kind, ErrorKind::SyntaxError);
+        assert_eq!(error.message, "expected an expression");
+        let span = error.span.expect("insertion span");
+        assert_eq!(span.begin.offset, source.len() + 1);
+        assert_eq!(span.begin, span.end);
+    }
+
+    #[test]
+    fn no_comment_diagnostic_is_unchanged() {
+        let error = parse("inc[1").expect_err("missing close");
+        assert_eq!(error.kind, ErrorKind::SyntaxError);
+        assert_eq!(error.message, "missing closing delimiter");
+        let span = error.span.expect("insertion span");
+        assert_eq!(span.begin.offset, 6);
+        assert_eq!(span.begin, span.end);
     }
 }

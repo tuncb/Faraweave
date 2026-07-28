@@ -2214,7 +2214,11 @@ mod tests {
 
     #[test]
     fn operation_references_are_rejected_outside_registered_consumer_positions() {
-        for (source, offset) in [("@add\n", 2), ("add[@add 1]\n", 6)] {
+        for (source, offset) in [
+            ("@add\n", 2),
+            ("@add# trailing comment\n", 2),
+            ("add[@add 1]\n", 6),
+        ] {
             let error = must_source_error(source);
             assert_eq!(error.kind, ErrorKind::SyntaxError, "{source}");
             assert_eq!(error.location.offset, offset, "{source}");
