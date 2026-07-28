@@ -2223,6 +2223,62 @@ mod tests {
         panic!("section {wanted} missing")
     }
 
+    fn replace_test_section(bytes: &[u8], wanted: u16, replacement: Option<&[u8]>) -> Vec<u8> {
+        let count = test_u32(bytes, 20) as usize;
+        let mut sections = Vec::new();
+        let mut found = false;
+        for index in 0..count {
+            let entry_offset = 32 + index * 24;
+            let entry = bytes[entry_offset..entry_offset + 24].to_vec();
+            let id = test_u16(&entry, 0);
+            let payload_offset = test_u64(&entry, 8) as usize;
+            let payload_length = test_u64(&entry, 16) as usize;
+            let payload = if id == wanted {
+                found = true;
+                match replacement {
+                    Some(value) => value.to_vec(),
+                    None => continue,
+                }
+            } else {
+                bytes[payload_offset..payload_offset + payload_length].to_vec()
+            };
+            sections.push((entry, payload));
+        }
+        assert!(found, "section {wanted} missing from test artifact");
+
+        let mut rebuilt = bytes[..32].to_vec();
+        put_u32_at(&mut rebuilt, 20, sections.len() as u32);
+        let mut payload_offset = 32 + sections.len() * 24;
+        for (entry, payload) in &mut sections {
+            put_u64_at(entry, 8, payload_offset as u64);
+            put_u64_at(entry, 16, payload.len() as u64);
+            rebuilt.extend_from_slice(entry);
+            payload_offset += payload.len();
+        }
+        for (_, payload) in sections {
+            rebuilt.extend_from_slice(&payload);
+        }
+        rebuilt
+    }
+
+    fn assert_noncanonical_record(
+        bytes: &[u8],
+        field: &'static str,
+        offset: usize,
+        section_id: u16,
+        record_index: Option<u32>,
+    ) {
+        assert_eq!(
+            decode_fwir(bytes, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::NonCanonicalRecord { field },
+                offset: offset as u64,
+                section_id: Some(section_id),
+                record_index,
+            })
+        );
+    }
+
     fn empty_with_extension(minor: u16, flags: u16) -> Vec<u8> {
         let empty = example_bytes("empty");
         let mut bytes = empty[..32].to_vec();
@@ -2775,16 +2831,157 @@ mod tests {
 
         let mut unknown_plan = explicit;
         put_u16_at(&mut unknown_plan, explicit_plans + 4, 99);
-        assert!(matches!(
+        assert_eq!(
             decode_fwir(&unknown_plan, &FwirDecodeLimits::default()),
             Err(FwirDecodeError {
                 kind: FwirDecodeErrorKind::NonCanonicalRecord {
                     field: "application_plan_id"
                 },
+                offset: (explicit_plans + 4) as u64,
                 section_id: Some(17),
-                ..
+                record_index: Some(0),
             })
+        );
+    }
+
+    #[test]
+    fn application_plan_section_presence_count_and_node_mapping_errors_are_exact() {
+        let explicit_one = must(encode_fwir(
+            &planned_program(1, true),
+            &FwirEncodeOptions::default(),
         ));
+        let (_, features, features_length) = test_section(&explicit_one, 2);
+        let mut retained_features = Vec::new();
+        for record in explicit_one[features..features + features_length].chunks_exact(4) {
+            if test_u16(record, 0) != Feature::ApplicationPlans.numeric() {
+                retained_features.extend_from_slice(record);
+            }
+        }
+        let section_without_feature =
+            replace_test_section(&explicit_one, 2, Some(&retained_features));
+        let (_, plans_without_feature, _) = test_section(&section_without_feature, 17);
+        assert_noncanonical_record(
+            &section_without_feature,
+            "application_plans_feature",
+            plans_without_feature,
+            17,
+            Some(0),
+        );
+
+        let missing_section = replace_test_section(&explicit_one, 17, None);
+        let (_, missing_section_nodes, _) = test_section(&missing_section, 14);
+        assert_noncanonical_record(
+            &missing_section,
+            "missing_application_plans",
+            missing_section_nodes,
+            17,
+            None,
+        );
+
+        let explicit_two = must(encode_fwir(
+            &planned_program(2, true),
+            &FwirEncodeOptions::default(),
+        ));
+        let (_, plans, plans_length) = test_section(&explicit_two, 17);
+        assert_eq!(plans_length, 16);
+        let count_mismatch =
+            replace_test_section(&explicit_two, 17, Some(&explicit_two[plans..plans + 8]));
+        let (_, mismatched_plans, _) = test_section(&count_mismatch, 17);
+        assert_noncanonical_record(
+            &count_mismatch,
+            "application_plan_count",
+            mismatched_plans,
+            17,
+            Some(0),
+        );
+
+        let plan_records = &explicit_two[plans..plans + plans_length];
+        let first_node = test_u32(plan_records, 0);
+        let second_node = test_u32(plan_records, 8);
+        assert!(first_node < second_node);
+
+        let mut out_of_order_records = plan_records.to_vec();
+        put_u32_at(&mut out_of_order_records, 0, second_node);
+        put_u32_at(&mut out_of_order_records, 8, first_node);
+        let out_of_order = replace_test_section(&explicit_two, 17, Some(&out_of_order_records));
+        let (_, out_of_order_plans, _) = test_section(&out_of_order, 17);
+        assert_noncanonical_record(
+            &out_of_order,
+            "application_plan_node",
+            out_of_order_plans,
+            17,
+            Some(0),
+        );
+
+        let mut duplicate_records = plan_records.to_vec();
+        put_u32_at(&mut duplicate_records, 8, first_node);
+        let duplicate = replace_test_section(&explicit_two, 17, Some(&duplicate_records));
+        let (_, duplicate_plans, _) = test_section(&duplicate, 17);
+        assert_noncanonical_record(
+            &duplicate,
+            "application_plan_node",
+            duplicate_plans + 8,
+            17,
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn application_plan_record_identity_and_version_errors_are_exact() {
+        let explicit = must(encode_fwir(
+            &planned_program(1, true),
+            &FwirEncodeOptions::default(),
+        ));
+        let (_, plans, _) = test_section(&explicit, 17);
+
+        let mut reserved = explicit.clone();
+        reserved[plans + 6] = 1;
+        assert_noncanonical_record(&reserved, "reserved", plans + 6, 17, Some(0));
+
+        let mut known_mismatch = explicit.clone();
+        put_u16_at(&mut known_mismatch, plans + 4, 2);
+        assert_noncanonical_record(
+            &known_mismatch,
+            "application_plan_id",
+            plans + 4,
+            17,
+            Some(0),
+        );
+
+        let mut physical_minor_zero = explicit.clone();
+        put_u16_at(&mut physical_minor_zero, 10, 0);
+        let (_, features, features_length) = test_section(&physical_minor_zero, 2);
+        let application_plan_feature = physical_minor_zero[features..features + features_length]
+            .chunks_exact(4)
+            .position(|record| test_u16(record, 0) == Feature::ApplicationPlans.numeric())
+            .unwrap_or_else(|| panic!("application-plans feature missing"));
+        assert_noncanonical_record(
+            &physical_minor_zero,
+            "feature_format_minor",
+            features + application_plan_feature * 4,
+            2,
+            u32::try_from(application_plan_feature).ok(),
+        );
+
+        let mut semantic_minor_zero = explicit;
+        let (_, module, _) = test_section(&semantic_minor_zero, 1);
+        put_u16_at(&mut semantic_minor_zero, module + 2, 0);
+        assert_eq!(
+            decode_fwir(&semantic_minor_zero, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                    crate::MalformedProgram {
+                        invariant: crate::Invariant::UnsupportedVersion,
+                        record: crate::RecordKind::Module,
+                        index: None,
+                        field: "application_plans",
+                    }
+                )),
+                offset: 0,
+                section_id: None,
+                record_index: None,
+            })
+        );
     }
 
     #[test]

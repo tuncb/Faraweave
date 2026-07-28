@@ -1920,6 +1920,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "canonical-producer",
         "compat-forward-minor",
         "compat-advisory-feature",
+        "canonical-application-plans",
     ]);
     let behavioral_evidence = BTreeSet::from([
         ("header.section_count", "section-count-limit"),
@@ -1949,6 +1950,19 @@ fn traceability_references_complete_executable_evidence_sets() {
         ("decoder.no_backend_before_verify", "public-backend-gate"),
         ("canonical.byte_identity", "corpus-hash"),
         ("canonical.host_neutral", "corpus-host-neutral"),
+        (
+            "appl.feature_required",
+            "application-plan-section-without-feature",
+        ),
+        ("appl.section_required", "application-plan-section-missing"),
+        ("appl.record_count", "application-plan-count"),
+        ("appl.node_order", "application-plan-node-order"),
+        ("appl.node_unique", "application-plan-node-duplicate"),
+        ("appl.reserved", "application-plan-reserved"),
+        ("appl.plan_id_known", "application-plan-id-unknown"),
+        ("appl.implementation_match", "application-plan-id-mismatch"),
+        ("appl.format_minor", "application-plan-format-minor"),
+        ("appl.semantic_minor", "application-plan-semantic-minor"),
         ("surfaces.source_memory_decoded", "differential-runtime"),
         ("surfaces.c_native", "strict-native-journey"),
         (
@@ -1996,6 +2010,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "shck.",
         "bran.",
         "node.",
+        "appl.",
         "ownr.",
         "root.",
         "prod.",
