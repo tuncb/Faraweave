@@ -1,8 +1,9 @@
 use faraweave::{
-    AllocationFailureInjection, ArgumentErrorReason, Error, ErrorKind, EvaluationConfiguration,
-    ExecutionProfile, ParameterErrorReason, ResourceErrorReason, ResourceLimits, Value,
-    emit_c_source_with_configuration, evaluate_expression, evaluate_expression_with_configuration,
-    evaluate_source, evaluate_source_with_arguments, evaluate_source_with_configuration,
+    AllocationFailureInjection, ArgumentErrorReason, DomainErrorReason, Error, ErrorKind,
+    EvaluationConfiguration, ExecutionProfile, ParameterErrorReason, ResourceErrorReason,
+    ResourceLimits, Value, emit_c_source_with_configuration, evaluate_expression,
+    evaluate_expression_with_configuration, evaluate_source, evaluate_source_with_arguments,
+    evaluate_source_with_configuration,
 };
 use std::sync::Mutex;
 
@@ -416,6 +417,77 @@ fn failure_usage_is_post_cleanup_and_work_remains_monotonic() {
     assert_eq!(usage.live_evaluation_bytes, 0);
     assert_eq!(usage.work_units, 1);
     assert_eq!(usage.allocation_attempts, 2);
+}
+
+#[test]
+fn div_admission_precedes_domain_and_failure_cleanup_is_exact() {
+    let scalar = evaluate_expression("div[1 0]").expect_err("scalar division domain");
+    assert_eq!(scalar.kind, ErrorKind::DomainError);
+    assert_eq!(
+        scalar.domain.as_ref().map(|context| context.reason),
+        Some(DomainErrorReason::DivisionByZero)
+    );
+    assert_eq!(
+        scalar.usage,
+        Some(faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 0,
+            work_units: 1,
+            allocation_attempts: 0,
+        })
+    );
+
+    let lifted = evaluate_expression("div[(8 9) (2 0)]").expect_err("lifted division domain");
+    assert_eq!(lifted.kind, ErrorKind::DomainError);
+    assert_eq!(
+        lifted
+            .domain
+            .as_ref()
+            .and_then(|context| context.element_index),
+        Some(1)
+    );
+    assert_eq!(
+        lifted.usage,
+        Some(faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 48,
+            work_units: 2,
+            allocation_attempts: 3,
+        })
+    );
+
+    let work = evaluate_expression_with_configuration(
+        "div[(8 9) (2 0)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(64),
+            max_live_evaluation_bytes: Some(64),
+            max_work_units: Some(1),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("work refusal precedes division domain");
+    assert_eq!(work.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&work).limit_kind, Some("max_work_units"));
+    assert!(work.domain.is_none());
+
+    let allocation = evaluate_expression_with_configuration(
+        "div[(8 9) (2 0)]",
+        EvaluationConfiguration {
+            profile: ExecutionProfile::TrustedLocalV2,
+            limits: ResourceLimits::default(),
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(2),
+            },
+        },
+    )
+    .expect_err("result allocation refusal precedes division domain");
+    assert_eq!(allocation.kind, ErrorKind::ResourceError);
+    assert_eq!(
+        resource(&allocation).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(resource(&allocation).allocation_ordinal, Some(2));
+    assert!(allocation.domain.is_none());
 }
 
 #[test]
