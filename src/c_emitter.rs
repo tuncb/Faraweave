@@ -16,7 +16,7 @@ pub struct CEmissionResult {
     pub source: String,
 }
 
-pub(crate) fn emit_verified_c_program(
+pub fn emit_verified_c_program(
     program: &VerifiedProgram,
     configuration: EvaluationConfiguration,
 ) -> Result<CEmissionResult, Error> {

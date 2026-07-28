@@ -55,6 +55,11 @@ cargo run -- repl
 cargo run -- run examples/rewrite.faraweave
 cargo run -- emit-c examples/rewrite.faraweave -o rewrite.c
 cargo run -- build examples/rewrite.faraweave -o rewrite
+cargo run -- compile-ir examples/rewrite.faraweave -o rewrite.fwir
+cargo run -- inspect-ir rewrite.fwir
+cargo run -- run-ir rewrite.fwir
+cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
+cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
 `emit-c` writes deterministic self-contained strict C11. `build` selects the C
@@ -62,6 +67,22 @@ compiler in this order: explicit `--cc`, `CC`, then `cc` on Unix or `cl.exe` on
 Windows. Compiler values are executable names or paths, not shell fragments.
 Both commands reject source/output aliases, prepare privately, clean temporary
 files after failure, and replace the destination only at publication.
+
+FWIR commands are explicit: `compile-ir` is the only source-to-artifact
+boundary, while `inspect-ir`, `run-ir`, `emit-c-ir`, and `build-ir` accept only
+canonical artifacts that fully decode and verify first. `run-ir` accepts
+parameters after `--`, and `build-ir` accepts the same optional `--cc
+<compiler>` selection as `build`; no command infers source versus FWIR from a
+file extension. Inspection text is deterministic and includes exact binary64
+bits plus the canonical bytes, but it is not executable FWIR.
+
+The library exposes the same phase boundaries through
+`compile_source_to_verified_program`, `compile_source_to_fwir`, `encode_fwir`,
+bounded `decode_fwir`, `inspect_fwir`,
+`evaluate_verified_program_with_arguments`, `emit_c_from_verified_program`,
+and `build_native_from_verified_program`. Named compilation retains a logical
+source name inside the artifact so later execution diagnostics do not depend
+on the artifact's filesystem path.
 
 The parser is extension-agnostic. New examples use `.faraweave`; retained
 `.bennu` fixtures prove arbitrary extensions continue to work.

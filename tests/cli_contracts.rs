@@ -36,6 +36,15 @@ fn cli_help_version_and_unknown_contracts() {
     let help = String::from_utf8(help.stdout).expect("utf8");
     assert!(help.contains("Usage: faraweave"));
     assert!(help.contains("interactive Faraweave session"));
+    for command in [
+        "compile-ir",
+        "inspect-ir",
+        "run-ir",
+        "emit-c-ir",
+        "build-ir",
+    ] {
+        assert!(help.contains(command), "{command}");
+    }
 
     let unknown = Command::new(binary())
         .arg("unknown")
@@ -51,6 +60,227 @@ fn cli_help_version_and_unknown_contracts() {
         .expect("unknown option");
     assert!(!option.status.success());
     assert_eq!(option.stderr, b"error: unknown option '--unknown'\n");
+}
+
+#[test]
+fn cli_explicit_fwir_lifecycle_is_deterministic_and_phase_separated() {
+    let directory = unique("fwir-lifecycle");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("logical source.anything");
+    let artifact = directory.join("program.data");
+    let c_output = directory.join("program.c");
+    fs::write(
+        &source,
+        "parameters[n Int]\n-0.0\ninc[n]\nfanout[iota[n] {inc[_]} {add[_ 10]}]\n",
+    )
+    .expect("source");
+
+    let compiled = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&source)
+        .args(["-o"])
+        .arg(&artifact)
+        .output()
+        .expect("compile IR");
+    assert!(compiled.status.success(), "{:?}", compiled.stderr);
+    assert!(compiled.stdout.is_empty());
+    assert!(compiled.stderr.is_empty());
+
+    let first = Command::new(binary())
+        .arg("inspect-ir")
+        .arg(&artifact)
+        .output()
+        .expect("inspect");
+    let second = Command::new(binary())
+        .arg("inspect-ir")
+        .arg(&artifact)
+        .output()
+        .expect("inspect again");
+    assert!(first.status.success(), "{:?}", first.stderr);
+    assert_eq!(first.stdout, second.stdout);
+    assert!(
+        first
+            .stdout
+            .windows(31)
+            .any(|window| { window == b"DoubleBits(9223372036854775808)" })
+    );
+
+    let run = Command::new(binary())
+        .arg("run-ir")
+        .arg(&artifact)
+        .args(["--", "3"])
+        .output()
+        .expect("run IR");
+    assert!(run.status.success(), "{:?}", run.stderr);
+    assert_eq!(run.stdout, b"-0.0\n4\n[(2 3 4) (11 12 13)]\n");
+
+    let emitted = Command::new(binary())
+        .arg("emit-c-ir")
+        .arg(&artifact)
+        .args(["-o"])
+        .arg(&c_output)
+        .output()
+        .expect("emit C from IR");
+    assert!(emitted.status.success(), "{:?}", emitted.stderr);
+    assert!(
+        fs::read_to_string(&c_output)
+            .expect("C")
+            .contains("/* VerifiedProgram-driven definitions. */")
+    );
+
+    let overflow = Command::new(binary())
+        .arg("run-ir")
+        .arg(&artifact)
+        .args(["--", "9223372036854775807"])
+        .output()
+        .expect("runtime error");
+    assert!(!overflow.status.success());
+    assert!(overflow.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&overflow.stderr)
+            .starts_with(&source.to_string_lossy().to_string()),
+        "{:?}",
+        overflow.stderr
+    );
+
+    let malformed = directory.join("malformed.not-fwir");
+    fs::write(&malformed, b"not FWIR").expect("malformed");
+    let malformed_with_argument = Command::new(binary())
+        .arg("run-ir")
+        .arg(&malformed)
+        .args(["--", "not-an-int"])
+        .output()
+        .expect("malformed before argument");
+    assert!(!malformed_with_argument.status.success());
+    assert!(malformed_with_argument.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&malformed_with_argument.stderr).contains("artifact error"),
+        "{:?}",
+        malformed_with_argument.stderr
+    );
+    assert!(
+        !malformed_with_argument
+            .stderr
+            .starts_with(b"faraweave_argument_error")
+    );
+
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn cli_fwir_outputs_reject_aliases_and_preserve_destinations_on_every_failure() {
+    let directory = unique("fwir-transactions");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("source.faraweave");
+    let artifact = directory.join("program.fwir");
+    fs::write(&source, "inc[41]\n").expect("source");
+    let compiled = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&source)
+        .args(["-o"])
+        .arg(&artifact)
+        .output()
+        .expect("compile");
+    assert!(compiled.status.success(), "{:?}", compiled.stderr);
+
+    let source_before = fs::read(&source).expect("source bytes");
+    let lexical_alias = directory.join("child").join("..").join("source.faraweave");
+    let lexical = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&source)
+        .args(["-o"])
+        .arg(&lexical_alias)
+        .output()
+        .expect("lexical alias");
+    assert!(!lexical.status.success());
+    assert_eq!(fs::read(&source).expect("preserved source"), source_before);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let canonical_alias = directory.join("canonical-source-alias");
+        symlink(&source, &canonical_alias).expect("source symlink");
+        let canonical = Command::new(binary())
+            .arg("compile-ir")
+            .arg(&source)
+            .args(["-o"])
+            .arg(&canonical_alias)
+            .output()
+            .expect("canonical alias");
+        assert!(!canonical.status.success());
+        assert_eq!(
+            fs::read(&source).expect("canonical source preserved"),
+            source_before
+        );
+    }
+
+    let artifact_before = fs::read(&artifact).expect("artifact bytes");
+    let ir_alias = Command::new(binary())
+        .arg("emit-c-ir")
+        .arg(&artifact)
+        .args(["-o"])
+        .arg(&artifact)
+        .output()
+        .expect("artifact alias");
+    assert!(!ir_alias.status.success());
+    assert_eq!(
+        fs::read(&artifact).expect("artifact preserved"),
+        artifact_before
+    );
+
+    let invalid_source = directory.join("invalid.faraweave");
+    let compile_destination = directory.join("existing.fwir");
+    fs::write(&invalid_source, "inc[").expect("invalid source");
+    fs::write(&compile_destination, b"keep-compile").expect("sentinel");
+    let invalid_compile = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&invalid_source)
+        .args(["-o"])
+        .arg(&compile_destination)
+        .output()
+        .expect("invalid compilation");
+    assert!(!invalid_compile.status.success());
+    assert_eq!(
+        fs::read(&compile_destination).expect("compile destination"),
+        b"keep-compile"
+    );
+
+    let malformed = directory.join("malformed.fwir");
+    let c_destination = directory.join("existing.c");
+    fs::write(&malformed, b"bad").expect("malformed");
+    fs::write(&c_destination, b"keep-c").expect("sentinel");
+    let invalid_emit = Command::new(binary())
+        .arg("emit-c-ir")
+        .arg(&malformed)
+        .args(["-o"])
+        .arg(&c_destination)
+        .output()
+        .expect("invalid emit");
+    assert!(!invalid_emit.status.success());
+    assert_eq!(fs::read(&c_destination).expect("C destination"), b"keep-c");
+
+    let native_destination = directory.join(if cfg!(windows) {
+        "existing.exe"
+    } else {
+        "existing"
+    });
+    fs::write(&native_destination, b"keep-native").expect("native sentinel");
+    let failed_build = Command::new(binary())
+        .arg("build-ir")
+        .arg(&artifact)
+        .args(["-o"])
+        .arg(&native_destination)
+        .args(["--cc", "faraweave-compiler-that-does-not-exist"])
+        .env_remove("CC")
+        .output()
+        .expect("compiler failure");
+    assert!(!failed_build.status.success());
+    assert_eq!(
+        fs::read(&native_destination).expect("native destination"),
+        b"keep-native"
+    );
+
+    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -355,6 +585,32 @@ fn cli_windows_long_path_journey() {
         .expect("long-path process");
     assert!(result.status.success(), "{:?}", result.stderr);
     assert_eq!(result.stdout, b"42\n");
+    let artifact = directory.join("program.fwir");
+    let compiled = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&source)
+        .args(["-o"])
+        .arg(&artifact)
+        .output()
+        .expect("long-path compile IR");
+    assert!(compiled.status.success(), "{:?}", compiled.stderr);
+    let run_ir = Command::new(binary())
+        .arg("run-ir")
+        .arg(&artifact)
+        .output()
+        .expect("long-path run IR");
+    assert!(run_ir.status.success(), "{:?}", run_ir.stderr);
+    assert_eq!(run_ir.stdout, b"42\n");
+    let emitted = directory.join("program.c");
+    let emit_ir = Command::new(binary())
+        .arg("emit-c-ir")
+        .arg(&artifact)
+        .args(["-o"])
+        .arg(&emitted)
+        .output()
+        .expect("long-path emit IR");
+    assert!(emit_ir.status.success(), "{:?}", emit_ir.stderr);
+    assert!(emitted.exists());
     fs::remove_dir_all(base).expect("long-path cleanup");
 }
 

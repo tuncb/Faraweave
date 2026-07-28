@@ -715,7 +715,7 @@ fn validate_arguments(raw: &crate::RawProgram, arguments: &[Value]) -> Result<()
     Ok(())
 }
 
-pub(crate) fn decode_verified_arguments(
+pub fn decode_verified_arguments(
     program: &VerifiedProgram,
     arguments: &[&str],
 ) -> Result<Vec<Value>, Error> {

@@ -4,6 +4,7 @@
 mod c_emitter;
 mod error;
 mod evaluator;
+mod fwir_api;
 mod fwir_decoder;
 mod fwir_encoder;
 mod interpreter;
@@ -17,6 +18,7 @@ mod strict_float;
 mod typed_program;
 mod value;
 
+pub use c_emitter::emit_verified_c_program;
 pub use c_emitter::{CEmissionResult, emit_c_source, emit_c_source_with_configuration};
 pub use error::{
     ArgumentErrorContext, ArgumentErrorReason, DomainErrorContext, DomainErrorReason, Error,
@@ -29,6 +31,11 @@ pub use evaluator::{
     evaluate_runner_source, evaluate_source, evaluate_source_with_arguments,
     evaluate_source_with_arguments_and_observer, evaluate_source_with_configuration,
 };
+pub use fwir_api::{
+    CompileFwirError, FwirInspectError, build_native_from_verified_program, compile_source_to_fwir,
+    compile_source_to_fwir_with_name, compile_source_to_verified_program,
+    emit_c_from_verified_program, evaluate_verified_program_with_arguments, inspect_fwir,
+};
 pub use fwir_decoder::{
     FwirDecodeAllocationFailureInjection, FwirDecodeAllocationSite, FwirDecodeError,
     FwirDecodeErrorKind, FwirDecodeLimit, FwirDecodeLimits, decode_fwir,
@@ -39,7 +46,9 @@ pub use fwir_encoder::{
     FwirEncodeOptions, FwirOutputOperation, FwirProducerMetadata, encode_fwir,
     encode_fwir_with_allocation_failure, encode_fwir_with_atomic_publication, write_fwir,
 };
-pub use interpreter::{evaluate_verified_program, evaluate_verified_program_with_observer};
+pub use interpreter::{
+    decode_verified_arguments, evaluate_verified_program, evaluate_verified_program_with_observer,
+};
 pub use native_builder::{
     CompilerConfiguration, CompilerSelection, NativeBuildRequest, NativeBuildResult,
     NativePlatform, build_native, make_c_compiler_arguments, native_platform,

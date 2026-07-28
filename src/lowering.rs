@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::parser::parse;
 use crate::parser::{CallSyntax, Expr, ExprKind, Program, validate_parameter_declarations};
 use crate::primitive::analyze_for_lowering;
@@ -112,31 +111,46 @@ struct TupleElement {
 
 #[cfg(test)]
 pub(crate) fn compile_source(source: &str) -> Result<VerifiedProgram, CompileError> {
-    compile(source)
+    compile_source_with_name(source, "<source>")
 }
 
-#[cfg(test)]
-fn compile(source: &str) -> Result<VerifiedProgram, LowerError> {
+pub(crate) fn compile_source_with_name(
+    source: &str,
+    diagnostic_name: &str,
+) -> Result<VerifiedProgram, CompileError> {
     let program = parse(source)?;
-    compile_parsed_source(source, &program)
+    compile_parsed_source_with_name(source, diagnostic_name, &program)
 }
 
 pub(crate) fn compile_parsed_source(
     source: &str,
     program: &Program,
 ) -> Result<VerifiedProgram, CompileError> {
-    validate_parameter_declarations(program)?;
-    let _ = analyze_for_lowering(program)?;
-    lower_program(source, program)
+    compile_parsed_source_with_name(source, "<source>", program)
 }
 
-fn lower_program(source: &str, program: &Program) -> Result<VerifiedProgram, LowerError> {
+pub(crate) fn compile_parsed_source_with_name(
+    source: &str,
+    diagnostic_name: &str,
+    program: &Program,
+) -> Result<VerifiedProgram, CompileError> {
+    validate_parameter_declarations(program)?;
+    let _ = analyze_for_lowering(program)?;
+    lower_program(source, diagnostic_name, program)
+}
+
+fn lower_program(
+    source: &str,
+    diagnostic_name: &str,
+    program: &Program,
+) -> Result<VerifiedProgram, LowerError> {
     let builder = RawProgramBuilder::new();
-    lower_program_with_builder(source, program, builder)
+    lower_program_with_builder(source, diagnostic_name, program, builder)
 }
 
 fn lower_program_with_builder(
     source: &str,
+    diagnostic_name: &str,
     program: &Program,
     mut builder: RawProgramBuilder,
 ) -> Result<VerifiedProgram, LowerError> {
@@ -146,7 +160,7 @@ fn lower_program_with_builder(
         })
     })?;
     let source_unit = builder.push_source_unit(SourceUnit {
-        diagnostic_name: try_clone_string("<source>", crate::Arena::SourceUnit)?,
+        diagnostic_name: try_clone_string(diagnostic_name, crate::Arena::SourceUnit)?,
         byte_length,
     })?;
     let mut lowerer = Lowerer {
@@ -1600,6 +1614,7 @@ mod tests {
         for ordinal in 0..1_000 {
             match lower_program_with_builder(
                 source,
+                "<source>",
                 &program,
                 RawProgramBuilder::with_reservation_failure_at(ordinal),
             ) {

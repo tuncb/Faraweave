@@ -214,8 +214,20 @@ def main() -> None:
             ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
+            artifact = work / f"fixture-{index}.fwir"
             emitted = work / f"fixture-{index}.c"
+            emitted_ir = work / f"fixture-{index}-ir.c"
             native = work / f"fixture-{index}{suffix}"
+            run(
+                [
+                    str(executable),
+                    "compile-ir",
+                    str(fixture),
+                    "-o",
+                    str(artifact),
+                ],
+                environment=environment,
+            )
             run(
                 [
                     str(executable),
@@ -225,6 +237,20 @@ def main() -> None:
                     str(emitted),
                 ],
                 environment=environment,
+            )
+            run(
+                [
+                    str(executable),
+                    "emit-c-ir",
+                    str(artifact),
+                    "-o",
+                    str(emitted_ir),
+                ],
+                environment=environment,
+            )
+            require(
+                emitted.read_bytes() == emitted_ir.read_bytes(),
+                f"source/artifact C mismatch for {fixture.name}",
             )
             source = emitted.read_text(encoding="utf-8")
             require("strcmp(name" not in source, "runtime primitive-name lookup returned")
@@ -237,6 +263,10 @@ def main() -> None:
                 [str(executable), "run", str(fixture), "--", *arguments],
                 environment=environment,
             )
+            artifact_runner = run(
+                [str(executable), "run-ir", str(artifact), "--", *arguments],
+                environment=environment,
+            )
             require(
                 normalize_newlines(generated.stdout) == normalize_newlines(expected),
                 f"generated output mismatch for {fixture.name}",
@@ -246,7 +276,17 @@ def main() -> None:
                 == normalize_newlines(generated.stdout),
                 f"evaluator/generated mismatch for {fixture.name}",
             )
-            require(not evaluator.stderr and not generated.stderr, fixture.name)
+            require(
+                normalize_newlines(artifact_runner.stdout)
+                == normalize_newlines(evaluator.stdout),
+                f"source/artifact evaluator mismatch for {fixture.name}",
+            )
+            require(
+                not evaluator.stderr
+                and not artifact_runner.stderr
+                and not generated.stderr,
+                fixture.name,
+            )
             if index == 0 and platform.system() == "Linux":
                 sanitized = work / "fixture-sanitized"
                 compile_c_sanitized(compiler, environment, emitted, sanitized)
@@ -351,6 +391,39 @@ def main() -> None:
             normalize_newlines(native_result.stdout)
             == b"3\n2.5\ntrue\n(1 2 3)\n5.5\nfalse\n",
             "native build output",
+        )
+        artifact = work / "native-build.fwir"
+        built_ir = work / f"native-build-ir{suffix}"
+        run(
+            [
+                str(executable),
+                "compile-ir",
+                str(argument_fixture),
+                "-o",
+                str(artifact),
+            ],
+            environment=environment,
+        )
+        run(
+            [
+                str(executable),
+                "build-ir",
+                str(artifact),
+                "-o",
+                str(built_ir),
+                "--cc",
+                compiler,
+            ],
+            environment=environment,
+        )
+        native_ir_result = run(
+            [str(built_ir), "3", "2.5", "true"],
+            environment=environment,
+        )
+        require(
+            normalize_newlines(native_ir_result.stdout)
+            == normalize_newlines(native_result.stdout),
+            "source/artifact native build output",
         )
 
     print(
