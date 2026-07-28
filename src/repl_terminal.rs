@@ -48,7 +48,22 @@ pub(crate) fn classify_terminal(
 
 pub(crate) fn stdout_capability() -> TerminalCapability {
     let term = env::var_os("TERM");
-    classify_terminal(io::stdout().is_terminal(), cfg!(windows), term.as_deref())
+    classify_stdout_capability(
+        io::stdout().is_terminal(),
+        term.as_deref(),
+        windows_stdout_is_console,
+    )
+}
+
+fn classify_stdout_capability(
+    interactive: bool,
+    term: Option<&OsStr>,
+    windows_console_probe: impl FnOnce() -> bool,
+) -> TerminalCapability {
+    if !interactive {
+        return TerminalCapability::Redirected;
+    }
+    classify_terminal(true, windows_console_probe(), term)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,9 +177,11 @@ fn publish_ansi(output: &mut impl Write) -> Result<(), ClearFailure> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub(crate) fn clear_windows_console() -> Result<(), ClearFailure> {
+mod windows_console {
     use std::ffi::c_void;
     use std::mem::MaybeUninit;
+
+    use super::ClearFailure;
 
     type Handle = *mut c_void;
 
@@ -219,22 +236,33 @@ pub(crate) fn clear_windows_console() -> Result<(), ClearFailure> {
     }
 
     const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
-    let mut information = MaybeUninit::<ConsoleScreenBufferInfo>::uninit();
-    let home = Coord { x: 0, y: 0 };
-    let mut written = 0_u32;
 
-    // SAFETY: every pointer is either a valid stack out-pointer for the call or
-    // the console handle returned by GetStdHandle. The information value is
-    // read only after GetConsoleScreenBufferInfo reports success.
-    unsafe {
-        let output = GetStdHandle(STD_OUTPUT_HANDLE);
-        if output.is_null()
-            || output as isize == -1
-            || GetConsoleScreenBufferInfo(output, information.as_mut_ptr()) == 0
-        {
-            return Err(ClearFailure::WindowsOperationFailed);
+    fn stdout_screen_buffer() -> Result<(Handle, ConsoleScreenBufferInfo), ClearFailure> {
+        let mut information = MaybeUninit::<ConsoleScreenBufferInfo>::uninit();
+
+        // SAFETY: `information` is a valid stack out-pointer and is read only
+        // after the API reports success. The returned opaque handle is used
+        // only with Console APIs that accept an output screen-buffer handle.
+        unsafe {
+            let output = GetStdHandle(STD_OUTPUT_HANDLE);
+            if output.is_null()
+                || output as isize == -1
+                || GetConsoleScreenBufferInfo(output, information.as_mut_ptr()) == 0
+            {
+                return Err(ClearFailure::WindowsOperationFailed);
+            }
+            Ok((output, information.assume_init()))
         }
-        let information = information.assume_init();
+    }
+
+    pub(super) fn stdout_is_screen_buffer() -> bool {
+        stdout_screen_buffer().is_ok()
+    }
+
+    pub(super) fn clear() -> Result<(), ClearFailure> {
+        let (output, information) = stdout_screen_buffer()?;
+        let home = Coord { x: 0, y: 0 };
+        let mut written = 0_u32;
         let width =
             u32::try_from(information.size.x).map_err(|_| ClearFailure::WindowsOperationFailed)?;
         let height =
@@ -243,21 +271,42 @@ pub(crate) fn clear_windows_console() -> Result<(), ClearFailure> {
             .checked_mul(height)
             .filter(|count| *count != 0)
             .ok_or(ClearFailure::WindowsOperationFailed)?;
-        if FillConsoleOutputCharacterW(output, u16::from(b' '), cells, home, &mut written) == 0
-            || written != cells
-        {
-            return Err(ClearFailure::WindowsOperationFailed);
+
+        // SAFETY: `output` and `information` came from a successful
+        // GetConsoleScreenBufferInfo call. All out-pointers refer to valid
+        // stack storage, and `home` and `cells` are checked buffer coordinates.
+        unsafe {
+            if FillConsoleOutputCharacterW(output, u16::from(b' '), cells, home, &mut written) == 0
+                || written != cells
+            {
+                return Err(ClearFailure::WindowsOperationFailed);
+            }
+            written = 0;
+            if FillConsoleOutputAttribute(output, information.attributes, cells, home, &mut written)
+                == 0
+                || written != cells
+                || SetConsoleCursorPosition(output, home) == 0
+            {
+                return Err(ClearFailure::WindowsOperationFailed);
+            }
         }
-        written = 0;
-        if FillConsoleOutputAttribute(output, information.attributes, cells, home, &mut written)
-            == 0
-            || written != cells
-            || SetConsoleCursorPosition(output, home) == 0
-        {
-            return Err(ClearFailure::WindowsOperationFailed);
-        }
+        Ok(())
     }
-    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_stdout_is_console() -> bool {
+    windows_console::stdout_is_screen_buffer()
+}
+
+#[cfg(not(windows))]
+fn windows_stdout_is_console() -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub(crate) fn clear_windows_console() -> Result<(), ClearFailure> {
+    windows_console::clear()
 }
 
 #[cfg(not(windows))]
@@ -327,6 +376,32 @@ mod tests {
                 TerminalCapability::Unsupported
             );
         }
+    }
+
+    #[test]
+    fn stdout_capability_probes_native_windows_support_and_falls_back_to_ansi() {
+        let mut redirected_probe_called = false;
+        assert_eq!(
+            classify_stdout_capability(false, Some(OsStr::new("xterm")), || {
+                redirected_probe_called = true;
+                true
+            }),
+            TerminalCapability::Redirected
+        );
+        assert!(!redirected_probe_called);
+
+        assert_eq!(
+            classify_stdout_capability(true, None, || true),
+            TerminalCapability::Windows
+        );
+        assert_eq!(
+            classify_stdout_capability(true, Some(OsStr::new("xterm-256color")), || false),
+            TerminalCapability::Ansi
+        );
+        assert_eq!(
+            classify_stdout_capability(true, Some(OsStr::new("dumb")), || false),
+            TerminalCapability::Unsupported
+        );
     }
 
     #[test]

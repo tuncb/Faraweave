@@ -66,7 +66,8 @@ cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 
 Inside the REPL, the exact case-sensitive `.cls` meta-command clears and homes
 interactive Windows consoles or ANSI terminals with a nonempty, non-`dumb`
-`TERM`. Redirected output remains byte-clean, while unsupported terminals and
+`TERM`; Windows PTYs that are not native console screen buffers use the ANSI
+path. Redirected output remains byte-clean, while unsupported terminals and
 terminal failures produce a deterministic diagnostic and leave the session
 running.
 
