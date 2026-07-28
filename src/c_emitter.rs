@@ -241,6 +241,30 @@ impl<'a> IrCGenerator<'a> {
                 .map_err(|_| emission_error())?;
                 continue;
             }
+            if matches!(
+                descriptor.kernel,
+                ScalarKernel::SumIntVector | ScalarKernel::SumDoubleVector
+            ) {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::Scalar
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(1)
+                {
+                    return Err(emission_error());
+                }
+                let runtime = match descriptor.kernel {
+                    ScalarKernel::SumIntVector => "fw_apply_selected_sum_int",
+                    ScalarKernel::SumDoubleVector => "fw_apply_selected_sum_double",
+                    _ => return Err(emission_error()),
+                };
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return {runtime}({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
             self.emit_selected_kernel(implementation, descriptor.kernel)?;
             writeln!(
                 self.definitions,
@@ -344,6 +368,8 @@ impl<'a> IrCGenerator<'a> {
             | ScalarKernel::SortBoolVector
             | ScalarKernel::SortIntVector
             | ScalarKernel::SortDoubleVector
+            | ScalarKernel::SumIntVector
+            | ScalarKernel::SumDoubleVector
             | ScalarKernel::IotaInt => return Err(emission_error()),
         };
         writeln!(
@@ -1272,6 +1298,29 @@ static int fw_apply_selected_sort(const char *name,const FWV *args,FWV *out,
   if(length!=0U)(void)memcpy(out->data,args[0].data,out->charge);
   fw_sort_in_place(out);return 1;
 }
+static int fw_apply_selected_sum_int(const char *name,const FWV *args,FWV *out,
+                                     size_t line,size_t column) {
+  const int64_t *values=(const int64_t *)args[0].data;
+  int64_t total=INT64_C(0);size_t index;
+  if(!fw_charge_work(args[0].len,name,line,column))return 0;
+  for(index=0U;index<args[0].len;++index){
+    int64_t value=values[index];
+    if((value>INT64_C(0)&&total>INT64_MAX-value)||
+       (value<INT64_C(0)&&total<INT64_MIN-value))
+      return fw_selected_integer_overflow(name,line,column,index,1);
+    total+=value;
+  }
+  fw_set_int(out,total);return 1;
+}
+static int fw_apply_selected_sum_double(const char *name,const FWV *args,FWV *out,
+                                        size_t line,size_t column) {
+  const double *values=(const double *)args[0].data;
+  double total=0.0;size_t index;
+  if(!fw_charge_work(args[0].len,name,line,column))return 0;
+  for(index=0U;index<args[0].len;++index)
+    total=fw_double_arithmetic(total,values[index],FW_DOUBLE_ADD);
+  fw_set_double(out,total);return 1;
+}
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
 static int fw_append(FWBuffer *buffer,const char *text) {
   size_t n=strlen(text),needed; char *grown;
@@ -1442,6 +1491,8 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   (void)fw_apply_selected_iota;
   (void)fw_apply_selected_length;
   (void)fw_apply_selected_sort;
+  (void)fw_apply_selected_sum_int;
+  (void)fw_apply_selected_sum_double;
   (void)fw_selected_integer_overflow;
   (void)fw_selected_division_by_zero;
   (void)fw_as_double;
@@ -1671,7 +1722,8 @@ mod ir_tests {
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
              length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
-             sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n",
+             sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n\
+             sum[(1 2)]\nsum[(1.0 2.0)]\n",
         );
         for implementation in (1..=36).filter(|implementation| *implementation != 34) {
             assert!(
@@ -1698,6 +1750,20 @@ mod ir_tests {
             assert!(source.contains(&format!("fw_impl_{implementation}(const FWV *args")));
         }
         assert_eq!(source.matches("return fw_apply_selected_sort(").count(), 3);
+        for implementation in 43..=44 {
+            assert!(source.contains(&format!("static int fw_impl_{implementation}(")));
+            assert!(source.contains(&format!("fw_impl_{implementation}(const FWV *args")));
+        }
+        assert_eq!(
+            source.matches("return fw_apply_selected_sum_int(").count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches("return fw_apply_selected_sum_double(")
+                .count(),
+            1
+        );
         assert!(!source.contains("fw_apply_scalar"));
         assert!(!source.contains("primitive=="));
     }
@@ -1722,6 +1788,31 @@ mod ir_tests {
         assert!(source.contains("memcpy(out->data,args[0].data,out->charge)"));
         assert!(source.contains("fw_sort_sift_down"));
         assert!(!source.contains("qsort("));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn sum_uses_left_to_right_checked_reduction_after_full_work_charge() {
+        let source = emit("sum[(1 2 3)]\nsum[(1e16 1.0 -1e16)]\n");
+        assert!(source.contains("return fw_apply_selected_sum_int(\"sum\",args,out,line,column)"));
+        assert!(
+            source.contains("return fw_apply_selected_sum_double(\"sum\",args,out,line,column)")
+        );
+        let work = source.find("fw_charge_work(args[0].len,name,line,column)");
+        let integer_loop = source.find("for(index=0U;index<args[0].len;++index)");
+        let integer_add = source.find("total+=value");
+        assert!(
+            matches!((work, integer_loop, integer_add), (Some(work), Some(loop_start), Some(add)) if work < loop_start && loop_start < add)
+        );
+        assert!(source.contains("total>INT64_MAX-value"));
+        assert!(source.contains("total<INT64_MIN-value"));
+        assert!(source.contains("total=fw_double_arithmetic(total,values[index],FW_DOUBLE_ADD)"));
+        let sum_runtime = source
+            .split("static int fw_apply_selected_sum_int")
+            .nth(1)
+            .and_then(|tail| tail.split("typedef struct { char *data").next())
+            .unwrap_or("");
+        assert!(!sum_runtime.contains("fw_make_vector"));
         assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
     }
 
@@ -1952,6 +2043,11 @@ mod ir_tests {
             ("sort[(3 -1 3 0)]\n", &[]),
             ("sort[(nan inf -0.0 0.0 -inf)]\n", &[]),
             ("parameters[n Int]\nsort iota n\n", &["3"]),
+            ("sum[(1 2 3 -4)]\n", &[]),
+            ("sum[(1e16 1.0 -1e16)]\n", &[]),
+            ("sum[(inf -inf)]\n", &[]),
+            ("sum[(9223372036854775807 1 -1)]\n", &[]),
+            ("parameters[n Int]\nsum iota n\n", &["3"]),
             ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
         ];
         for (source, arguments) in corpus {
@@ -2004,6 +2100,28 @@ mod ir_tests {
             &[],
             sort_allocation_configuration,
         );
+
+        let sum_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(5),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "parameters[n Int]\nsum iota n\n",
+            &["3"],
+            sum_work_configuration,
+        );
+
+        let sum_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct("sum[(1 2 3)]\n", &[], sum_allocation_configuration);
     }
 
     #[cfg(not(windows))]
@@ -2162,7 +2280,8 @@ mod ir_tests {
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
              length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
-             sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n";
+             sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n\
+             sum[(1 2)]\nsum[(1.0 2.0)]\n";
         let configuration = EvaluationConfiguration::default();
         assert_public_generated_matches_direct(source, &[], configuration);
     }

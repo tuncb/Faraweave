@@ -5,5 +5,6 @@ enabled
 iota[count]
 length iota count
 sort iota count
+sum iota count
 add[ratio count]
 not[enabled]

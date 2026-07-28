@@ -185,6 +185,31 @@ pub(crate) fn apply_implementation(
     }
 
     if matches!(
+        descriptor.kernel,
+        ScalarKernel::SumIntVector | ScalarKernel::SumDoubleVector
+    ) {
+        let [argument] = arguments else {
+            return Err(type_runtime_error(producer, location));
+        };
+        if lift != crate::LiftMode::ContainerScalar
+            || result_type != descriptor.result
+            || argument.conversion != crate::Conversion::Identity
+        {
+            return Err(type_runtime_error(producer, location));
+        }
+        let work = admitted_work(application_plan, 1, arguments, producer, location)?;
+        return apply_vector_sum(
+            descriptor.kernel,
+            argument.value,
+            work,
+            location,
+            producer,
+            resources,
+        )
+        .map(|value| (value, false));
+    }
+
+    if matches!(
         lift,
         crate::LiftMode::ContainerScalar | crate::LiftMode::ContainerVector
     ) {
@@ -483,6 +508,8 @@ fn invoke_kernel(
             | ScalarKernel::SortBoolVector
             | ScalarKernel::SortIntVector
             | ScalarKernel::SortDoubleVector
+            | ScalarKernel::SumIntVector
+            | ScalarKernel::SumDoubleVector
             | ScalarKernel::IotaInt,
             _,
         ) => None,
@@ -570,6 +597,45 @@ fn apply_vector_sort(
         }
     };
     Ok(result)
+}
+
+fn apply_vector_sum(
+    kernel: ScalarKernel,
+    input: &Value,
+    work: usize,
+    location: SourceLocation,
+    producer: &str,
+    resources: &mut ResourceContext,
+) -> Result<Value, Error> {
+    match (kernel, input) {
+        (ScalarKernel::SumIntVector, Value::IntVector(values)) => {
+            resources.charge_work(work, location, producer)?;
+            let mut total = 0_i64;
+            for (index, value) in values.iter().copied().enumerate() {
+                let operands = [Value::Int(total), Value::Int(value)];
+                total = total.checked_add(value).ok_or_else(|| {
+                    integer_domain_error(
+                        producer,
+                        &operands,
+                        ScalarType::Int,
+                        location,
+                        Some(index),
+                        DomainErrorReason::IntegerOverflow,
+                    )
+                })?;
+            }
+            Ok(Value::Int(total))
+        }
+        (ScalarKernel::SumDoubleVector, Value::DoubleVector(values)) => {
+            resources.charge_work(work, location, producer)?;
+            let mut total = 0.0_f64;
+            for value in values {
+                total = strict_float::arithmetic(total, *value, Binary64Operation::Add);
+            }
+            Ok(Value::Double(total))
+        }
+        _ => Err(type_runtime_error(producer, location)),
+    }
 }
 
 fn integer_domain_error(
