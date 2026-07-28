@@ -1,3 +1,5 @@
+mod repl_terminal;
+
 use faraweave::{
     ArgumentErrorContext, CompileFwirError, Error, ErrorKind, FwirDecodeLimits, FwirEncodeOptions,
     NativeBuildRequest, VERSION, build_native, build_native_from_verified_program,
@@ -33,6 +35,8 @@ const HELP: &str = "Usage: faraweave <command> [arguments]\n\
                      \x20         Emit C from a verified FWIR artifact\n\
                      \x20 build-ir <artifact.fwir> -o <output> [--cc <compiler>]\n\
                      \x20         Build a verified FWIR artifact\n";
+const REPL_HISTORY_MAX_ENTRIES: usize = 100;
+const REPL_HISTORY_MAX_BYTES: usize = 65_536;
 
 fn main() -> ExitCode {
     match run_cli(env::args_os().collect()) {
@@ -358,30 +362,322 @@ fn build_command(arguments: &[OsString]) -> Result<(), ()> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplHistoryLimits {
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl Default for ReplHistoryLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: REPL_HISTORY_MAX_ENTRIES,
+            max_bytes: REPL_HISTORY_MAX_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReplAllocationFailureInjection {
+    fail_at_attempt: Option<usize>,
+    attempts: usize,
+}
+
+impl ReplAllocationFailureInjection {
+    const fn none() -> Self {
+        Self {
+            fail_at_attempt: None,
+            attempts: 0,
+        }
+    }
+
+    #[cfg(test)]
+    const fn at(attempt: usize) -> Self {
+        Self {
+            fail_at_attempt: Some(attempt),
+            attempts: 0,
+        }
+    }
+
+    fn refuse(&mut self) -> bool {
+        let attempt = self.attempts;
+        self.attempts = self.attempts.saturating_add(1);
+        self.fail_at_attempt == Some(attempt)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ReplHistoryEntry {
+    number: u64,
+    text: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplHistoryRecordFailureReason {
+    AllocationUnavailable,
+    EntryNumberOverflow,
+    EntryTooLarge,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ReplHistoryRecordFailure {
+    reason: ReplHistoryRecordFailureReason,
+    line: String,
+}
+
+struct ReplHistory {
+    entries: Vec<ReplHistoryEntry>,
+    retained_bytes: usize,
+    next_number: u64,
+    limits: ReplHistoryLimits,
+    allocation_failure: ReplAllocationFailureInjection,
+}
+
+impl ReplHistory {
+    fn new() -> Self {
+        Self::with_limits_and_failure(
+            ReplHistoryLimits::default(),
+            ReplAllocationFailureInjection::none(),
+        )
+    }
+
+    fn with_limits_and_failure(
+        limits: ReplHistoryLimits,
+        allocation_failure: ReplAllocationFailureInjection,
+    ) -> Self {
+        Self {
+            entries: Vec::new(),
+            retained_bytes: 0,
+            next_number: 1,
+            limits,
+            allocation_failure,
+        }
+    }
+
+    fn record(&mut self, line: String) -> Result<(), ReplHistoryRecordFailure> {
+        if self.limits.max_entries == 0 || line.len() > self.limits.max_bytes {
+            return Err(ReplHistoryRecordFailure {
+                reason: ReplHistoryRecordFailureReason::EntryTooLarge,
+                line,
+            });
+        }
+        let Some(following_number) = self.next_number.checked_add(1) else {
+            return Err(ReplHistoryRecordFailure {
+                reason: ReplHistoryRecordFailureReason::EntryNumberOverflow,
+                line,
+            });
+        };
+        let Some(mut retained_after_insert) = self.retained_bytes.checked_add(line.len()) else {
+            return Err(ReplHistoryRecordFailure {
+                reason: ReplHistoryRecordFailureReason::EntryTooLarge,
+                line,
+            });
+        };
+        let Some(mut count_after_insert) = self.entries.len().checked_add(1) else {
+            return Err(ReplHistoryRecordFailure {
+                reason: ReplHistoryRecordFailureReason::EntryTooLarge,
+                line,
+            });
+        };
+        let mut evicted = 0usize;
+        while count_after_insert > self.limits.max_entries
+            || retained_after_insert > self.limits.max_bytes
+        {
+            let Some(entry) = self.entries.get(evicted) else {
+                return Err(ReplHistoryRecordFailure {
+                    reason: ReplHistoryRecordFailureReason::EntryTooLarge,
+                    line,
+                });
+            };
+            retained_after_insert -= entry.text.len();
+            count_after_insert -= 1;
+            evicted += 1;
+        }
+        if self.allocation_failure.refuse()
+            || (evicted == 0 && self.entries.try_reserve(1).is_err())
+        {
+            return Err(ReplHistoryRecordFailure {
+                reason: ReplHistoryRecordFailureReason::AllocationUnavailable,
+                line,
+            });
+        }
+        if evicted != 0 {
+            self.entries.drain(..evicted);
+        }
+        self.entries.push(ReplHistoryEntry {
+            number: self.next_number,
+            text: line,
+        });
+        self.retained_bytes = retained_after_insert;
+        self.next_number = following_number;
+        Ok(())
+    }
+
+    fn latest_text(&self) -> Option<&str> {
+        self.entries.last().map(|entry| entry.text.as_str())
+    }
+
+    fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
+        for entry in &self.entries {
+            writeln!(output, "{}\t{}", entry.number, entry.text)?;
+        }
+        output.flush()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ReplLineRead {
+    Eof,
+    Line(String),
+    Oversized,
+    AllocationUnavailable,
+}
+
+fn read_repl_line(
+    input: &mut impl BufRead,
+    maximum_bytes: usize,
+    allocation_failure: &mut ReplAllocationFailureInjection,
+) -> io::Result<ReplLineRead> {
+    let raw_limit = maximum_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "REPL input limit cannot represent a CR terminator",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    let mut rejection = None;
+    let mut consumed_any = false;
+    let mut consumed_lf = false;
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        consumed_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_length = newline.unwrap_or(available.len());
+        if rejection.is_none() {
+            let projected = bytes.len().checked_add(content_length);
+            if projected.is_none_or(|length| length > raw_limit) {
+                rejection = Some(ReplLineRead::Oversized);
+            } else if content_length != 0 {
+                if allocation_failure.refuse() || bytes.try_reserve_exact(content_length).is_err() {
+                    rejection = Some(ReplLineRead::AllocationUnavailable);
+                } else {
+                    bytes.extend_from_slice(&available[..content_length]);
+                }
+            }
+        }
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        input.consume(consumed);
+        if newline.is_some() {
+            consumed_lf = true;
+            break;
+        }
+    }
+    if let Some(rejection) = rejection {
+        return Ok(rejection);
+    }
+    if !consumed_any {
+        return Ok(ReplLineRead::Eof);
+    }
+    if consumed_lf && bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if bytes.len() > maximum_bytes {
+        return Ok(ReplLineRead::Oversized);
+    }
+    String::from_utf8(bytes)
+        .map(ReplLineRead::Line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "REPL input is not UTF-8"))
+}
+
+fn publish_history_stdout(history: &ReplHistory) -> Result<(), ()> {
+    let mut stdout = io::stdout().lock();
+    history.write_to(&mut stdout).map_err(|_| {
+        eprintln!("error: unable to write stdout");
+    })
+}
+
+fn report_history_failure(reason: ReplHistoryRecordFailureReason) {
+    match reason {
+        ReplHistoryRecordFailureReason::AllocationUnavailable => {
+            eprintln!("error: unable to retain REPL history entry");
+        }
+        ReplHistoryRecordFailureReason::EntryNumberOverflow => {
+            eprintln!("error: REPL history entry number overflow");
+        }
+        ReplHistoryRecordFailureReason::EntryTooLarge => {
+            eprintln!("error: REPL input exceeds {REPL_HISTORY_MAX_BYTES} retained bytes");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplCommand {
+    Exit,
+}
+
+fn repl_command(line: &str) -> Option<ReplCommand> {
+    match line.trim_matches([' ', '\t']) {
+        ".exit" => Some(ReplCommand::Exit),
+        _ => None,
+    }
+}
+
 fn repl() -> Result<(), ()> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
-    let mut line = String::new();
+    let mut history = ReplHistory::new();
+    let mut input_allocation_failure = ReplAllocationFailureInjection::none();
     loop {
         publish_stdout(b"> ")?;
-        line.clear();
-        match input.read_line(&mut line) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {}
+        let line = match read_repl_line(
+            &mut input,
+            REPL_HISTORY_MAX_BYTES,
+            &mut input_allocation_failure,
+        ) {
+            Ok(ReplLineRead::Eof) => return Ok(()),
+            Ok(ReplLineRead::Line(line)) => line,
+            Ok(ReplLineRead::Oversized) => {
+                eprintln!("error: REPL input exceeds {REPL_HISTORY_MAX_BYTES} retained bytes");
+                continue;
+            }
+            Ok(ReplLineRead::AllocationUnavailable) => {
+                eprintln!("error: unable to allocate REPL input");
+                continue;
+            }
             Err(_) => {
                 eprintln!("error: unable to read stdin");
                 return Err(());
             }
+        };
+        if line.is_empty() {
+            continue;
         }
-        if line.ends_with('\n') {
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
+        let mut unrecorded = None;
+        if let Err(failure) = history.record(line) {
+            report_history_failure(failure.reason);
+            unrecorded = Some(failure.line);
+        }
+        let Some(line) = unrecorded.as_deref().or_else(|| history.latest_text()) else {
+            eprintln!("error: unable to access REPL input");
+            return Err(());
+        };
+        match repl_terminal::classify_repl_input(line) {
+            repl_terminal::ReplInputKind::Blank => continue,
+            repl_terminal::ReplInputKind::Clear => {
+                clear_repl_terminal();
+                continue;
+            }
+            repl_terminal::ReplInputKind::Evaluate => {
+                if line.trim_start_matches([' ', '\t']).starts_with('#') {
+                    continue;
+                }
             }
         }
-        let content = line.trim_start_matches([' ', '\t']);
-        if content.is_empty() || content.starts_with('#') {
-            continue;
+        if repl_command(line) == Some(ReplCommand::Exit) {
+            return Ok(());
         }
         if line == ".internal" {
             let mut stdout = io::stdout().lock();
@@ -390,7 +686,11 @@ fn repl() -> Result<(), ()> {
             })?;
             continue;
         }
-        match evaluate_expression(&line) {
+        if line.trim_matches([' ', '\t']) == ".history" {
+            publish_history_stdout(&history)?;
+            continue;
+        }
+        match evaluate_expression(line) {
             Ok(result) => {
                 let formatted = format_value(&result.value).map_err(|error| {
                     report_error("<repl>", &error);
@@ -399,6 +699,21 @@ fn repl() -> Result<(), ()> {
             }
             Err(error) => report_error("<repl>", &error),
         }
+    }
+}
+
+fn clear_repl_terminal() {
+    let capability = repl_terminal::stdout_capability();
+    let mut stdout = io::stdout().lock();
+    let result = repl_terminal::clear_terminal(
+        capability,
+        &mut stdout,
+        repl_terminal::clear_windows_console,
+    );
+    drop(stdout);
+    if let Err(failure) = result {
+        let mut stderr = io::stderr().lock();
+        let _ = repl_terminal::report_clear_failure(failure, &mut stderr);
     }
 }
 
@@ -679,7 +994,8 @@ fn report_argument_error(argument: &ArgumentErrorContext) {
 mod output_tests {
     use super::{
         CommandLineArgumentFailure, CommandLineArgumentFailureInjection, OutputFailureReason,
-        OutputPublicationFailure, collect_command_line_arguments, publish_to,
+        OutputPublicationFailure, ReplCommand, collect_command_line_arguments, publish_to,
+        repl_command,
     };
     use std::ffi::OsString;
     use std::io::{self, Write};
@@ -784,5 +1100,264 @@ mod output_tests {
             failure.diagnostic(),
             "error: unable to decode Unicode command line"
         );
+    }
+
+    #[test]
+    fn repl_command_dispatch_is_exact_and_case_sensitive() {
+        for accepted in [".exit", " .exit", "\t.exit", " \t.exit\t "] {
+            assert_eq!(repl_command(accepted), Some(ReplCommand::Exit));
+        }
+        for rejected in [
+            "",
+            " ",
+            ".EXIT",
+            ".Exit",
+            ".exit-now",
+            ".exit argument",
+            ".exit # trailing source comment",
+            ".exit#trailing-source-comment",
+            "\u{a0}.exit",
+            ".exit\u{a0}",
+        ] {
+            assert_eq!(repl_command(rejected), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod repl_tests {
+    use super::{
+        ReplAllocationFailureInjection, ReplHistory, ReplHistoryLimits,
+        ReplHistoryRecordFailureReason, ReplLineRead, read_repl_line,
+    };
+    use std::io::{self, Cursor, Write};
+
+    fn record(history: &mut ReplHistory, text: &str) {
+        if let Err(error) = history.record(text.to_owned()) {
+            panic!("history record failed: {:?}", error.reason);
+        }
+    }
+
+    #[test]
+    fn history_evicts_oldest_at_exact_count_and_utf8_byte_boundaries() {
+        let mut history = ReplHistory::with_limits_and_failure(
+            ReplHistoryLimits {
+                max_entries: 3,
+                max_bytes: 8,
+            },
+            ReplAllocationFailureInjection::none(),
+        );
+        record(&mut history, "a");
+        record(&mut history, "éé");
+        record(&mut history, "ccc");
+        assert_eq!(history.retained_bytes, 8);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| (entry.number, entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "a"), (2, "éé"), (3, "ccc")]
+        );
+
+        record(&mut history, "d");
+        assert_eq!(history.retained_bytes, 8);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| (entry.number, entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(2, "éé"), (3, "ccc"), (4, "d")]
+        );
+
+        record(&mut history, "zzzz");
+        assert_eq!(history.retained_bytes, 8);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| (entry.number, entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(3, "ccc"), (4, "d"), (5, "zzzz")]
+        );
+
+        record(&mut history, "12345678");
+        assert_eq!(history.retained_bytes, 8);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| (entry.number, entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(6, "12345678")]
+        );
+    }
+
+    #[test]
+    fn default_history_limits_retain_only_the_latest_hundred_entries() {
+        let mut history = ReplHistory::new();
+        assert_eq!(
+            history.limits,
+            ReplHistoryLimits {
+                max_entries: 100,
+                max_bytes: 65_536,
+            }
+        );
+        for _ in 0..101 {
+            record(&mut history, "x");
+        }
+        assert_eq!(history.entries.len(), 100);
+        assert_eq!(history.retained_bytes, 100);
+        assert_eq!(history.entries.first().map(|entry| entry.number), Some(2));
+        assert_eq!(history.entries.last().map(|entry| entry.number), Some(101));
+    }
+
+    #[test]
+    fn history_refusal_and_oversize_leave_existing_entries_and_input_owned() {
+        let mut refused = ReplHistory::with_limits_and_failure(
+            ReplHistoryLimits {
+                max_entries: 1,
+                max_bytes: 8,
+            },
+            ReplAllocationFailureInjection::at(1),
+        );
+        record(&mut refused, "one");
+        let failure = refused
+            .record("two".to_owned())
+            .expect_err("injected history reservation refusal");
+        assert_eq!(
+            failure.reason,
+            ReplHistoryRecordFailureReason::AllocationUnavailable
+        );
+        assert_eq!(failure.line, "two");
+        assert_eq!(refused.next_number, 2);
+        assert_eq!(refused.retained_bytes, 3);
+        assert_eq!(refused.entries[0].text, "one");
+
+        let oversized = refused
+            .record("123456789".to_owned())
+            .expect_err("history entry over byte limit");
+        assert_eq!(
+            oversized.reason,
+            ReplHistoryRecordFailureReason::EntryTooLarge
+        );
+        assert_eq!(oversized.line, "123456789");
+        assert_eq!(refused.entries.len(), 1);
+    }
+
+    #[test]
+    fn bounded_reader_removes_lf_and_crlf_and_recovers_after_rejections() {
+        let mut input = Cursor::new("éé\r\nplain\nok\n");
+        let mut injection = ReplAllocationFailureInjection::none();
+        assert_eq!(
+            read_repl_line(&mut input, 4, &mut injection).expect("UTF-8 CRLF line"),
+            ReplLineRead::Line("éé".to_owned())
+        );
+        assert_eq!(
+            read_repl_line(&mut input, 4, &mut injection).expect("oversized line"),
+            ReplLineRead::Oversized
+        );
+        assert_eq!(
+            read_repl_line(&mut input, 4, &mut injection).expect("line after oversize"),
+            ReplLineRead::Line("ok".to_owned())
+        );
+        assert_eq!(
+            read_repl_line(&mut input, 4, &mut injection).expect("end of input"),
+            ReplLineRead::Eof
+        );
+
+        let mut input = Cursor::new("first\nok\n");
+        let mut injection = ReplAllocationFailureInjection::at(0);
+        assert_eq!(
+            read_repl_line(&mut input, 8, &mut injection).expect("refused first line"),
+            ReplLineRead::AllocationUnavailable
+        );
+        assert_eq!(
+            read_repl_line(&mut input, 8, &mut injection).expect("line after refusal"),
+            ReplLineRead::Line("ok".to_owned())
+        );
+    }
+
+    #[test]
+    fn bounded_reader_preserves_and_counts_lone_cr_at_eof() {
+        let mut input = Cursor::new(b"1\r");
+        let mut injection = ReplAllocationFailureInjection::none();
+        assert_eq!(
+            read_repl_line(&mut input, 2, &mut injection).expect("EOF line with lone CR"),
+            ReplLineRead::Line("1\r".to_owned())
+        );
+        assert_eq!(
+            read_repl_line(&mut input, 2, &mut injection).expect("end after lone CR"),
+            ReplLineRead::Eof
+        );
+
+        let mut input = Cursor::new(b"1\r");
+        assert_eq!(
+            read_repl_line(&mut input, 1, &mut injection).expect("bounded EOF line with lone CR"),
+            ReplLineRead::Oversized
+        );
+    }
+
+    struct FailingWriter {
+        remaining: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected history output failure",
+                ));
+            }
+            let accepted = self.remaining.min(bytes.len());
+            self.remaining -= accepted;
+            Ok(accepted)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected history flush failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn history_output_is_exact_and_write_or_flush_failure_is_recoverable() {
+        let mut history = ReplHistory::with_limits_and_failure(
+            ReplHistoryLimits {
+                max_entries: 3,
+                max_bytes: 32,
+            },
+            ReplAllocationFailureInjection::none(),
+        );
+        record(&mut history, " α ");
+        record(&mut history, ".history");
+        let mut output = Vec::new();
+        history.write_to(&mut output).expect("history output");
+        assert_eq!(output, "1\t α \n2\t.history\n".as_bytes());
+
+        let write = history
+            .write_to(&mut FailingWriter {
+                remaining: 2,
+                fail_flush: false,
+            })
+            .expect_err("injected write failure");
+        assert_eq!(write.kind(), io::ErrorKind::BrokenPipe);
+
+        let flush = history
+            .write_to(&mut FailingWriter {
+                remaining: usize::MAX,
+                fail_flush: true,
+            })
+            .expect_err("injected flush failure");
+        assert_eq!(flush.kind(), io::ErrorKind::BrokenPipe);
     }
 }
