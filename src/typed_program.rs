@@ -3296,6 +3296,13 @@ mod tests {
         }
     }
 
+    fn sort_program() -> RawProgram {
+        match crate::lowering::compile_source_with_name("sort[(3 1 2)]\n", "sort.faraweave") {
+            Ok(program) => program.raw,
+            Err(error) => panic!("sort fixture did not lower: {error}"),
+        }
+    }
+
     fn dynamic_shape_program() -> RawProgram {
         let mut builder = RawProgramBuilder::new();
         must(builder.push_feature(Feature::StableSemanticIds.numeric()));
@@ -4553,6 +4560,94 @@ mod tests {
         verify_error(wrong_conversion, Invariant::InvalidRecord);
 
         let mut missing_feature = length_program();
+        missing_feature
+            .features
+            .retain(|feature| *feature != Feature::ApplicationPlans.numeric());
+        missing_feature.module.ranges.features.count =
+            u32::try_from(missing_feature.features.len()).unwrap_or(u32::MAX);
+        verify_error(missing_feature, Invariant::MissingFeature);
+    }
+
+    #[test]
+    fn vector_sort_plan_identity_container_mode_cardinality_and_feature_are_verified() {
+        assert!(sort_program().verify().is_ok());
+
+        let mut wrong_plan = sort_program();
+        let Some(node) = wrong_plan.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 22,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing sort node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut application_plan_id,
+            ..
+        } = node.kind
+        else {
+            panic!("sort node kind changed");
+        };
+        *application_plan_id = 3;
+        verify_error(wrong_plan, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_lift = sort_program();
+        let Some(node) = wrong_lift.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 22,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing sort node");
+        };
+        let NodeKind::SelectedApply { ref mut lift, .. } = node.kind else {
+            panic!("sort node kind changed");
+        };
+        *lift = LiftMode::ContainerScalar;
+        verify_error(wrong_lift, Invariant::InconsistentResultMetadata);
+
+        let mut wrong_cardinality = sort_program();
+        let Some(node) = wrong_cardinality.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 22,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing sort node");
+        };
+        node.cardinality = Some(Cardinality::StaticVector(2));
+        verify_error(wrong_cardinality, Invariant::InconsistentResultMetadata);
+
+        let mut wrong_conversion = sort_program();
+        let edge_start = wrong_conversion
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::SelectedApply {
+                        primitive_id: 22,
+                        ..
+                    }
+                )
+            })
+            .map(|node| node.edges.start)
+            .unwrap_or(u32::MAX);
+        if let Some(edge) = wrong_conversion.edges.get_mut(edge_start as usize) {
+            edge.conversion = Conversion::PromoteIntToDouble;
+        }
+        verify_error(wrong_conversion, Invariant::InvalidRecord);
+
+        let mut missing_feature = sort_program();
         missing_feature
             .features
             .retain(|feature| *feature != Feature::ApplicationPlans.numeric());

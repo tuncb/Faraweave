@@ -20,6 +20,7 @@ struct ObservedResourceEvent {
 
 static RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static LENGTH_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static SORT_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
@@ -37,6 +38,20 @@ fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
 
 fn observe_length_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = LENGTH_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_sort_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = SORT_RESOURCE_EVENTS.lock() {
         events.push(ObservedResourceEvent {
             kind: event.kind,
             producer: event.producer.to_owned(),
@@ -586,6 +601,132 @@ fn length_charges_constant_work_borrows_input_and_has_no_result_allocation() {
     let usage = work_refusal.usage.expect("post-cleanup usage");
     assert_eq!(usage.live_evaluation_bytes, 0);
     assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn sort_admits_owned_output_with_input_live_and_cleans_up_refused_output() {
+    SORT_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let result = faraweave::evaluate_expression_with_observer(
+        "sort[(4 1 3 2)]",
+        EvaluationConfiguration::default(),
+        observe_sort_resource_event,
+    )
+    .expect("vector sort");
+    assert_eq!(result.value, Value::IntVector(vec![1, 2, 3, 4]));
+    assert_eq!(
+        result.usage,
+        faraweave::ResourceUsage {
+            live_evaluation_bytes: 32,
+            peak_live_evaluation_bytes: 64,
+            work_units: 4,
+            allocation_attempts: 2,
+        }
+    );
+    let events = SORT_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[0].bytes, Some(32));
+    assert_eq!(events[0].ordinal, Some(0));
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].producer, "sort");
+    assert_eq!(events[1].bytes, Some(32));
+    assert_eq!(events[1].work, 4);
+    assert_eq!(events[1].ordinal, Some(1));
+    assert_eq!(events[1].usage.live_evaluation_bytes, 64);
+    assert_eq!(events[1].usage.peak_live_evaluation_bytes, 64);
+    assert_eq!(events[1].usage.work_units, 4);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 32);
+
+    SORT_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let refusal = faraweave::evaluate_expression_with_observer(
+        "sort[(4 1 3 2)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+        observe_sort_resource_event,
+    )
+    .expect_err("sort output allocation refusal");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(
+        resource(&refusal).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(resource(&refusal).allocation_ordinal, Some(1));
+    let events = SORT_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Refusal);
+    assert_eq!(events[1].producer, "sort");
+    assert_eq!(events[1].bytes, Some(32));
+    assert_eq!(events[1].work, 4);
+    assert_eq!(
+        events[1].refusal,
+        Some(ResourceErrorReason::AllocationUnavailable)
+    );
+    assert_eq!(events[1].usage.live_evaluation_bytes, 32);
+    assert_eq!(events[1].usage.work_units, 0);
+    assert_eq!(events[1].usage.allocation_attempts, 2);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 0);
+    assert_eq!(refusal.usage.expect("post-cleanup usage"), events[2].usage);
+
+    let empty = evaluate_expression_with_configuration(
+        "sort[Int()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty input and output have no allocation ordinal");
+    assert_eq!(empty.value, Value::IntVector(Vec::new()));
+    assert_eq!(empty.usage.live_evaluation_bytes, 0);
+    assert_eq!(empty.usage.peak_live_evaluation_bytes, 0);
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+}
+
+#[test]
+fn sort_large_bounded_input_has_linear_semantic_work_and_exact_limit_seam() {
+    let success = evaluate_expression_with_configuration(
+        "sort iota 4096",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32_768),
+            max_live_evaluation_bytes: Some(65_536),
+            max_work_units: Some(8_192),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect("bounded large sort");
+    assert_eq!(success.value.len(), 4_096);
+    assert_eq!(success.usage.peak_live_evaluation_bytes, 65_536);
+    assert_eq!(success.usage.work_units, 8_192);
+    assert_eq!(success.usage.allocation_attempts, 2);
+
+    let refusal = evaluate_expression_with_configuration(
+        "sort iota 4096",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32_768),
+            max_live_evaluation_bytes: Some(65_536),
+            max_work_units: Some(8_191),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("one work unit below sort schedule");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(4_096));
+    assert_eq!(resource(&refusal).refused_charge, Some(4_096));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 4_096);
     assert_eq!(usage.allocation_attempts, 1);
 }
 
