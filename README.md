@@ -66,6 +66,13 @@ cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
 cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
+Inside the REPL, the exact case-sensitive `.cls` meta-command clears and homes
+interactive Windows consoles or ANSI terminals with a nonempty, non-`dumb`
+`TERM`; Windows PTYs that are not native console screen buffers use the ANSI
+path. Redirected output remains byte-clean, while unsupported terminals and
+terminal failures produce a deterministic diagnostic and leave the session
+running.
+
 In the REPL, `.exit` ends the session successfully without evaluating source.
 Matching is case-sensitive and exact after removing the line ending and
 ignoring surrounding ASCII spaces or tabs; arguments, prefixes, and trailing
