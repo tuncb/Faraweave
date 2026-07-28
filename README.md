@@ -86,11 +86,15 @@ and `build_native_from_verified_program`. Named compilation retains a logical
 source name inside the artifact so later execution diagnostics do not depend
 on the artifact's filesystem path.
 
-FWIR v1 commits to physical format 1.0, semantic contract 1.0, `.fwir`, and
-the documented API and CLI spellings. Same-major forward-minor artifacts are
-accepted only when every addition is explicitly optional and advisory;
-unknown mandatory semantics and unsupported current-minor extensions are
-rejected before a backend runs. Faraweave is the authoritative producer;
+FWIR v1 commits to physical format 1.0, semantic contract 1.1, `.fwir`, and
+the documented API and CLI spellings. The canonical semantic-1.0 corpus
+remains accepted and round-trips byte-for-byte. Artifacts that use the
+backend-native math identities carry the known mandatory feature
+`7=BackendNativeMathV1`; artifacts without those identities need not carry it.
+Unknown class-1 advisory features and explicitly optional, non-identity
+forward-minor sections may be skipped. Unknown mandatory semantics,
+unsupported semantic minors, and other unsupported current-minor extensions
+are rejected before a backend runs. Faraweave is the authoritative producer;
 accepted canonical bytes do not become trusted because of `PROD` metadata,
 and third-party producer support is not promised.
 

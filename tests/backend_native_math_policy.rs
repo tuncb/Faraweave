@@ -56,14 +56,45 @@ fn order_key(bits: u64) -> u64 {
 
 fn conforms(actual: f64, case: FiniteCase) -> bool {
     let reference = f64::from_bits(case.reference);
-    if !actual.is_finite()
-        || actual.is_sign_negative() != reference.is_sign_negative()
-        || (actual == 0.0 && actual.to_bits() != reference.to_bits())
-    {
+    if !actual.is_finite() || actual.is_sign_negative() != reference.is_sign_negative() {
         return false;
+    }
+    if reference == 0.0 {
+        return actual.to_bits() == case.reference;
     }
     let ulps = order_key(actual.to_bits()).abs_diff(order_key(case.reference));
     ulps <= case.max_ulps || (actual - reference).abs() <= case.max_absolute
+}
+
+#[test]
+fn backend_native_math_envelope_handles_underflow_zero_asymmetry() {
+    let positive_minimum_reference = FiniteCase {
+        operation: Operation::Exp,
+        input: 0,
+        reference: 1,
+        max_ulps: 1,
+        max_absolute: 0.0,
+    };
+    assert!(conforms(0.0, positive_minimum_reference));
+    assert!(!conforms(-0.0, positive_minimum_reference));
+    assert!(!conforms(f64::NAN, positive_minimum_reference));
+    assert!(!conforms(f64::INFINITY, positive_minimum_reference));
+
+    for (reference, matching_zero, wrong_zero, same_sign_nonzero) in [
+        (0, 0.0, -0.0, f64::from_bits(1)),
+        (1_u64 << 63, -0.0, 0.0, f64::from_bits((1_u64 << 63) | 1)),
+    ] {
+        let signed_zero_reference = FiniteCase {
+            operation: Operation::Exp,
+            input: 0,
+            reference,
+            max_ulps: u64::MAX,
+            max_absolute: f64::MAX,
+        };
+        assert!(conforms(matching_zero, signed_zero_reference));
+        assert!(!conforms(wrong_zero, signed_zero_reference));
+        assert!(!conforms(same_sign_nonzero, signed_zero_reference));
+    }
 }
 
 #[test]
