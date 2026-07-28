@@ -1,8 +1,8 @@
 use faraweave::{
     AllocationFailureInjection, CompilerConfiguration, DomainErrorReason, ErrorKind,
-    EvaluationConfiguration, ExecutionProfile, NativePlatform, ResourceLimits, ScalarType, Type,
-    Value, evaluate_expression, evaluate_expression_with_configuration, evaluate_source,
-    format_type, format_value, select_c_compiler,
+    EvaluationConfiguration, ExecutionProfile, NativePlatform, ResourceLimits, ScalarType,
+    SourceLocation, Type, Value, evaluate_expression, evaluate_expression_with_configuration,
+    evaluate_source, format_type, format_value, select_c_compiler,
 };
 
 fn formatted(source: &str) -> String {
@@ -121,6 +121,93 @@ fn div_integer_faults_and_strict_binary64_are_exact() {
             panic!("{source} did not return Double");
         };
         assert_eq!(value.to_bits(), expected_bits, "{source}");
+    }
+}
+
+#[test]
+fn div_bool_operands_are_rejected_with_exact_public_type_diagnostics() {
+    let cases = [
+        (
+            "div[true 2]",
+            1,
+            5,
+            vec![
+                Type::Scalar(ScalarType::Bool),
+                Type::Scalar(ScalarType::Int),
+            ],
+        ),
+        (
+            "div[2 false]",
+            2,
+            7,
+            vec![
+                Type::Scalar(ScalarType::Int),
+                Type::Scalar(ScalarType::Bool),
+            ],
+        ),
+        (
+            "div[true false]",
+            1,
+            5,
+            vec![
+                Type::Scalar(ScalarType::Bool),
+                Type::Scalar(ScalarType::Bool),
+            ],
+        ),
+        (
+            "div[(true false) 2]",
+            1,
+            5,
+            vec![
+                Type::Vector(ScalarType::Bool),
+                Type::Scalar(ScalarType::Int),
+            ],
+        ),
+        (
+            "div[2.0 (true false)]",
+            2,
+            9,
+            vec![
+                Type::Scalar(ScalarType::Double),
+                Type::Vector(ScalarType::Bool),
+            ],
+        ),
+        (
+            "div[(1 2) false]",
+            2,
+            11,
+            vec![
+                Type::Vector(ScalarType::Int),
+                Type::Scalar(ScalarType::Bool),
+            ],
+        ),
+    ];
+
+    for (source, position, offset, actual_types) in cases {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.kind.diagnostic_name(), "TypeError", "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("div"), "{source}");
+        assert_eq!(error.argument_position, Some(position), "{source}");
+        assert_eq!(
+            error.location,
+            SourceLocation {
+                offset,
+                line: 1,
+                column: offset,
+            },
+            "{source}"
+        );
+        assert_eq!(error.span, None, "{source}");
+        assert_eq!(
+            error.message,
+            format!(
+                "div arguments do not match an accepted signature; first unsupported argument is {position}"
+            ),
+            "{source}"
+        );
+        assert!(error.expected_types.is_empty(), "{source}");
+        assert_eq!(error.actual_types, actual_types, "{source}");
     }
 }
 
