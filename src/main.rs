@@ -545,6 +545,7 @@ fn read_repl_line(
     let mut bytes = Vec::new();
     let mut rejection = None;
     let mut consumed_any = false;
+    let mut consumed_lf = false;
     loop {
         let available = input.fill_buf()?;
         if available.is_empty() {
@@ -568,6 +569,7 @@ fn read_repl_line(
         let consumed = newline.map_or(available.len(), |position| position + 1);
         input.consume(consumed);
         if newline.is_some() {
+            consumed_lf = true;
             break;
         }
     }
@@ -577,7 +579,7 @@ fn read_repl_line(
     if !consumed_any {
         return Ok(ReplLineRead::Eof);
     }
-    if bytes.last() == Some(&b'\r') {
+    if consumed_lf && bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
     if bytes.len() > maximum_bytes {
@@ -1204,6 +1206,26 @@ mod repl_tests {
         assert_eq!(
             read_repl_line(&mut input, 8, &mut injection).expect("line after refusal"),
             ReplLineRead::Line("ok".to_owned())
+        );
+    }
+
+    #[test]
+    fn bounded_reader_preserves_and_counts_lone_cr_at_eof() {
+        let mut input = Cursor::new(b"1\r");
+        let mut injection = ReplAllocationFailureInjection::none();
+        assert_eq!(
+            read_repl_line(&mut input, 2, &mut injection).expect("EOF line with lone CR"),
+            ReplLineRead::Line("1\r".to_owned())
+        );
+        assert_eq!(
+            read_repl_line(&mut input, 2, &mut injection).expect("end after lone CR"),
+            ReplLineRead::Eof
+        );
+
+        let mut input = Cursor::new(b"1\r");
+        assert_eq!(
+            read_repl_line(&mut input, 1, &mut injection).expect("bounded EOF line with lone CR"),
+            ReplLineRead::Oversized
         );
     }
 

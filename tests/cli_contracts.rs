@@ -340,6 +340,17 @@ fn cli_repl_history_preserves_inclusion_text_numbering_and_crlf() {
 }
 
 #[test]
+fn cli_repl_eof_lone_cr_is_preserved_and_diagnosed() {
+    let result = repl_output(b"1\r");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > ");
+    assert_eq!(
+        result.stderr,
+        b"<repl>:1:2: InvalidByte: invalid source byte\n"
+    );
+}
+
+#[test]
 fn cli_repl_history_is_process_local_and_clear_remains_unsupported() {
     let first = repl_output(b"1\n.history\n");
     assert!(first.status.success());
