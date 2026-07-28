@@ -11,7 +11,7 @@
 # Decisions
 
 If you make a decision, document it under decisions folder. Create a markdown file per issue. Be brief, write at most 3-4 sentences per decision.
-Shorter without losing meaning is better.
+Shorter without losing meaning is better. Treat decisions as historical records not ideas that must be followed.
 
 # Testing
 
