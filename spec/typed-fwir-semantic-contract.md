@@ -647,26 +647,26 @@ maps every wire field and invariant in
 
 | Requirement | Final evidence |
 | --- | --- |
-| `FWIR-SEM-001` | `validate_product_cutover`; `public_source_artifact_execution_c_and_resource_traces_are_differential` |
-| `FWIR-SEM-002` | `valid_fixtures_cover_every_node_and_edge_family`; `verifier_category_winners_follow_the_normative_order` |
-| `FWIR-SEM-003` | `typed_public_api_parameter_contract`; `cli_parameters_and_diagnostics_contract` |
-| `FWIR-SEM-004` | `s16_empty_singleton_promotion_and_shape_contracts`; `deep_structural_values_and_types_format_and_drop_iteratively` |
-| `FWIR-SEM-005` | `canonical_binary64_format_boundaries`; `typed_api_rejects_noncanonical_nan_without_normalizing_it`; `resource_observer_reports_commit_refusal_and_cleanup_order` |
-| `FWIR-SEM-006` | `parses_literals_calls_tuples_parameters_and_fanout`; `deep_unary_programs_use_iterative_parse_analysis_and_evaluation` |
-| `FWIR-SEM-007` | `production_registry_is_complete_and_numeric_lookups_are_checked`; `every_selected_id_emits_a_direct_kernel_symbol_without_type_redispatch` |
-| `FWIR-SEM-008` | `checked_arithmetic_has_no_partial_result`; `vector_tuple_and_work_limits_cover_zero_exact_and_one_past`; golden IDs `S16-16/17/19/22` |
-| `FWIR-SEM-009` | `tup_structural_format_spread_and_direct_preservation`; `lifting_and_tuples_are_canonical` |
-| `FWIR-SEM-010` | `tuple_allocation_ordinals_exclude_empty_tables_and_cleanup_failures`; `live_limit_observes_children_before_outer_tuple_admission`; deep tuple journeys |
-| `FWIR-SEM-011` | `fan_stable_id_matrix`; `fan_out_prefix_placeholder_borrows_prepare_and_preserves_elements`; generated-C fan-out parity |
-| `FWIR-SEM-012` | `parameter_header_reason_and_span_contract_is_structured`; authored failure corpus; CLI diagnostics |
-| `FWIR-SEM-013` | `profile_configuration_precedes_source_and_backend_analysis`; `whole_program_static_precedence_is_arity_then_type_then_shape` |
-| `FWIR-SEM-014` | `refusal_precedence_is_vector_then_live_then_work_then_allocation`; `failure_usage_is_post_cleanup_and_work_remains_monotonic`; observer parity |
-| `FWIR-SEM-015` | `resource_profiles_limits_and_ordinals`; `generated_runtime_embeds_profile_and_verified_primitive_selection` |
-| `FWIR-SEM-016` | `identity_result_root_and_feature_invariants_are_rejected`; `deterministic_mutation_corpus_is_rejected_without_panic_or_partial_program` |
-| `FWIR-SEM-017` | `exact_ir_golden_digests_cover_every_source_construct`; `evaluates_complete_primitive_surface` |
-| `FWIR-SEM-018` | `same_major_optional_compatibility_and_mandatory_rejection_are_exact`; canonical decode/re-encode tests |
-| `FWIR-SEM-019` | `validate_product_cutover`; `traceability_references_complete_executable_evidence_sets` |
-| `FWIR-SEM-020` | `validate_product_cutover`; exact changed-file and decision review |
+| `FWIR-SEM-001` | `python:tools/validation/contracts.py::validate_product_cutover`<br>`rust:tests/fwir_public_contracts.rs::public_source_artifact_execution_c_and_resource_traces_are_differential` |
+| `FWIR-SEM-002` | `rust:src/typed_program.rs::valid_fixtures_cover_every_node_and_edge_family`<br>`rust:src/typed_program.rs::verifier_category_winners_follow_the_normative_order` |
+| `FWIR-SEM-003` | `rust:tests/parity_contracts.rs::typed_public_api_parameter_contract`<br>`rust:tests/cli_contracts.rs::cli_parameters_and_diagnostics_contract` |
+| `FWIR-SEM-004` | `rust:tests/parity_contracts.rs::s16_empty_singleton_promotion_and_shape_contracts`<br>`rust:tests/parity_contracts.rs::deep_structural_values_and_types_format_and_drop_iteratively` |
+| `FWIR-SEM-005` | `rust:tests/parity_contracts.rs::canonical_binary64_format_boundaries`<br>`rust:tests/resource_contracts.rs::typed_api_rejects_noncanonical_nan_without_normalizing_it`<br>`rust:tests/resource_contracts.rs::resource_observer_reports_commit_refusal_and_cleanup_order` |
+| `FWIR-SEM-006` | `rust:src/parser.rs::parses_literals_calls_tuples_parameters_and_fanout`<br>`rust:tests/parity_contracts.rs::deep_unary_programs_use_iterative_parse_analysis_and_evaluation` |
+| `FWIR-SEM-007` | `rust:src/semantic_registry.rs::production_registry_is_complete_and_numeric_lookups_are_checked`<br>`rust:src/c_emitter.rs::every_selected_id_emits_a_direct_kernel_symbol_without_type_redispatch` |
+| `FWIR-SEM-008` | `rust:tests/parity_contracts.rs::checked_arithmetic_has_no_partial_result`<br>`rust:tests/resource_contracts.rs::vector_tuple_and_work_limits_cover_zero_exact_and_one_past`<br>`rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct` |
+| `FWIR-SEM-009` | `rust:tests/parity_contracts.rs::tup_structural_format_spread_and_direct_preservation`<br>`rust:src/evaluator.rs::lifting_and_tuples_are_canonical` |
+| `FWIR-SEM-010` | `rust:tests/resource_contracts.rs::tuple_allocation_ordinals_exclude_empty_tables_and_cleanup_failures`<br>`rust:tests/resource_contracts.rs::live_limit_observes_children_before_outer_tuple_admission`<br>`rust:tests/parity_contracts.rs::deep_structural_values_and_types_format_and_drop_iteratively` |
+| `FWIR-SEM-011` | `rust:tests/parity_contracts.rs::fan_stable_id_matrix`<br>`rust:src/lowering.rs::fan_out_prefix_placeholder_borrows_prepare_and_preserves_elements`<br>`rust:src/c_emitter.rs::public_generated_c_matches_direct_ir_for_success_and_failure_corpus` |
+| `FWIR-SEM-012` | `rust:tests/resource_contracts.rs::parameter_header_reason_and_span_contract_is_structured`<br>`rust:tests/golden_corpus.rs::authored_section_15_and_16_failure_golden_corpus`<br>`rust:tests/cli_contracts.rs::cli_parameters_and_diagnostics_contract` |
+| `FWIR-SEM-013` | `rust:tests/resource_contracts.rs::profile_configuration_precedes_source_and_backend_analysis`<br>`rust:src/lowering.rs::whole_program_static_precedence_is_arity_then_type_then_shape` |
+| `FWIR-SEM-014` | `rust:tests/resource_contracts.rs::refusal_precedence_is_vector_then_live_then_work_then_allocation`<br>`rust:tests/resource_contracts.rs::failure_usage_is_post_cleanup_and_work_remains_monotonic`<br>`rust:tests/fwir_public_contracts.rs::public_source_artifact_execution_c_and_resource_traces_are_differential` |
+| `FWIR-SEM-015` | `rust:tests/parity_contracts.rs::resource_profiles_limits_and_ordinals`<br>`rust:tests/resource_contracts.rs::generated_runtime_embeds_profile_and_verified_primitive_selection` |
+| `FWIR-SEM-016` | `rust:src/typed_program.rs::identity_result_root_and_feature_invariants_are_rejected`<br>`rust:tests/fwir_conformance.rs::deterministic_mutation_corpus_is_rejected_without_panic_or_partial_program` |
+| `FWIR-SEM-017` | `rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:src/evaluator.rs::evaluates_complete_primitive_surface` |
+| `FWIR-SEM-018` | `rust:tests/fwir_conformance.rs::same_major_optional_compatibility_and_mandatory_rejection_are_exact`<br>`rust:tests/fwir_conformance.rs::canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral` |
+| `FWIR-SEM-019` | `python:tools/validation/contracts.py::validate_product_cutover`<br>`rust:tests/fwir_conformance.rs::traceability_references_complete_executable_evidence_sets` |
+| `FWIR-SEM-020` | `python:tools/validation/contracts.py::validate_product_cutover`<br>`command:contracts-review` |
 
 The former parameter, tuple, and fan-out requirement families are represented
 respectively by `FWIR-SEM-003/004/007/008/012/013/014`,
