@@ -96,11 +96,9 @@ its specified record size. A known section appears at most once.
 | 14 | `NODE` | `3` | 56 | executable nodes |
 | 15 | `OWNR` | `3` | 12 | logical ownership and release |
 | 16 | `ROOT` | `3` | 8 | ordered program roots |
+| 17 | `APPL` | `3` | 8 | explicit application plans |
 | 18 | `OPRF` | `3` | 16 | stable built-in operation references |
 | 32769 | `PROD` | `0` | 0 | optional producer metadata |
-
-Section ID 17 is allocated to issue #36's application-plan records and is not
-defined or accepted by issue #38 in isolation.
 
 Every fixed-record section contains only consecutive records; its record count
 is `payload_length / record_size`.
@@ -120,10 +118,14 @@ mandatory semantic feature and class `1` is optional advisory metadata.
 Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`,
-`4=FanOut`, and `6=OperationReferences`; ID 5 is allocated to issue #36 and
-zero is invalid. Known semantic capabilities MUST have class `0`: pairing a
-known current ID with class `1` is a
+`4=FanOut`, `5=ApplicationPlans`, `6=OperationReferences`, and
+`7=BackendNativeMathV1`; zero is invalid. IDs 1 through 7 are semantic capabilities and
+MUST have class `0`: pairing a known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
+Feature 5 requires semantic minor 1 and physical format minor 1.
+Feature 6 requires semantic minor 1 and physical format minor 1.
+Feature 7 requires semantic minor 1 but does not by itself raise the physical
+format minor.
 
 `STRS` begins with `count:u32`, followed by `count` descriptors
 `offset:u32, length:u32`, followed by one concatenated byte area. Offsets are
@@ -203,13 +205,21 @@ outside SelectedApply.
   `a2=implementation_id`, `a3=primitive_origin`,
   `a4=static_anchor` (`NONE` when absent), `a5=dynamic_check_start`,
   `a6=dynamic_check_count`, and `a7=0`. Stable semantic IDs fit `u16`, so the
-  upper 16 bits of `a0` through `a2` MUST be zero.
+  upper 16 bits of `a0` through `a2` MUST be zero. Lift adds
+  `4=ContainerScalar` and `5=ContainerVector` only under feature 5.
 - FanOut: `a0=branch_start`, `a1=branch_count`,
   `a2=keyword_origin`; `a3` through `a7` are zero.
 
 `OWNR` is `owner:u32, release_kind:u8, reserved[3], release_index:u32`.
 Release kind is `1=Node` or `2=Root`. `ROOT` is
 `node:u32, origin:u32`.
+
+`APPL` is present exactly when feature 5 is present and at least one
+SelectedApply exists. Each record is `node:u32, application_plan_id:u16,
+reserved:u16`; records cover every SelectedApply exactly once in ascending
+node order. Application-plan IDs are nonzero, fit `u16`, and must match the
+selected implementation's registry descriptor. A v1.0 artifact omits `APPL`
+and reconstructs the plan from its validated implementation identity.
 
 `OPRF` is `primitive_id:u16, signature_id:u16, implementation_id:u16,
 reserved:u16, origin:u32, reserved:u32`. Both reserved fields are zero.
@@ -241,7 +251,8 @@ asserts provenance but conveys no trust.
 | `parameters` | `PARM` plus `STRS` |
 | `types`, `type_elements` | `TYPE`, `TYEL` |
 | `constants`, `constant_elements` | `CONS`, `COEL` |
-| `nodes`, including every variant field | `NODE` |
+| `nodes`, except the application-plan sidecar | `NODE` |
+| `SelectedApply.application_plan_id` | `APPL` with feature 5; reconstructed from the validated implementation identity in v1.0 |
 | `edges`, `shape_checks` | `EDGE`, `SHCK` |
 | `origins` | `ORIG` |
 | `operation_references` | `OPRF` |
@@ -287,10 +298,11 @@ The physical format version and semantic contract version are separate.
 - The decoded `MODL` semantic version is passed unchanged to semantic
   verification. The current semantic verifier accepts major `1` and a minor
   no greater than its supported minor.
+- Format minor 1 is emitted when feature 5 or feature 6 is present; either
+  sidecar feature at format or semantic minor 0 is noncanonical/unsupported.
 - `OPRF` records or feature `6=OperationReferences` require semantic version
-  1.1. Semantic 1.0 artifacts cannot opt into that mandatory capability;
-  semantic 1.1 without `OPRF` remains valid when every declared feature is
-  understood.
+  1.1 and physical format minor 1. Semantic 1.0/physical 1.0 artifacts cannot
+  opt into that mandatory sidecar capability.
 - A lower format minor is accepted when the major matches and every required
   v1 section/record rule used by the artifact is supported.
 
@@ -303,8 +315,11 @@ because a v1 decoder cannot reconstruct the program identity projection.
 Unknown mandatory feature IDs are rejected before `RawProgram` construction.
 Unknown class-1 advisory feature IDs may be skipped. Unknown feature classes,
 node kinds, type kinds, scalar types, access modes, conversions, ownership
-modes, release kinds, primitive IDs, signature IDs, or implementation IDs are
-always rejected. A known feature ID with class `1` is likewise rejected as
+modes, release kinds, primitive IDs, signature IDs, implementation IDs, or
+application-plan IDs are always rejected. When any SelectedApply exists,
+feature 5 requires mandatory section 17 and one explicit nonzero plan per
+SelectedApply; section 17 without feature 5 is rejected. A known feature ID
+with class `1` is likewise rejected as
 `NonCanonicalRecord`; optionality is granted only to an unknown feature ID
 explicitly marked class `1`, not to a known semantic capability or an unknown
 enum value inside a known semantic record.
@@ -317,7 +332,8 @@ for a greater format minor, and accepts/skips an unknown class-1 advisory
 feature; those forward-compatible bytes are not retained in
 `VerifiedProgram`. Decode-encode is therefore byte-identical for supported
 canonical v1.0 artifacts, while an accepted forward-minor artifact re-encodes
-as canonical v1.0 with advisory extensions omitted.
+as canonical v1.0 with advisory extensions omitted. A semantic 1.1 artifact
+using mandatory feature 5 re-encodes as canonical physical v1.1.
 
 ## 8. Checked decoding and hostile lengths
 
@@ -343,7 +359,7 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known semantic IDs), tag, boolean, optional sentinel, unused
+   class `1` on known IDs 1 through 7), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after
@@ -456,9 +472,10 @@ issue rather than treating this comparison as authorization.
 
 ## 12. Accepted product, producer, and security policy
 
-Physical format 1.0, semantic contracts 1.0 and 1.1, canonical program-identity bytes,
-the `.fwir` extension, and the library and CLI spellings above are the stable
-FWIR v1 product contract. A compatible addition uses the same-major
+Physical formats 1.0 and 1.1, semantic contracts 1.0 and 1.1, canonical
+program-identity bytes, the `.fwir` extension, and the library and CLI
+spellings above are the stable FWIR v1 product contract. A compatible addition
+uses the same-major
 forward-minor and explicitly optional advisory mechanisms in section 7;
 changing identity-participating meaning, a stable semantic ID, or a mandatory
 record requires a new incompatible version.

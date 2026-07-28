@@ -1,0 +1,3 @@
+# Issue #39 — backend-native math policy
+
+The ten reserved backend-native unary Double operations use Rust `f64` and C `<math.h>` directly, with exact portable special-value/sign rules and operation-specific finite envelopes instead of cross-library bit equality. FWIR semantic 1.1 marks every artifact using primitive IDs 29–38 with mandatory feature `7=BackendNativeMathV1`, so older consumers reject rather than redispatch. NaNs normalize at the language boundary, caller floating state is restored, and `errno` and exception flags never become language errors; all resource, diagnostic, ownership, and publication behavior remains exact.

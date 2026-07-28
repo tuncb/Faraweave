@@ -87,6 +87,16 @@ node.variant_words	canonical-complete	node-unused-variant
 node.primitive_id	canonical-complete	primitive-id
 node.signature_id	canonical-complete	signature-id
 node.implementation_id	canonical-complete	implementation-id
+appl.feature_required	canonical-application-plans	application-plan-section-without-feature
+appl.section_required	canonical-application-plans	application-plan-section-missing
+appl.record_count	canonical-application-plans	application-plan-count
+appl.node_order	canonical-application-plans	application-plan-node-order
+appl.node_unique	canonical-application-plans	application-plan-node-duplicate
+appl.reserved	canonical-application-plans	application-plan-reserved
+appl.plan_id_known	canonical-application-plans	application-plan-id-unknown
+appl.implementation_match	canonical-application-plans	application-plan-id-mismatch
+appl.format_minor	canonical-application-plans	application-plan-format-minor
+appl.semantic_minor	canonical-application-plans	application-plan-semantic-minor
 ownr.owner	canonical-complete	ownership-owner
 ownr.release_kind	canonical-complete	ownership-release-kind
 ownr.reserved	canonical-complete	ownership-reserved

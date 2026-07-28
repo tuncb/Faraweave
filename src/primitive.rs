@@ -1,6 +1,9 @@
 use crate::parser::{Expr, ExprKind, Program};
 use crate::resources::ResourceContext;
-use crate::semantic_registry::{ScalarKernel, implementation_from_numeric, primitive_from_name};
+use crate::semantic_registry::{
+    ApplicationPlan, ScalarKernel, WorkAdmission, application_plan_from_numeric,
+    implementation_from_numeric, primitive_from_name,
+};
 use crate::strict_float::{self, Binary64Operation};
 use crate::{
     DomainErrorContext, DomainErrorReason, Error, ErrorKind, ScalarType, SourceLocation, Value,
@@ -78,6 +81,7 @@ pub(crate) struct SelectedApplicationArgument<'a> {
 
 pub(crate) fn apply_implementation(
     implementation_id: u16,
+    application_plan_id: u16,
     arguments: &[SelectedApplicationArgument<'_>],
     lift: crate::LiftMode,
     result_type: ScalarType,
@@ -86,6 +90,11 @@ pub(crate) fn apply_implementation(
 ) -> Result<(Value, bool), Error> {
     let descriptor = implementation_from_numeric(implementation_id)
         .map_err(|_| type_runtime_error("selected implementation", location))?;
+    let application_plan = application_plan_from_numeric(application_plan_id)
+        .map_err(|_| type_runtime_error("selected application plan", location))?;
+    if descriptor.application_plan != application_plan {
+        return Err(type_runtime_error("selected application plan", location));
+    }
     let producer = descriptor.primitive_name;
     if descriptor.kernel == ScalarKernel::IotaInt {
         let Some(SelectedApplicationArgument {
@@ -103,7 +112,7 @@ pub(crate) fn apply_implementation(
         let admitted = resources.admit_vector_with_work(
             ScalarType::Int,
             length,
-            length,
+            admitted_work(application_plan, length, arguments, producer, location)?,
             location,
             producer,
         )?;
@@ -118,6 +127,12 @@ pub(crate) fn apply_implementation(
         return Ok((Value::IntVector(values), true));
     }
 
+    if matches!(
+        lift,
+        crate::LiftMode::ContainerScalar | crate::LiftMode::ContainerVector
+    ) {
+        return Err(type_runtime_error("container implementation", location));
+    }
     let accounted = !matches!(lift, crate::LiftMode::Scalar);
     let count = if accounted {
         arguments
@@ -128,9 +143,19 @@ pub(crate) fn apply_implementation(
         1
     };
     let admitted = if accounted {
-        resources.admit_vector_with_work(result_type, count, count, location, producer)?
+        resources.admit_vector_with_work(
+            result_type,
+            count,
+            admitted_work(application_plan, count, arguments, producer, location)?,
+            location,
+            producer,
+        )?
     } else {
-        resources.charge_work(count, location, producer)?;
+        resources.charge_work(
+            admitted_work(application_plan, count, arguments, producer, location)?,
+            location,
+            producer,
+        )?;
         0
     };
     let mut scalar_results = Vec::new();
@@ -213,12 +238,34 @@ pub(crate) fn apply_operation_reference(
     }
     apply_implementation(
         reference.implementation_id,
+        descriptor.application_plan.id.numeric(),
         arguments,
         lift,
         result_type,
         location,
         resources,
     )
+}
+
+fn admitted_work(
+    plan: ApplicationPlan,
+    result_cardinality: usize,
+    arguments: &[SelectedApplicationArgument<'_>],
+    producer: &str,
+    location: SourceLocation,
+) -> Result<usize, Error> {
+    match plan.resources.work {
+        WorkAdmission::Constant(value) => {
+            usize::try_from(value).map_err(|_| resource_size_error(producer, location))
+        }
+        WorkAdmission::ResultCardinality => Ok(result_cardinality),
+        WorkAdmission::OperandCardinality(position) => position
+            .checked_sub(1)
+            .map(usize::from)
+            .and_then(|index| arguments.get(index))
+            .map(|argument| argument.value.len())
+            .ok_or_else(|| type_runtime_error(producer, location)),
+    }
 }
 
 pub(crate) fn implementation_name(implementation_id: u16) -> Option<&'static str> {
