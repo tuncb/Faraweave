@@ -139,10 +139,13 @@ enum RegistryValidationError {
     UnknownSignatureId,
     UnknownImplementationId,
     UnknownApplicationPlanId,
+    DuplicateApplicationPlanId,
+    MissingApplicationPlanId,
     InvalidApplicationPlan,
     InconsistentPrimitiveIdentity,
     InconsistentSignatureIdentity,
     InconsistentImplementationIdentity,
+    InconsistentApplicationPlanIdentity,
 }
 
 const PRIMITIVE_COUNT: u16 = 19;
@@ -182,6 +185,8 @@ const IOTA_PLAN: ApplicationPlan = ApplicationPlan {
         work: WorkAdmission::ResultCardinality,
     },
 };
+
+const APPLICATION_PLANS: &[ApplicationPlan] = &[ELEMENTWISE_PLAN, IOTA_PLAN];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -643,10 +648,10 @@ pub(crate) fn implementation_from_numeric(
 pub(crate) fn application_plan_from_numeric(
     numeric: u16,
 ) -> Result<ApplicationPlan, RegistryLookupError> {
-    SEMANTIC_REGISTRY
+    APPLICATION_PLANS
         .iter()
-        .find(|descriptor| descriptor.application_plan.id.numeric() == numeric)
-        .map(|descriptor| descriptor.application_plan)
+        .find(|plan| plan.id.numeric() == numeric)
+        .copied()
         .ok_or(RegistryLookupError::ApplicationPlanId)
 }
 
@@ -670,6 +675,15 @@ pub(crate) fn conversion(actual: ScalarType, accepted: ScalarType) -> Option<Con
 
 #[allow(dead_code)]
 fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryValidationError> {
+    validate_registry_with_application_plans(registry, APPLICATION_PLANS)
+}
+
+fn validate_registry_with_application_plans(
+    registry: &[SemanticDescriptor],
+    application_plans: &[ApplicationPlan],
+) -> Result<(), RegistryValidationError> {
+    validate_application_plan_catalog(application_plans)?;
+
     for descriptor in registry {
         if descriptor.primitive_id.numeric() == 0
             || descriptor.primitive_id.numeric() > PRIMITIVE_COUNT
@@ -693,6 +707,13 @@ fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryVali
         }
         if !valid_application_plan(descriptor) {
             return Err(RegistryValidationError::InvalidApplicationPlan);
+        }
+        if application_plans
+            .iter()
+            .find(|plan| plan.id == descriptor.application_plan.id)
+            .is_none_or(|plan| *plan != descriptor.application_plan)
+        {
+            return Err(RegistryValidationError::InconsistentApplicationPlanIdentity);
         }
     }
 
@@ -779,6 +800,34 @@ fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryVali
                 || descriptor.kernel != canonical.kernel
         }) {
             return Err(RegistryValidationError::InconsistentImplementationIdentity);
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_application_plan_catalog(
+    application_plans: &[ApplicationPlan],
+) -> Result<(), RegistryValidationError> {
+    for (index, plan) in application_plans.iter().enumerate() {
+        if plan.id.numeric() == 0 || plan.id.numeric() > APPLICATION_PLAN_COUNT {
+            return Err(RegistryValidationError::UnknownApplicationPlanId);
+        }
+        if application_plans
+            .iter()
+            .skip(index + 1)
+            .any(|other| other.id == plan.id)
+        {
+            return Err(RegistryValidationError::DuplicateApplicationPlanId);
+        }
+    }
+
+    for expected in 1..=APPLICATION_PLAN_COUNT {
+        if !application_plans
+            .iter()
+            .any(|plan| plan.id.numeric() == expected)
+        {
+            return Err(RegistryValidationError::MissingApplicationPlanId);
         }
     }
 
@@ -1057,6 +1106,44 @@ mod tests {
         assert_eq!(
             validate_registry(&changed_application_plan),
             Err(RegistryValidationError::InvalidApplicationPlan)
+        );
+    }
+
+    #[test]
+    fn application_plan_ids_reject_different_otherwise_valid_meanings() {
+        const WHOLE_INT: &[OperandDescriptor] = &[OperandDescriptor {
+            element_type: ScalarType::Int,
+            consumption: OperandConsumption::WholeVector,
+        }];
+        let mut conflicting = SEMANTIC_REGISTRY.to_vec();
+        conflicting[0].parameters = WHOLE_INT;
+        conflicting[0].application_plan = ApplicationPlan {
+            id: ApplicationPlanId(1),
+            result_cardinality: ResultCardinality::Scalar,
+            resources: ResourceAdmissionPlan {
+                work: WorkAdmission::OperandCardinality(1),
+            },
+        };
+
+        assert!(valid_application_plan(&conflicting[0]));
+        assert_eq!(
+            validate_registry(&conflicting),
+            Err(RegistryValidationError::InconsistentApplicationPlanIdentity)
+        );
+    }
+
+    #[test]
+    fn application_plan_catalog_rejects_missing_and_duplicate_ids() {
+        assert_eq!(
+            validate_registry_with_application_plans(SEMANTIC_REGISTRY, &[ELEMENTWISE_PLAN]),
+            Err(RegistryValidationError::MissingApplicationPlanId)
+        );
+        assert_eq!(
+            validate_registry_with_application_plans(
+                SEMANTIC_REGISTRY,
+                &[ELEMENTWISE_PLAN, IOTA_PLAN, IOTA_PLAN],
+            ),
+            Err(RegistryValidationError::DuplicateApplicationPlanId)
         );
     }
 
