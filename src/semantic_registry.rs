@@ -57,6 +57,7 @@ pub(crate) enum ScalarKernel {
     GreaterThanInt,
     GreaterThanDouble,
     IotaInt,
+    SqrtDouble,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,9 +97,8 @@ enum RegistryValidationError {
     InconsistentImplementationIdentity,
 }
 
-const PRIMITIVE_COUNT: u16 = 19;
-const SIGNATURE_COUNT: u16 = 34;
-const IMPLEMENTATION_COUNT: u16 = 34;
+const SIGNATURE_COUNT: u16 = 35;
+const IMPLEMENTATION_COUNT: u16 = 35;
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -275,6 +275,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         GreaterThanDouble
     ),
     descriptor!(19, "iota", 34, 34, INT1, Int, Iota, IotaInt),
+    descriptor!(29, "sqrt", 35, 35, DOUBLE1, Double, Elementwise, SqrtDouble),
 ];
 
 impl PrimitiveId {
@@ -356,9 +357,7 @@ pub(crate) fn conversion(actual: ScalarType, accepted: ScalarType) -> Option<Con
 #[allow(dead_code)]
 fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryValidationError> {
     for descriptor in registry {
-        if descriptor.primitive_id.numeric() == 0
-            || descriptor.primitive_id.numeric() > PRIMITIVE_COUNT
-        {
+        if primitive_from_numeric(descriptor.primitive_id.numeric()).is_err() {
             return Err(RegistryValidationError::UnknownPrimitiveId);
         }
         if descriptor.signature_id.numeric() == 0
@@ -395,10 +394,10 @@ fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryVali
         }
     }
 
-    for expected in 1..=PRIMITIVE_COUNT {
+    for expected in SEMANTIC_REGISTRY {
         if !registry
             .iter()
-            .any(|descriptor| descriptor.primitive_id.numeric() == expected)
+            .any(|descriptor| descriptor.primitive_id == expected.primitive_id)
         {
             return Err(RegistryValidationError::MissingPrimitiveId);
         }
@@ -502,6 +501,7 @@ mod tests {
             (18, "greater_than"),
             (18, "greater_than"),
             (19, "iota"),
+            (29, "sqrt"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -527,6 +527,14 @@ mod tests {
             Ok(ScalarKernel::IotaInt)
         );
         assert_eq!(
+            signature_from_numeric(35).map(|descriptor| descriptor.primitive_name),
+            Ok("sqrt")
+        );
+        assert_eq!(
+            implementation_from_numeric(35).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::SqrtDouble)
+        );
+        assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
         );
@@ -535,11 +543,11 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(35),
+            signature_from_numeric(36),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(35),
+            implementation_from_numeric(36),
             Err(RegistryLookupError::ImplementationId)
         );
     }
@@ -590,7 +598,7 @@ mod tests {
             Err(RegistryValidationError::UnknownImplementationId)
         );
         unknown[0].implementation_id = SEMANTIC_REGISTRY[0].implementation_id;
-        unknown[0].primitive_id = PrimitiveId(PRIMITIVE_COUNT + 1);
+        unknown[0].primitive_id = PrimitiveId(20);
         assert_eq!(
             validate_registry(&unknown),
             Err(RegistryValidationError::UnknownPrimitiveId)

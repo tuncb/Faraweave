@@ -289,6 +289,9 @@ impl<'a> IrCGenerator<'a> {
             ScalarKernel::GreaterThanDouble => {
                 "fw_set_bool(out,fw_double_less_than(args[1].d,args[0].d));return 1;"
             }
+            ScalarKernel::SqrtDouble => {
+                "fw_set_double(out,fw_backend_native_sqrt(args[0].d));return 1;"
+            }
             ScalarKernel::IotaInt => return Err(emission_error()),
         };
         writeln!(
@@ -946,6 +949,14 @@ static double fw_double_arithmetic(double left,double right,int operation) {
         ?fw_double_from_bits(UINT64_C(0x7ff8000000000000)):result;
   }
 }
+static double fw_backend_native_sqrt(double value) {
+  FWStrictEnvironment environment;volatile double input=value,result=0.0;
+  fw_begin_strict_environment(&environment);
+  result=sqrt(input);
+  fw_restore_strict_environment(&environment);
+  return fw_double_is_nan(result)
+      ?fw_double_from_bits(UINT64_C(0x7ff8000000000000)):result;
+}
 static void fw_set_bool(FWV *out, int value) {
   (void)memset(out, 0, sizeof(*out)); out->b = value != 0;
 }
@@ -1301,6 +1312,7 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   (void)fw_as_double;
   (void)fw_borrow;
   (void)fw_double_arithmetic;
+  (void)fw_backend_native_sqrt;
   (void)fw_double_equal;
   (void)fw_double_less_than;
   (void)fw_set_int;
@@ -1514,10 +1526,11 @@ mod ir_tests {
              mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
              not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
-             is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
-             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n",
+              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
+              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
+              sqrt[4.0]\n",
         );
-        for implementation in 1..34 {
+        for implementation in (1..=35).filter(|implementation| *implementation != 34) {
             assert!(
                 source.contains(&format!("static int fw_kernel_{implementation}(")),
                 "missing kernel {implementation}"

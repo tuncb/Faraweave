@@ -259,6 +259,7 @@ mod tests {
             ("less_than[1 2.0]", "true"),
             ("greater_than[2 1]", "true"),
             ("iota[3]", "(1 2 3)"),
+            ("sqrt[9]", "3.0"),
         ];
         for (source, expected) in cases {
             let value = evaluate_expression(source).expect(source).value;

@@ -386,6 +386,12 @@ def main() -> None:
                 ["0.1"],
                 b"0.1\n",
             ),
+            (
+                ROOT / "tests/fixtures/backend-native-sqrt.bennu",
+                [],
+                b"2.0\n3.0\n(0.0 -0.0 nan nan inf nan)\n"
+                b"(1.0 2.0 3.0 4.0)\n2.2227587494850775e-162\n",
+            ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
             artifact = work / f"fixture-{index}.fwir"
@@ -461,6 +467,57 @@ def main() -> None:
                 and not generated.stderr,
                 fixture.name,
             )
+            if fixture.name == "backend-native-sqrt.bennu":
+                hostile_source = work / "backend-native-sqrt-hostile.c"
+                hostile_native = work / f"backend-native-sqrt-hostile{suffix}"
+                generated_source = emitted.read_text(encoding="utf-8")
+                generated_main = "int main(int argc, char **argv) {"
+                require(
+                    generated_main in generated_source,
+                    "sqrt generated main declaration",
+                )
+                hostile_source.write_text(
+                    generated_source.replace(
+                        generated_main,
+                        "static int fw_generated_main(int argc, char **argv) {",
+                        1,
+                    )
+                    + """
+int main(int argc, char **argv) {
+#if defined(__x86_64__) || defined(_M_X64)
+  unsigned int original=_mm_getcsr();
+  unsigned int hostile=(original|0x1f80U|0x0040U|0x4000U|0x8000U)&~0x003fU;
+  unsigned int restored;
+  int result;
+  _mm_setcsr(hostile);
+  result=fw_generated_main(argc,argv);
+  restored=_mm_getcsr();
+  _mm_setcsr(original);
+  if(result!=0)return result;
+  return restored==hostile?0:1;
+#else
+  return fw_generated_main(argc,argv);
+#endif
+}
+""",
+                    encoding="utf-8",
+                )
+                compile_c(
+                    compiler,
+                    environment,
+                    hostile_source,
+                    hostile_native,
+                )
+                hostile_result = run(
+                    [str(hostile_native)],
+                    environment=environment,
+                )
+                require(
+                    normalize_newlines(hostile_result.stdout)
+                    == normalize_newlines(expected)
+                    and not hostile_result.stderr,
+                    "sqrt hostile generated-C mismatch",
+                )
             if index == 0 and platform.system() == "Linux":
                 sanitized = work / "fixture-sanitized"
                 compile_c_sanitized(compiler, environment, emitted, sanitized)

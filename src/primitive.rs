@@ -312,6 +312,9 @@ fn invoke_kernel(
         (ScalarKernel::GreaterThanDouble, [Value::Double(left), Value::Double(right)]) => {
             Some(Value::Bool(strict_float::less_than(*right, *left)))
         }
+        (ScalarKernel::SqrtDouble, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_sqrt(*value)))
+        }
         (ScalarKernel::IotaInt, _) => None,
         _ => None,
     };
