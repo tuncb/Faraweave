@@ -311,7 +311,7 @@ pub(crate) fn clear_windows_console() -> Result<(), ClearFailure> {
 
 #[cfg(not(windows))]
 pub(crate) fn clear_windows_console() -> Result<(), ClearFailure> {
-    Err(ClearFailure::UnsupportedTerminal)
+    Err(ClearFailure::WindowsOperationFailed)
 }
 
 #[cfg(test)]
@@ -434,6 +434,15 @@ mod tests {
             Err(ClearFailure::WindowsOperationFailed)
         );
         assert!(windows_output.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unavailable_windows_backend_reports_an_operation_failure() {
+        assert_eq!(
+            clear_windows_console(),
+            Err(ClearFailure::WindowsOperationFailed)
+        );
     }
 
     #[test]
