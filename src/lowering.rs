@@ -1583,11 +1583,8 @@ fn select_descriptor(
             .first()
             .is_some_and(|operand| !matches!(operand.parts().2, Type::Scalar(_)))
     {
-        let mut error = Error::new(
-            ErrorKind::TypeError,
-            operands[0].parts().6,
-            "iota arguments do not match an accepted signature; first unsupported argument is 1",
-        );
+        let message = unsupported_signature_message(name, 1, diagnostics)?;
+        let mut error = Error::new(ErrorKind::TypeError, operands[0].parts().6, message);
         error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
         error.argument_position = Some(1);
         error
@@ -2154,6 +2151,10 @@ mod tests {
         assert_eq!(rejected.kind, ErrorKind::TypeError);
         assert_eq!(rejected.argument_position, Some(1));
         assert_eq!(rejected.actual_types, vec![Type::Vector(ScalarType::Int)]);
+        assert_eq!(
+            rejected.message,
+            "iota arguments do not match an accepted signature; first unsupported argument is 1"
+        );
 
         let deep_tuple = must_source_error("inc [[[[1]]]]\n");
         assert_eq!(deep_tuple.kind, ErrorKind::TypeError);
@@ -2163,6 +2164,28 @@ mod tests {
     #[test]
     fn unsupported_signature_diagnostic_allocation_refusal_is_explicit() {
         let source = "inc[true]\n";
+        let program = match parse(source) {
+            Ok(program) => program,
+            Err(error) => panic!("parse failed: {error:?}"),
+        };
+        let result = lower_program_with_builder_and_diagnostics(
+            source,
+            "<source>",
+            &program,
+            RawProgramBuilder::new(),
+            DiagnosticReservations { refuse_next: true },
+        );
+        assert!(matches!(
+            result,
+            Err(LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Type,
+            }))
+        ));
+    }
+
+    #[test]
+    fn iota_type_diagnostic_allocation_refusal_is_explicit() {
+        let source = "iota[(1 2)]\n";
         let program = match parse(source) {
             Ok(program) => program,
             Err(error) => panic!("parse failed: {error:?}"),

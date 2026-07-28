@@ -470,6 +470,10 @@ def validate_product_cutover() -> None:
         and "implementation_id: descriptor.implementation_id.numeric()" in lowering,
         "lowering is not the single typed selection authority",
     )
+    require(
+        "unsupported_signature_message(name, 1, diagnostics)?" in lowering,
+        "iota type rejection bypasses fallible diagnostic construction",
+    )
     require("[features]" not in cargo, "migration feature flags remain")
 
     require(
