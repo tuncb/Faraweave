@@ -1,6 +1,7 @@
 # Faraweave Portable Typed IR Implementation Plan
 
-**Status:** Accepted by [GitHub issue #1](https://github.com/tuncb/Faraweave/issues/1)
+**Status:** Completed and accepted as FWIR v1 by
+[GitHub issue #15](https://github.com/tuncb/Faraweave/issues/15)
 
 **Relevant decision record:**
 [Issue #1 — accept the portable typed FWIR plan](../decisions/issue-1-accept-fwir-plan.md)
@@ -10,11 +11,10 @@ dependency-ordered GitHub issues. The completed work makes the IR the one
 semantic input to the direct interpreter and C11 generator and then exposes a
 versioned artifact that other systems can validate, inspect, and execute.
 
-The intended format name is **Faraweave Intermediate Representation (FWIR)**,
-and `.fwir` is its provisional file extension. Neither name nor extension
-freezes a public format: [issue #10](https://github.com/tuncb/Faraweave/issues/10)
-owns the encoding and compatibility decision after the interpreter and C
-backend cutovers.
+The stable format name is **Faraweave Intermediate Representation (FWIR)** and
+the accepted extension is `.fwir`. The
+[FWIR v1 specification](../spec/fwir-v1-encoding.md) freezes the canonical
+bytes, compatibility behavior, producer policy, and public boundaries.
 
 ## 1. Outcome
 
@@ -479,7 +479,8 @@ lowering while preserving whole-program static winner order.
 - Treat `iota` as `DynamicVector` even for literal bounds.
 - Substitute fan-out operand types into branch placeholders without values.
 - Verify the completed raw program before returning it.
-- Expose a temporary internal `compile_source` seam for direct tests.
+- Use the named source-to-verified-program entry point during implementation;
+  the test-only convenience seam is removed at v1 acceptance.
 
 ### Out of scope
 
@@ -699,7 +700,7 @@ the semantic model.
 - Specify producer metadata, semantic version identity, optional source digest,
   and what participates in canonical program identity.
 - Specify compatibility and rejection rules.
-- Decide the command/API spelling provisionally proposed for IR-12.
+- Decide the command/API spelling proposed for IR-12.
 
 ### Out of scope
 
@@ -935,15 +936,15 @@ quality assurance.
 
 ### Acceptance criteria
 
-- [ ] One source-to-IR lowerer owns every typed semantic decision.
-- [ ] One IR interpreter owns direct execution.
-- [ ] One IR-to-C generator owns C/native semantics.
-- [ ] No production AST backend or runtime overload selection remains.
-- [ ] Canonical FWIR v1 bytes, version behavior, and producer policy are
+- [x] One source-to-IR lowerer owns every typed semantic decision.
+- [x] One IR interpreter owns direct execution.
+- [x] One IR-to-C generator owns C/native semantics.
+- [x] No production AST backend or runtime overload selection remains.
+- [x] Canonical FWIR v1 bytes, version behavior, and producer policy are
       documented.
-- [ ] Every requirement has traceability and passing evidence.
-- [ ] All temporary code, feature flags, and migration-only tests are removed.
-- [ ] Final isolated QA passes with platform exclusions recorded accurately.
+- [x] Every requirement has traceability and passing evidence.
+- [x] All temporary code, feature flags, and migration-only tests are removed.
+- [x] Final isolated QA passes with platform exclusions recorded accurately.
 
 ### Validation
 

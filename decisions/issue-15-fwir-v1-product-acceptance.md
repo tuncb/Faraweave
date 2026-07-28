@@ -1,0 +1,3 @@
+# Issue #15 — FWIR v1 product acceptance
+
+FWIR physical format 1.0, semantic contract 1.0, `.fwir`, and the documented API and CLI spellings are the stable v1 product contract; compatible advisory additions may be ignored only under the specified same-major forward-minor rules. Faraweave is the authoritative producer, while producer metadata is untrusted and third-party producer support is not promised. The parser AST remains syntax-only, lowering is the sole typed semantic authority, and only fully verified programs reach the interpreter or C/native generator. FWIR artifacts are not confidential or a sandbox boundary, so callers must apply decode limits and must not place secrets in artifacts or execute generated/native outputs outside their trust policy.

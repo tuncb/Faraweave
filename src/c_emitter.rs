@@ -1335,7 +1335,7 @@ failure:
 #[cfg(test)]
 mod ir_tests {
     use super::*;
-    use crate::lowering::compile_source;
+    use crate::lowering::compile_source_with_name;
 
     fn emit(source: &str) -> String {
         emit_with_configuration(
@@ -1348,7 +1348,7 @@ mod ir_tests {
     }
 
     fn emit_with_configuration(source: &str, configuration: EvaluationConfiguration) -> String {
-        let program = match compile_source(source) {
+        let program = match compile_source_with_name(source, "<source>") {
             Ok(program) => program,
             Err(error) => panic!("test source did not lower: {error}"),
         };
@@ -1400,10 +1400,11 @@ mod ir_tests {
 
     #[test]
     fn verified_generation_is_byte_identical() {
-        let program = match compile_source("parameters[n Int]\ninc[iota[n]]\n") {
-            Ok(program) => program,
-            Err(error) => panic!("test source did not lower: {error}"),
-        };
+        let program =
+            match compile_source_with_name("parameters[n Int]\ninc[iota[n]]\n", "<source>") {
+                Ok(program) => program,
+                Err(error) => panic!("test source did not lower: {error}"),
+            };
         let configuration = EvaluationConfiguration::default();
         let first = match emit_verified_c_program(&program, configuration) {
             Ok(emission) => emission.source,
@@ -1424,7 +1425,7 @@ mod ir_tests {
             "inc[9223372036854775807]\n",
             "parameters[value Int]\ninc[value]\n",
         ] {
-            let program = match compile_source(source) {
+            let program = match compile_source_with_name(source, "<source>") {
                 Ok(program) => program,
                 Err(error) => panic!("test source did not lower: {error}"),
             };
@@ -1450,36 +1451,8 @@ mod ir_tests {
     }
 
     #[test]
-    fn production_c_emission_has_no_ast_evaluation_or_generic_dispatch_backend() {
-        let production = include_str!("c_emitter.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or("");
-        for removed in [
-            "struct CGenerator",
-            "emit_parameterized_program(",
-            "emit_constant_program(",
-            "runtime_failure_program(",
-            "static_expression_type(",
-            "known_vector_length(",
-            "primitive_tag(",
-            "evaluate_source_with_configuration(",
-            "static int fw_apply(",
-            "fw_apply_scalar",
-            "FW_INC",
-        ] {
-            assert!(
-                !production.contains(removed),
-                "obsolete backend remains: {removed}"
-            );
-        }
-        assert!(production.contains("compile_parsed_source(source, &parsed)"));
-        assert!(production.contains("emit_verified_c_program(&program, configuration)"));
-    }
-
-    #[test]
     fn verified_generator_preflights_configuration_and_tuple_profile() {
-        let scalar = match compile_source("inc[1]\n") {
+        let scalar = match compile_source_with_name("inc[1]\n", "<source>") {
             Ok(program) => program,
             Err(error) => panic!("scalar source did not lower: {error}"),
         };
@@ -1496,7 +1469,7 @@ mod ir_tests {
         };
         assert_eq!(error.kind, ErrorKind::InvalidExecutionProfile);
 
-        let tuple = match compile_source("parameters[x Int]\n[inc[x] 2]\n") {
+        let tuple = match compile_source_with_name("parameters[x Int]\n[inc[x] 2]\n", "<source>") {
             Ok(program) => program,
             Err(error) => panic!("tuple source did not lower: {error}"),
         };
@@ -1634,7 +1607,7 @@ mod ir_tests {
         arguments: &[&str],
         configuration: EvaluationConfiguration,
     ) {
-        let program = match compile_source(source) {
+        let program = match compile_source_with_name(source, "<source>") {
             Ok(program) => program,
             Err(error) => panic!("test source did not lower: {error}"),
         };

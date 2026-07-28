@@ -968,7 +968,7 @@ mod tests {
     }
 
     fn compile(source: &str) -> VerifiedProgram {
-        match crate::lowering::compile_source(source) {
+        match crate::lowering::compile_source_with_name(source, "<source>") {
             Ok(program) => program,
             Err(error) => panic!("{source:?} did not lower: {error}"),
         }
@@ -1199,15 +1199,5 @@ mod tests {
             allocation_failure: AllocationFailureInjection::default(),
         };
         assert_public_route_matches_direct_ir(&source, &[], configuration);
-    }
-
-    #[test]
-    fn interpreter_has_no_source_selection_or_ast_execution_path() {
-        let source = include_str!("interpreter.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        assert!(!production.contains("select_call("));
-        assert!(!production.contains("primitive_from_name("));
-        assert!(!production.contains("evaluate_expr("));
-        assert!(!production.contains("ExprKind"));
     }
 }

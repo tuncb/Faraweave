@@ -284,25 +284,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_evaluation_contains_no_ast_execution_or_runtime_selection() {
-        let source = include_str!("evaluator.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        for forbidden in [
-            "evaluate_expr(",
-            "ApplicationArgument",
-            "select_call(",
-            "TypeInfo",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "legacy direct-execution token remains: {forbidden}"
-            );
-        }
-        assert!(production.contains("compile_parsed_source("));
-        assert!(production.contains("evaluate_verified_program("));
-    }
-
-    #[test]
     fn runner_static_failure_precedes_argument_decoding() {
         let error =
             evaluate_runner_source("parameters[value Int]\nadd[value]\n", &["not-an-integer"])

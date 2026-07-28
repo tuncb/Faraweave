@@ -1,6 +1,6 @@
 use crate::parser::parse;
 use crate::parser::{CallSyntax, Expr, ExprKind, Program, validate_parameter_declarations};
-use crate::primitive::analyze_for_lowering;
+use crate::primitive::resolve_names;
 use crate::semantic_registry::{
     Conversion as RegistryConversion, SemanticDescriptor, StructuralBehavior, conversion,
     descriptors, primitive_from_name,
@@ -12,6 +12,7 @@ use crate::typed_program::{
     ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram, VerifyError,
 };
 use crate::{Error, ErrorKind, ScalarType, SourceLocation, SourceSpan, Type, Value};
+use std::fmt::Write as _;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -88,6 +89,31 @@ struct Lowerer {
     needs_fan_out: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
+    first_shape_error: Option<Error>,
+    diagnostics: DiagnosticReservations,
+}
+
+#[derive(Default)]
+struct DiagnosticReservations {
+    refuse_next: bool,
+}
+
+impl DiagnosticReservations {
+    fn try_reserve(
+        &mut self,
+        message: &mut String,
+        capacity: usize,
+        arena: crate::Arena,
+    ) -> Result<(), LowerError> {
+        if std::mem::take(&mut self.refuse_next) {
+            return Err(LowerError::Build(BuildError::AllocationUnavailable {
+                arena,
+            }));
+        }
+        message
+            .try_reserve_exact(capacity)
+            .map_err(|_| LowerError::Build(BuildError::AllocationUnavailable { arena }))
+    }
 }
 
 #[derive(Clone)]
@@ -96,6 +122,7 @@ struct Lowered {
     result_type: TypeIndex,
     cardinality: Option<Cardinality>,
     origin: OriginIndex,
+    location: SourceLocation,
     borrowed: bool,
     value_type: Type,
     tuple_elements: Vec<TupleElement>,
@@ -107,11 +134,7 @@ struct TupleElement {
     value_type: Type,
     cardinality: Option<Cardinality>,
     origin: OriginIndex,
-}
-
-#[cfg(test)]
-pub(crate) fn compile_source(source: &str) -> Result<VerifiedProgram, CompileError> {
-    compile_source_with_name(source, "<source>")
+    location: SourceLocation,
 }
 
 pub(crate) fn compile_source_with_name(
@@ -135,8 +158,182 @@ pub(crate) fn compile_parsed_source_with_name(
     program: &Program,
 ) -> Result<VerifiedProgram, CompileError> {
     validate_parameter_declarations(program)?;
-    let _ = analyze_for_lowering(program)?;
+    resolve_names(program)?;
+    validate_program_arities(program)?;
     lower_program(source, diagnostic_name, program)
+}
+
+#[derive(Clone, Copy)]
+enum StructuralValue {
+    NonTuple,
+    Tuple(usize),
+}
+
+fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
+    for root in &program.roots {
+        let _ = validate_expr_arities(root, None)?;
+    }
+    Ok(())
+}
+
+fn validate_expr_arities(
+    expression: &Expr,
+    placeholder: Option<StructuralValue>,
+) -> Result<StructuralValue, LowerError> {
+    match &expression.kind {
+        ExprKind::Call {
+            name,
+            syntax,
+            arguments,
+            ..
+        } => {
+            let mut spread_width = None;
+            for argument in arguments {
+                let value = validate_expr_arities(argument, placeholder)?;
+                if arguments.len() == 1 {
+                    spread_width = match value {
+                        StructuralValue::Tuple(width) => Some(width),
+                        StructuralValue::NonTuple => None,
+                    };
+                }
+            }
+            let actual = if *syntax == CallSyntax::Prefix {
+                spread_width.unwrap_or(arguments.len())
+            } else {
+                arguments.len()
+            };
+            validate_arity(name, actual, expression.span.begin)?;
+            Ok(StructuralValue::NonTuple)
+        }
+        ExprKind::Tuple(elements) => {
+            for element in elements {
+                let _ = validate_expr_arities(element, placeholder)?;
+            }
+            Ok(StructuralValue::Tuple(elements.len()))
+        }
+        ExprKind::Fanout { operand, branches } => {
+            let operand = validate_expr_arities(operand, placeholder)?;
+            for branch in branches {
+                let _ = validate_expr_arities(branch, Some(operand))?;
+            }
+            Ok(StructuralValue::Tuple(branches.len()))
+        }
+        ExprKind::UnaryChain { steps, .. } => {
+            for step in steps {
+                validate_arity(&step.name, 1, step.span.begin)?;
+            }
+            Ok(StructuralValue::NonTuple)
+        }
+        ExprKind::Placeholder => placeholder.ok_or_else(|| {
+            LowerError::Source(Error::at_span(
+                ErrorKind::SyntaxError,
+                expression.span,
+                "placeholder has no fanout operand",
+            ))
+        }),
+        ExprKind::Literal(_)
+        | ExprKind::Vector(_, _)
+        | ExprKind::DeepTuple { .. }
+        | ExprKind::Parameter(_)
+        | ExprKind::UnresolvedName { .. } => Ok(StructuralValue::NonTuple),
+    }
+}
+
+fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result<(), LowerError> {
+    let primitive = match primitive_from_name(name) {
+        Ok(primitive) => primitive,
+        Err(_) => {
+            return Err(LowerError::Source(unknown_primitive_diagnostic(
+                name, location,
+            )?));
+        }
+    };
+    if descriptors(primitive).any(|descriptor| descriptor.parameters.len() == actual) {
+        return Ok(());
+    }
+    let mut accepted = Vec::new();
+    for descriptor in descriptors(primitive) {
+        if !accepted.contains(&descriptor.parameters.len()) {
+            accepted.try_reserve(1).map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Node,
+                })
+            })?;
+            accepted.push(descriptor.parameters.len());
+        }
+    }
+    accepted.sort_unstable();
+    let accepted_capacity = accepted
+        .len()
+        .checked_mul(usize::BITS as usize / 3 + 2)
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::Node,
+        }))?;
+    let mut accepted_text = String::new();
+    accepted_text.try_reserve(accepted_capacity).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    for (index, arity) in accepted.iter().enumerate() {
+        if index != 0 {
+            accepted_text.push(' ');
+        }
+        write!(&mut accepted_text, "{arity}").map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Node,
+            })
+        })?;
+    }
+    let message_capacity = name
+        .len()
+        .checked_add(accepted_text.len())
+        .and_then(|length| length.checked_add(128))
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::Node,
+        }))?;
+    let mut message = String::new();
+    message.try_reserve_exact(message_capacity).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    write!(
+        &mut message,
+        "{name} received {actual} argument(s); accepted arity{} {accepted_text}",
+        if accepted.len() == 1 { "" } else { " values" },
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    let mut error = Error::new(ErrorKind::ArityError, location, message);
+    error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
+    error.actual_arity = Some(actual);
+    error.expected_arity = accepted;
+    Err(LowerError::Source(error))
+}
+
+fn unknown_primitive_diagnostic(name: &str, location: SourceLocation) -> Result<Error, LowerError> {
+    let capacity =
+        name.len()
+            .checked_add(32)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Node,
+            }))?;
+    let mut message = String::new();
+    message.try_reserve_exact(capacity).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    write!(&mut message, "unknown primitive '{name}'").map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    Ok(Error::new(ErrorKind::UnknownPrimitive, location, message))
 }
 
 fn lower_program(
@@ -152,7 +349,23 @@ fn lower_program_with_builder(
     source: &str,
     diagnostic_name: &str,
     program: &Program,
+    builder: RawProgramBuilder,
+) -> Result<VerifiedProgram, LowerError> {
+    lower_program_with_builder_and_diagnostics(
+        source,
+        diagnostic_name,
+        program,
+        builder,
+        DiagnosticReservations::default(),
+    )
+}
+
+fn lower_program_with_builder_and_diagnostics(
+    source: &str,
+    diagnostic_name: &str,
+    program: &Program,
     mut builder: RawProgramBuilder,
+    diagnostics: DiagnosticReservations,
 ) -> Result<VerifiedProgram, LowerError> {
     let byte_length = u32::try_from(source.len()).map_err(|_| {
         LowerError::Build(BuildError::CountOverflow {
@@ -174,6 +387,8 @@ fn lower_program_with_builder(
         needs_fan_out: false,
         placeholder: None,
         releases: Vec::new(),
+        first_shape_error: None,
+        diagnostics,
     };
 
     if let Some(header) = program.parameter_header {
@@ -232,6 +447,9 @@ fn lower_program_with_builder(
             node: lowered.node,
             origin: lowered.origin,
         })?;
+    }
+    if let Some(error) = lowerer.first_shape_error {
+        return Err(LowerError::Source(error));
     }
     for (owner, release_after) in lowerer.releases.iter().copied().enumerate() {
         if let Some(release_after) = release_after {
@@ -320,9 +538,9 @@ impl Lowerer {
     fn lower_expr(&mut self, expression: &Expr) -> Result<Lowered, LowerError> {
         let origin = self.push_origin(expression.span)?;
         match &expression.kind {
-            ExprKind::Literal(value) => self.lower_scalar(value, origin),
+            ExprKind::Literal(value) => self.lower_scalar(value, origin, expression.span.begin),
             ExprKind::Vector(element_type, values) => {
-                self.lower_vector(*element_type, values, origin)
+                self.lower_vector(*element_type, values, origin, expression.span.begin)
             }
             ExprKind::Parameter(index) => {
                 let result_type = self.parameter_types.get(*index).copied().ok_or_else(|| {
@@ -353,6 +571,7 @@ impl Lowerer {
                     result_type,
                     cardinality: Some(Cardinality::StaticScalar),
                     origin,
+                    location: expression.span.begin,
                     borrowed: true,
                     value_type: Type::Scalar(*self.parameter_scalar_types.get(*index).ok_or_else(
                         || {
@@ -367,15 +586,17 @@ impl Lowerer {
                     access: ValueAccess::WholeValue,
                 })
             }
-            ExprKind::Tuple(elements) => self.lower_tuple(elements, origin),
-            ExprKind::DeepTuple { depth, leaf } => self.lower_deep_tuple(*depth, leaf, origin),
+            ExprKind::Tuple(elements) => self.lower_tuple(elements, origin, expression.span.begin),
+            ExprKind::DeepTuple { depth, leaf } => {
+                self.lower_deep_tuple(*depth, leaf, origin, expression.span.begin)
+            }
             ExprKind::UnaryChain {
                 leaf,
                 leaf_span,
                 steps,
             } => {
                 let leaf_origin = self.push_origin(*leaf_span)?;
-                let mut current = self.lower_scalar(leaf, leaf_origin)?;
+                let mut current = self.lower_scalar(leaf, leaf_origin, leaf_span.begin)?;
                 for step in steps {
                     let primitive_origin = self.push_origin(step.name_span)?;
                     let call_origin = self.push_origin(step.span)?;
@@ -390,6 +611,7 @@ impl Lowerer {
                         &step.name,
                         primitive_origin,
                         call_origin,
+                        step.span.begin,
                         operands,
                     )?;
                 }
@@ -400,7 +622,14 @@ impl Lowerer {
                 syntax,
                 arguments,
                 name_span,
-            } => self.lower_call(name, *syntax, arguments, *name_span, origin),
+            } => self.lower_call(
+                name,
+                *syntax,
+                arguments,
+                *name_span,
+                origin,
+                expression.span.begin,
+            ),
             ExprKind::Placeholder => {
                 let mut placeholder = self.placeholder.take().ok_or_else(|| {
                     LowerError::Source(Error::at_span(
@@ -410,6 +639,7 @@ impl Lowerer {
                     ))
                 })?;
                 placeholder.origin = origin;
+                placeholder.location = expression.span.begin;
                 placeholder.borrowed = true;
                 placeholder.access = ValueAccess::FanOutOperandBorrow;
                 Ok(placeholder)
@@ -425,7 +655,12 @@ impl Lowerer {
         }
     }
 
-    fn lower_scalar(&mut self, value: &Value, origin: OriginIndex) -> Result<Lowered, LowerError> {
+    fn lower_scalar(
+        &mut self,
+        value: &Value,
+        origin: OriginIndex,
+        location: SourceLocation,
+    ) -> Result<Lowered, LowerError> {
         let scalar = scalar_constant(value).ok_or_else(|| {
             LowerError::Source(Error::new(
                 ErrorKind::TypeError,
@@ -458,6 +693,7 @@ impl Lowerer {
             result_type,
             cardinality: Some(Cardinality::StaticScalar),
             origin,
+            location,
             borrowed: false,
             value_type: Type::Scalar(scalar_type),
             tuple_elements: Vec::new(),
@@ -470,6 +706,7 @@ impl Lowerer {
         element_type: ScalarType,
         values: &[Value],
         origin: OriginIndex,
+        location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
         let start = self.builder.finish_preview_constant_elements()?;
         for value in values {
@@ -509,6 +746,7 @@ impl Lowerer {
             result_type,
             cardinality,
             origin,
+            location,
             borrowed: false,
             value_type: Type::Vector(element_type),
             tuple_elements: Vec::new(),
@@ -520,6 +758,7 @@ impl Lowerer {
         &mut self,
         elements: &[Expr],
         origin: OriginIndex,
+        location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
         let mut lowered = Vec::new();
         lowered.try_reserve(elements.len()).map_err(|_| {
@@ -597,6 +836,7 @@ impl Lowerer {
                 value_type: try_clone_type(&element.value_type)?,
                 cardinality: element.cardinality,
                 origin: element.origin,
+                location,
             });
         }
         let mut value_types = Vec::new();
@@ -614,6 +854,7 @@ impl Lowerer {
             result_type,
             cardinality: None,
             origin,
+            location,
             borrowed: false,
             value_type,
             tuple_elements,
@@ -626,8 +867,9 @@ impl Lowerer {
         depth: usize,
         leaf: &Value,
         origin: OriginIndex,
+        location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
-        let mut current = self.lower_scalar(leaf, origin)?;
+        let mut current = self.lower_scalar(leaf, origin, location)?;
         for _ in 0..depth {
             let type_start = self.builder.finish_preview_type_elements()?;
             self.builder.push_type_element(current.result_type)?;
@@ -699,12 +941,14 @@ impl Lowerer {
                 value_type: child_type,
                 cardinality: current.cardinality,
                 origin: current.origin,
+                location,
             });
             current = Lowered {
                 node,
                 result_type,
                 cardinality: None,
                 origin,
+                location,
                 borrowed: false,
                 value_type: Type::RepeatedTuple {
                     depth: next_depth,
@@ -725,6 +969,7 @@ impl Lowerer {
         arguments: &[Expr],
         name_span: SourceSpan,
         origin: OriginIndex,
+        location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
         let primitive_origin = self.push_origin(name_span)?;
         let mut lowered = Vec::new();
@@ -740,7 +985,13 @@ impl Lowerer {
             && lowered.len() == 1
             && matches!(lowered[0].value_type, Type::Tuple(_))
         {
-            return self.lower_prefix_call(name, primitive_origin, origin, lowered.remove(0));
+            return self.lower_prefix_call(
+                name,
+                primitive_origin,
+                origin,
+                location,
+                lowered.remove(0),
+            );
         }
         let mut operands = Vec::new();
         operands.try_reserve(lowered.len()).map_err(|_| {
@@ -751,7 +1002,7 @@ impl Lowerer {
         for argument in lowered {
             operands.push(CallOperand::Whole(argument));
         }
-        self.lower_selected_call(name, primitive_origin, origin, operands)
+        self.lower_selected_call(name, primitive_origin, origin, location, operands)
     }
 
     fn lower_prefix_call(
@@ -759,6 +1010,7 @@ impl Lowerer {
         name: &str,
         primitive_origin: OriginIndex,
         origin: OriginIndex,
+        location: SourceLocation,
         tuple: Lowered,
     ) -> Result<Lowered, LowerError> {
         let edge_start = self.builder.finish_preview_edges()?;
@@ -809,7 +1061,8 @@ impl Lowerer {
                 metadata,
             });
         }
-        let result = self.lower_selected_call(name, primitive_origin, origin, operands)?;
+        let result =
+            self.lower_selected_call(name, primitive_origin, origin, location, operands)?;
         self.set_release(prepare, ReleaseAfter::Node(result.node))?;
         self.needs_spread = true;
         Ok(result)
@@ -820,15 +1073,10 @@ impl Lowerer {
         name: &str,
         primitive_origin: OriginIndex,
         origin: OriginIndex,
+        location: SourceLocation,
         operands: Vec<CallOperand>,
     ) -> Result<Lowered, LowerError> {
-        let descriptor = select_descriptor(name, &operands).ok_or_else(|| {
-            LowerError::Source(Error::new(
-                ErrorKind::TypeError,
-                SourceLocation::start(),
-                "analysis-selected call could not be lowered",
-            ))
-        })?;
+        let descriptor = select_descriptor(name, &operands, location, &mut self.diagnostics)?;
         let edge_start = self.builder.finish_preview_edges()?;
         let mut static_anchor = None;
         let mut static_length = None;
@@ -837,8 +1085,15 @@ impl Lowerer {
         for (position, (operand, accepted)) in
             operands.iter().zip(descriptor.parameters).enumerate()
         {
-            let (producer, access, value_type, operand_cardinality, operand_origin, borrowed) =
-                operand.parts();
+            let (
+                producer,
+                access,
+                value_type,
+                operand_cardinality,
+                operand_origin,
+                borrowed,
+                _operand_location,
+            ) = operand.parts();
             let actual = scalar_element(value_type).ok_or_else(|| {
                 LowerError::Source(Error::new(
                     ErrorKind::TypeError,
@@ -889,6 +1144,65 @@ impl Lowerer {
                 },
                 origin: operand_origin,
             })?;
+        }
+        if self.first_shape_error.is_none()
+            && let Some((anchor_index, expected)) =
+                operands
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, operand)| match operand.parts().3 {
+                        Some(Cardinality::StaticVector(length)) => Some((index, length)),
+                        _ => None,
+                    })
+        {
+            for (index, operand) in operands.iter().enumerate() {
+                if index == anchor_index {
+                    continue;
+                }
+                if let Some(Cardinality::StaticVector(actual)) = operand.parts().3
+                    && actual != expected
+                {
+                    let message = static_shape_message(
+                        name,
+                        index + 1,
+                        expected,
+                        actual,
+                        &mut self.diagnostics,
+                    )?;
+                    let mut error =
+                        Error::new(ErrorKind::ShapeMismatch, operand.parts().6, message);
+                    error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
+                    error.argument_position = Some(index + 1);
+                    let expected = usize::try_from(expected).map_err(|_| {
+                        LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::ShapeCheck,
+                        })
+                    })?;
+                    let actual = usize::try_from(actual).map_err(|_| {
+                        LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::ShapeCheck,
+                        })
+                    })?;
+                    let mut expected_shape = Vec::new();
+                    expected_shape.try_reserve(1).map_err(|_| {
+                        LowerError::Build(BuildError::AllocationUnavailable {
+                            arena: crate::Arena::ShapeCheck,
+                        })
+                    })?;
+                    expected_shape.push(expected);
+                    let mut actual_shape = Vec::new();
+                    actual_shape.try_reserve(1).map_err(|_| {
+                        LowerError::Build(BuildError::AllocationUnavailable {
+                            arena: crate::Arena::ShapeCheck,
+                        })
+                    })?;
+                    actual_shape.push(actual);
+                    error.expected_shape = Some(expected_shape);
+                    error.actual_shape = Some(actual_shape);
+                    self.first_shape_error = Some(error);
+                    break;
+                }
+            }
         }
         let shape_start = self.builder.finish_preview_shape_checks()?;
         for (position, operand) in operands.iter().enumerate() {
@@ -986,6 +1300,7 @@ impl Lowerer {
             result_type,
             cardinality,
             origin,
+            location,
             borrowed: false,
             value_type,
             tuple_elements: Vec::new(),
@@ -1120,6 +1435,7 @@ impl Lowerer {
                 value_type: try_clone_type(&root.value_type)?,
                 cardinality: root.cardinality,
                 origin: root.origin,
+                location: expression.span.begin,
             });
             value_types.push(try_clone_type(&root.value_type)?);
         }
@@ -1128,6 +1444,7 @@ impl Lowerer {
             result_type,
             cardinality: None,
             origin,
+            location: expression.span.begin,
             borrowed: false,
             value_type: Type::Tuple(value_types),
             tuple_elements,
@@ -1155,6 +1472,7 @@ impl CallOperand {
         Option<Cardinality>,
         OriginIndex,
         bool,
+        SourceLocation,
     ) {
         match self {
             Self::Whole(lowered) => (
@@ -1164,6 +1482,7 @@ impl CallOperand {
                 lowered.cardinality,
                 lowered.origin,
                 lowered.borrowed,
+                lowered.location,
             ),
             Self::TupleElement {
                 prepare,
@@ -1176,24 +1495,117 @@ impl CallOperand {
                 metadata.cardinality,
                 metadata.origin,
                 true,
+                metadata.location,
             ),
         }
     }
 }
 
-fn select_descriptor(name: &str, operands: &[CallOperand]) -> Option<&'static SemanticDescriptor> {
-    let primitive = primitive_from_name(name).ok()?;
-    descriptors(primitive)
+fn unsupported_signature_message(
+    name: &str,
+    first_unsupported: usize,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<String, LowerError> {
+    let capacity =
+        name.len()
+            .checked_add(128)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Type,
+            }))?;
+    let mut message = String::new();
+    diagnostics.try_reserve(&mut message, capacity, crate::Arena::Type)?;
+    write!(
+        &mut message,
+        "{name} arguments do not match an accepted signature; first unsupported argument is {first_unsupported}"
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Type,
+        })
+    })?;
+    Ok(message)
+}
+
+fn static_shape_message(
+    name: &str,
+    argument_position: usize,
+    expected: u32,
+    actual: u32,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<String, LowerError> {
+    let capacity =
+        name.len()
+            .checked_add(128)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::ShapeCheck,
+            }))?;
+    let mut message = String::new();
+    diagnostics.try_reserve(&mut message, capacity, crate::Arena::ShapeCheck)?;
+    write!(
+        &mut message,
+        "{name} argument {argument_position} expected shape [{expected}], got [{actual}]"
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::ShapeCheck,
+        })
+    })?;
+    Ok(message)
+}
+
+fn select_descriptor(
+    name: &str,
+    operands: &[CallOperand],
+    location: SourceLocation,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<&'static SemanticDescriptor, LowerError> {
+    let primitive = match primitive_from_name(name) {
+        Ok(primitive) => primitive,
+        Err(_) => {
+            return Err(LowerError::Source(unknown_primitive_diagnostic(
+                name, location,
+            )?));
+        }
+    };
+    if !descriptors(primitive).any(|descriptor| descriptor.parameters.len() == operands.len()) {
+        return validate_arity(name, operands.len(), location).and_then(|()| {
+            Err(LowerError::Source(Error::new(
+                ErrorKind::ArityError,
+                location,
+                "arity validation did not reject an invalid call",
+            )))
+        });
+    }
+    if descriptors(primitive)
+        .next()
+        .is_some_and(|descriptor| descriptor.behavior == StructuralBehavior::Iota)
+        && operands
+            .first()
+            .is_some_and(|operand| !matches!(operand.parts().2, Type::Scalar(_)))
+    {
+        let message = unsupported_signature_message(name, 1, diagnostics)?;
+        let mut error = Error::new(ErrorKind::TypeError, operands[0].parts().6, message);
+        error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
+        error.argument_position = Some(1);
+        error
+            .actual_types
+            .try_reserve(operands.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Type,
+                })
+            })?;
+        for operand in operands {
+            error.actual_types.push(try_clone_type(operand.parts().2)?);
+        }
+        return Err(LowerError::Source(error));
+    }
+    let selected = descriptors(primitive)
         .filter(|descriptor| descriptor.parameters.len() == operands.len())
         .filter_map(|descriptor| {
             let mut cost = 0;
             for (operand, accepted) in operands.iter().zip(descriptor.parameters) {
-                let actual = match operand {
-                    CallOperand::Whole(lowered) => scalar_element(&lowered.value_type)?,
-                    CallOperand::TupleElement { metadata, .. } => {
-                        scalar_element(&metadata.value_type)?
-                    }
-                };
+                let actual = scalar_element(operand.parts().2)?;
                 match conversion(actual, *accepted)? {
                     RegistryConversion::Identity => {}
                     RegistryConversion::PromoteIntToDouble => cost += 1,
@@ -1202,7 +1614,46 @@ fn select_descriptor(name: &str, operands: &[CallOperand]) -> Option<&'static Se
             Some((cost, descriptor))
         })
         .min_by_key(|(cost, _)| *cost)
-        .map(|(_, descriptor)| descriptor)
+        .map(|(_, descriptor)| descriptor);
+    let Some(selected) = selected else {
+        let matched_prefix = descriptors(primitive)
+            .filter(|descriptor| descriptor.parameters.len() == operands.len())
+            .map(|descriptor| {
+                descriptor
+                    .parameters
+                    .iter()
+                    .zip(operands)
+                    .take_while(|(accepted, operand)| {
+                        scalar_element(operand.parts().2)
+                            .is_some_and(|actual| conversion(actual, **accepted).is_some())
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        let first_unsupported = (matched_prefix + 1).min(operands.len());
+        let message = unsupported_signature_message(name, first_unsupported, diagnostics)?;
+        let mut error = Error::new(
+            ErrorKind::TypeError,
+            operands[first_unsupported - 1].parts().6,
+            message,
+        );
+        error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
+        error.argument_position = Some(first_unsupported);
+        error
+            .actual_types
+            .try_reserve(operands.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Type,
+                })
+            })?;
+        for operand in operands {
+            error.actual_types.push(try_clone_type(operand.parts().2)?);
+        }
+        return Err(LowerError::Source(error));
+    };
+    Ok(selected)
 }
 
 fn scalar_element(value_type: &Type) -> Option<ScalarType> {
@@ -1258,6 +1709,7 @@ fn try_clone_lowered(lowered: &Lowered) -> Result<Lowered, LowerError> {
             value_type: try_clone_type(&element.value_type)?,
             cardinality: element.cardinality,
             origin: element.origin,
+            location: element.location,
         });
     }
     Ok(Lowered {
@@ -1265,6 +1717,7 @@ fn try_clone_lowered(lowered: &Lowered) -> Result<Lowered, LowerError> {
         result_type: lowered.result_type,
         cardinality: lowered.cardinality,
         origin: lowered.origin,
+        location: lowered.location,
         borrowed: lowered.borrowed,
         value_type: try_clone_type(&lowered.value_type)?,
         tuple_elements,
@@ -1349,14 +1802,14 @@ mod tests {
     }
 
     fn must_compile(source: &str) -> VerifiedProgram {
-        match compile_source(source) {
+        match compile_source_with_name(source, "<source>") {
             Ok(program) => program,
             Err(error) => panic!("compile failed: {error:?}"),
         }
     }
 
     fn must_source_error(source: &str) -> Error {
-        match compile_source(source) {
+        match compile_source_with_name(source, "<source>") {
             Err(CompileError::Source(error)) => error,
             Ok(_) => panic!("source unexpectedly compiled"),
             Err(error) => panic!("expected source diagnostic, got {error:?}"),
@@ -1650,6 +2103,131 @@ mod tests {
     }
 
     #[test]
+    fn lowering_materializes_the_only_typed_selection_decisions() {
+        let program = must_compile(
+            "equals[true false]\n\
+             equals[1 2]\n\
+             equals[1 2.0]\n\
+             equals [1.0 2]\n\
+             iota[3]\n",
+        );
+        let selected: Vec<(u16, u16, u16)> = program
+            .as_raw()
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id,
+                    signature_id,
+                    implementation_id,
+                    ..
+                } => Some((primitive_id, signature_id, implementation_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            selected,
+            vec![
+                (8, 15, 15),
+                (8, 16, 16),
+                (8, 17, 17),
+                (8, 17, 17),
+                (19, 34, 34),
+            ]
+        );
+
+        let fan_out_spread = must_compile("add fanout[1 {inc[_]} {inc[_]}]\n");
+        assert!(fan_out_spread.as_raw().nodes.iter().any(|node| matches!(
+            node.kind,
+            NodeKind::SelectedApply {
+                primitive_id: 5,
+                signature_id: 9,
+                implementation_id: 9,
+                ..
+            }
+        )));
+
+        let rejected = must_source_error("iota[(1 2)]\n");
+        assert_eq!(rejected.kind, ErrorKind::TypeError);
+        assert_eq!(rejected.argument_position, Some(1));
+        assert_eq!(rejected.actual_types, vec![Type::Vector(ScalarType::Int)]);
+        assert_eq!(
+            rejected.message,
+            "iota arguments do not match an accepted signature; first unsupported argument is 1"
+        );
+
+        let deep_tuple = must_source_error("inc [[[[1]]]]\n");
+        assert_eq!(deep_tuple.kind, ErrorKind::TypeError);
+        assert_eq!(deep_tuple.argument_position, Some(1));
+    }
+
+    #[test]
+    fn unsupported_signature_diagnostic_allocation_refusal_is_explicit() {
+        let source = "inc[true]\n";
+        let program = match parse(source) {
+            Ok(program) => program,
+            Err(error) => panic!("parse failed: {error:?}"),
+        };
+        let result = lower_program_with_builder_and_diagnostics(
+            source,
+            "<source>",
+            &program,
+            RawProgramBuilder::new(),
+            DiagnosticReservations { refuse_next: true },
+        );
+        assert!(matches!(
+            result,
+            Err(LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Type,
+            }))
+        ));
+    }
+
+    #[test]
+    fn iota_type_diagnostic_allocation_refusal_is_explicit() {
+        let source = "iota[(1 2)]\n";
+        let program = match parse(source) {
+            Ok(program) => program,
+            Err(error) => panic!("parse failed: {error:?}"),
+        };
+        let result = lower_program_with_builder_and_diagnostics(
+            source,
+            "<source>",
+            &program,
+            RawProgramBuilder::new(),
+            DiagnosticReservations { refuse_next: true },
+        );
+        assert!(matches!(
+            result,
+            Err(LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Type,
+            }))
+        ));
+    }
+
+    #[test]
+    fn static_shape_diagnostic_allocation_refusal_is_explicit() {
+        let source = "add[(1 2) (3 4 5)]\n";
+        let program = match parse(source) {
+            Ok(program) => program,
+            Err(error) => panic!("parse failed: {error:?}"),
+        };
+        let result = lower_program_with_builder_and_diagnostics(
+            source,
+            "<source>",
+            &program,
+            RawProgramBuilder::new(),
+            DiagnosticReservations { refuse_next: true },
+        );
+        assert!(matches!(
+            result,
+            Err(LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::ShapeCheck,
+            }))
+        ));
+    }
+
+    #[test]
     fn whole_program_static_precedence_is_arity_then_type_then_shape() {
         let cross_root = must_source_error("inc[true]\nadd[1]\n");
         assert_eq!(cross_root.kind, ErrorKind::ArityError);
@@ -1670,6 +2248,17 @@ mod tests {
         let type_before_shape = must_source_error("add[(1 2) (3 4 5)]\ninc[true]\n");
         assert_eq!(type_before_shape.kind, ErrorKind::TypeError);
         assert_eq!(type_before_shape.location.line, 2);
+
+        let arity_before_shape = must_source_error("add[(1 2) (3 4 5)]\nadd[1]\n");
+        assert_eq!(arity_before_shape.kind, ErrorKind::ArityError);
+        assert_eq!(arity_before_shape.location.line, 2);
+
+        let shape = must_source_error("add[(1 2) (3 4 5)]\n");
+        assert_eq!(shape.kind, ErrorKind::ShapeMismatch);
+        assert_eq!(shape.location.column, 11);
+        assert_eq!(shape.argument_position, Some(2));
+        assert_eq!(shape.expected_shape, Some(vec![2]));
+        assert_eq!(shape.actual_shape, Some(vec![3]));
     }
 
     #[test]

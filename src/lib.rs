@@ -1,4 +1,16 @@
 //! Faraweave's standalone Rust language runtime.
+//!
+//! Source APIs parse and lower exactly once to [`VerifiedProgram`]. Direct
+//! execution then uses [`evaluate_verified_program`], while C and native
+//! execution use [`emit_c_from_verified_program`] and
+//! [`build_native_from_verified_program`]; none of those backends accepts a
+//! parser AST or performs overload selection.
+//!
+//! [`decode_fwir`] treats bytes as untrusted, applies [`FwirDecodeLimits`], and
+//! returns only after complete physical decoding and semantic verification.
+//! FWIR v1 is deterministic but neither confidential nor a sandbox: artifacts
+//! can reveal names, constants, graph structure, provenance, and producer
+//! metadata, and generated/native code executes with the caller's authority.
 #![allow(clippy::result_large_err)]
 
 mod c_emitter;

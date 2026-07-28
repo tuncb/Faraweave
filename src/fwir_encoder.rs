@@ -896,7 +896,9 @@ mod tests {
                       inc[(1 2)]\n\
                       iota[3]\n\
                       fanout[iota[3] {inc[_]} {add[_ 10]}]\n";
-        must(crate::lowering::compile_source(source))
+        must(crate::lowering::compile_source_with_name(
+            source, "<source>",
+        ))
     }
 
     #[test]

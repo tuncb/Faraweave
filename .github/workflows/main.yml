@@ -49,6 +49,7 @@ jobs:
       - run: cargo test --workspace --all-targets --all-features
       - run: cargo test --workspace --all-targets --all-features --release
       - run: python tools/validation/contracts.py full
+      - run: python tools/validation/contracts.py package ${{ matrix.target }}
 
   pr-gate:
     name: PR Gate
