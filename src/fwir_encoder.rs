@@ -10,7 +10,7 @@ const HEADER_SIZE: u64 = 32;
 const DIRECTORY_ENTRY_SIZE: u64 = 24;
 const MANDATORY_IDENTITY_FLAGS: u16 = 3;
 const NONE: u32 = u32::MAX;
-const MAX_SECTIONS: usize = 17;
+const MAX_SECTIONS: usize = 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FwirProducerMetadata {
@@ -94,6 +94,7 @@ struct Preflight {
     string_count: u32,
     string_reference_count: usize,
     total_size: usize,
+    format_minor: u16,
 }
 
 pub fn encode_fwir(
@@ -299,6 +300,12 @@ fn preflight(
     checked_count(raw.nodes.len(), "nodes")?;
     checked_count(raw.ownership.len(), "ownership")?;
     checked_count(raw.roots.len(), "roots")?;
+    let application_plan_count = raw
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::SelectedApply { .. }))
+        .count();
+    checked_count(application_plan_count, "application_plans")?;
 
     let (string_count, string_reference_count, string_length) = string_pool_shape(program)?;
     let mut sections = [Section::default(); MAX_SECTIONS];
@@ -335,6 +342,19 @@ fn preflight(
         (14, 56, fixed_length(raw.nodes.len(), 56, "nodes")?),
         (15, 12, fixed_length(raw.ownership.len(), 12, "ownership")?),
         (16, 8, fixed_length(raw.roots.len(), 8, "roots")?),
+        (
+            17,
+            8,
+            if raw
+                .features
+                .binary_search(&crate::Feature::ApplicationPlans.numeric())
+                .is_ok()
+            {
+                fixed_length(application_plan_count, 8, "application_plans")?
+            } else {
+                0
+            },
+        ),
     ];
     for (id, record_size, length) in lengths {
         if id == 4 && string_count != 0 {
@@ -387,6 +407,11 @@ fn preflight(
         string_count,
         string_reference_count,
         total_size,
+        format_minor: u16::from(
+            raw.features
+                .binary_search(&crate::Feature::ApplicationPlans.numeric())
+                .is_ok(),
+        ),
     })
 }
 
@@ -446,7 +471,7 @@ fn encode_header_and_directory(
 ) -> Result<(), FwirEncodeError> {
     output.extend_from_slice(MAGIC);
     put_u16(output, 1);
-    put_u16(output, 0);
+    put_u16(output, plan.format_minor);
     put_u32(output, 32);
     put_u16(output, 24);
     put_u16(output, 0);
@@ -679,6 +704,7 @@ fn encode_sections(
                 primitive_id,
                 signature_id,
                 implementation_id,
+                application_plan_id: _,
                 primitive_origin,
                 lift,
                 result_element_type,
@@ -689,6 +715,8 @@ fn encode_sections(
                     LiftMode::Scalar => 1,
                     LiftMode::Vector => 2,
                     LiftMode::DynamicVector => 3,
+                    LiftMode::ContainerScalar => 4,
+                    LiftMode::ContainerVector => 5,
                 },
                 scalar_type(result_element_type),
                 [
@@ -753,6 +781,23 @@ fn encode_sections(
     for root in &raw.roots {
         put_u32(output, root.node.0);
         put_u32(output, root.origin.0);
+    }
+    if raw
+        .features
+        .binary_search(&crate::Feature::ApplicationPlans.numeric())
+        .is_ok()
+    {
+        for (index, node) in raw.nodes.iter().enumerate() {
+            if let NodeKind::SelectedApply {
+                application_plan_id,
+                ..
+            } = node.kind
+            {
+                put_u32(output, checked_count(index, "application_plan.node")?);
+                put_u16(output, application_plan_id);
+                put_u16(output, 0);
+            }
+        }
     }
     if let Some(metadata) = options.producer_metadata {
         put_u32(output, 9);

@@ -2,7 +2,7 @@ use crate::ScalarType;
 use std::collections::TryReserveError;
 
 pub const SUPPORTED_SEMANTIC_MAJOR: u16 = 1;
-pub const SUPPORTED_SEMANTIC_MINOR: u16 = 0;
+pub const SUPPORTED_SEMANTIC_MINOR: u16 = 1;
 
 macro_rules! index_type {
     ($name:ident) => {
@@ -64,6 +64,7 @@ pub enum Feature {
     Tuples = 2,
     PrefixSpread = 3,
     FanOut = 4,
+    ApplicationPlans = 5,
 }
 
 impl Feature {
@@ -174,6 +175,8 @@ pub enum LiftMode {
     Scalar,
     Vector,
     DynamicVector,
+    ContainerScalar,
+    ContainerVector,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +198,7 @@ pub enum NodeKind {
         primitive_id: u16,
         signature_id: u16,
         implementation_id: u16,
+        application_plan_id: u16,
         primitive_origin: OriginIndex,
         lift: LiftMode,
         result_element_type: ScalarType,
@@ -481,7 +485,9 @@ impl RawProgramBuilder {
             raw: RawProgram {
                 module: ModuleMetadata {
                     semantic_major: SUPPORTED_SEMANTIC_MAJOR,
-                    semantic_minor: SUPPORTED_SEMANTIC_MINOR,
+                    // Existing source programs remain canonical semantic 1.0.
+                    // Lowering raises this only when it emits a 1.1 feature.
+                    semantic_minor: 0,
                     parameter_header_origin: None,
                     ranges: ProgramRanges::default(),
                 },
@@ -514,6 +520,10 @@ impl RawProgramBuilder {
 
     pub fn set_parameter_header_origin(&mut self, origin: OriginIndex) {
         self.raw.module.parameter_header_origin = Some(origin);
+    }
+
+    pub(crate) fn set_semantic_minor(&mut self, minor: u16) {
+        self.raw.module.semantic_minor = minor;
     }
 
     pub(crate) fn finish_preview_type_elements(&self) -> Result<u32, BuildError> {
@@ -643,6 +653,7 @@ fn verify_program(
             Feature::Tuples.numeric(),
             Feature::PrefixSpread.numeric(),
             Feature::FanOut.numeric(),
+            Feature::ApplicationPlans.numeric(),
         ]
         .contains(&feature)
         {
@@ -662,6 +673,19 @@ fn verify_program(
             ));
         }
         previous_feature = Some(feature);
+    }
+    if program.module.semantic_minor == 0
+        && program
+            .features
+            .binary_search(&Feature::ApplicationPlans.numeric())
+            .is_ok()
+    {
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "application_plans",
+        ));
     }
     verify_module_ranges(program)?;
     verify_parameters(program)?;
@@ -1688,6 +1712,7 @@ fn verify_node(
             primitive_id,
             signature_id,
             implementation_id,
+            application_plan_id,
             primitive_origin,
             lift,
             result_element_type,
@@ -1701,6 +1726,7 @@ fn verify_node(
                 primitive_id,
                 signature_id,
                 implementation_id,
+                application_plan_id,
                 primitive_origin,
                 lift,
                 result_element_type,
@@ -1766,13 +1792,17 @@ fn verify_apply(
     primitive_id: u16,
     signature_id: u16,
     implementation_id: u16,
+    application_plan_id: u16,
     primitive_origin: OriginIndex,
     lift: LiftMode,
     result_element_type: ScalarType,
     shape: ShapePlan,
     injection: VerifyAllocationFailureInjection,
 ) -> Result<(), VerifyError> {
-    use crate::semantic_registry::{StructuralBehavior, implementation_from_numeric};
+    use crate::semantic_registry::{
+        OperandConsumption, ResultCardinality, WorkAdmission, application_plan_from_numeric,
+        implementation_from_numeric,
+    };
     let descriptor = implementation_from_numeric(implementation_id).map_err(|_| {
         malformed(
             Invariant::InvalidSemanticIdentity,
@@ -1798,6 +1828,36 @@ fn verify_apply(
             RecordKind::Node,
             Some(node_index),
             "semantic_identity",
+        ));
+    }
+    let application_plan = application_plan_from_numeric(application_plan_id).map_err(|_| {
+        malformed(
+            Invariant::InvalidSemanticIdentity,
+            RecordKind::Node,
+            Some(node_index),
+            "application_plan_id",
+        )
+    })?;
+    if descriptor.application_plan != application_plan {
+        return Err(malformed(
+            Invariant::InvalidSemanticIdentity,
+            RecordKind::Node,
+            Some(node_index),
+            "application_plan_id",
+        ));
+    }
+    if let WorkAdmission::OperandCardinality(position) = application_plan.resources.work
+        && (position == 0
+            || descriptor
+                .parameters
+                .get(usize::from(position - 1))
+                .is_none_or(|operand| operand.consumption != OperandConsumption::WholeVector))
+    {
+        return Err(malformed(
+            Invariant::InvalidSemanticIdentity,
+            RecordKind::Node,
+            Some(node_index),
+            "resource_admission",
         ));
     }
     if edges.len() != descriptor.parameters.len() {
@@ -1843,9 +1903,11 @@ fn verify_apply(
             )
         })?;
         let valid_conversion = match edge.conversion {
-            Conversion::Identity => actual == accepted,
+            Conversion::Identity => actual == accepted.element_type,
             Conversion::PromoteIntToDouble => {
-                actual == ScalarType::Int && accepted == ScalarType::Double
+                accepted.consumption == OperandConsumption::Elementwise
+                    && actual == ScalarType::Int
+                    && accepted.element_type == ScalarType::Double
             }
         };
         if !valid_conversion {
@@ -1856,7 +1918,15 @@ fn verify_apply(
                 "conversion",
             ));
         }
-        if vector {
+        if accepted.consumption == OperandConsumption::WholeVector && !vector {
+            return Err(malformed(
+                Invariant::InvalidRecord,
+                RecordKind::Edge,
+                Some(node.edges.start.saturating_add(offset as u32)),
+                "operand_consumption",
+            ));
+        }
+        if accepted.consumption == OperandConsumption::Elementwise && vector {
             any_vector = true;
             match edge.cardinality {
                 Some(Cardinality::StaticVector(length)) => {
@@ -1885,6 +1955,18 @@ fn verify_apply(
                     ));
                 }
             }
+        } else if vector
+            && !matches!(
+                edge.cardinality,
+                Some(Cardinality::StaticVector(_)) | Some(Cardinality::DynamicVector)
+            )
+        {
+            return Err(malformed(
+                Invariant::InconsistentResultMetadata,
+                RecordKind::Edge,
+                Some(node.edges.start.saturating_add(offset as u32)),
+                "cardinality",
+            ));
         }
     }
     let dynamic_bounds = range_bounds(
@@ -1906,27 +1988,82 @@ fn verify_apply(
             "shape",
         ));
     }
-    let (expected_type, expected_cardinality, expected_lift) = match descriptor.behavior {
-        StructuralBehavior::Iota => (
-            TypeRecord::Vector(descriptor.result),
-            Cardinality::DynamicVector,
-            LiftMode::DynamicVector,
-        ),
-        StructuralBehavior::Elementwise if any_vector => (
-            TypeRecord::Vector(descriptor.result),
-            if any_dynamic {
-                Cardinality::DynamicVector
-            } else {
-                Cardinality::StaticVector(static_length.unwrap_or(0))
-            },
-            LiftMode::Vector,
-        ),
-        StructuralBehavior::Elementwise => (
-            TypeRecord::Scalar(descriptor.result),
-            Cardinality::StaticScalar,
-            LiftMode::Scalar,
-        ),
+    let operand_cardinality = |position: u16| {
+        usize::from(position.checked_sub(1)?)
+            .checked_add(node.edges.start as usize)
+            .and_then(|index| program.edges.get(index))
+            .and_then(|edge| edge.cardinality)
     };
+    let (expected_type, expected_cardinality, expected_lift) =
+        match application_plan.result_cardinality {
+            ResultCardinality::DynamicVector => (
+                TypeRecord::Vector(descriptor.result),
+                Cardinality::DynamicVector,
+                LiftMode::DynamicVector,
+            ),
+            ResultCardinality::Elementwise if any_vector => (
+                TypeRecord::Vector(descriptor.result),
+                if any_dynamic {
+                    Cardinality::DynamicVector
+                } else {
+                    Cardinality::StaticVector(static_length.unwrap_or(0))
+                },
+                LiftMode::Vector,
+            ),
+            ResultCardinality::Elementwise => (
+                TypeRecord::Scalar(descriptor.result),
+                Cardinality::StaticScalar,
+                LiftMode::Scalar,
+            ),
+            ResultCardinality::Scalar => (
+                TypeRecord::Scalar(descriptor.result),
+                Cardinality::StaticScalar,
+                LiftMode::ContainerScalar,
+            ),
+            ResultCardinality::PreserveOperand(position) => {
+                let cardinality = operand_cardinality(position).ok_or_else(|| {
+                    malformed(
+                        Invariant::InconsistentResultMetadata,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "result_cardinality",
+                    )
+                })?;
+                (
+                    TypeRecord::Vector(descriptor.result),
+                    cardinality,
+                    LiftMode::ContainerVector,
+                )
+            }
+            ResultCardinality::OperandPlusOne(position) => {
+                let cardinality = match operand_cardinality(position) {
+                    Some(Cardinality::StaticVector(length)) => {
+                        Cardinality::StaticVector(length.checked_add(1).ok_or_else(|| {
+                            malformed(
+                                Invariant::RangeOverflow,
+                                RecordKind::Node,
+                                Some(node_index),
+                                "result_cardinality",
+                            )
+                        })?)
+                    }
+                    Some(Cardinality::DynamicVector) => Cardinality::DynamicVector,
+                    _ => {
+                        return Err(malformed(
+                            Invariant::InconsistentResultMetadata,
+                            RecordKind::Node,
+                            Some(node_index),
+                            "result_cardinality",
+                        ));
+                    }
+                };
+                (
+                    TypeRecord::Vector(descriptor.result),
+                    cardinality,
+                    LiftMode::ContainerVector,
+                )
+            }
+        };
     if type_record(program, node.result_type) != Some(expected_type)
         || node.cardinality != Some(expected_cardinality)
         || lift != expected_lift
@@ -2681,11 +2818,39 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             .edges
             .iter()
             .any(|edge| matches!(edge.access, ValueAccess::FanOutOperandBorrow));
+    let needs_application_plans = program.nodes.iter().any(|node| {
+        let NodeKind::SelectedApply {
+            implementation_id, ..
+        } = node.kind
+        else {
+            return false;
+        };
+        crate::semantic_registry::implementation_from_numeric(implementation_id).is_ok_and(
+            |descriptor| {
+                use crate::semantic_registry::{OperandConsumption, ResultCardinality};
+                descriptor
+                    .parameters
+                    .iter()
+                    .any(|operand| operand.consumption == OperandConsumption::WholeVector)
+                    || matches!(
+                        descriptor.application_plan.result_cardinality,
+                        ResultCardinality::Scalar
+                            | ResultCardinality::PreserveOperand(_)
+                            | ResultCardinality::OperandPlusOne(_)
+                    )
+            },
+        )
+    });
     for (required, needed, field) in [
         (Feature::StableSemanticIds, needs_ids, "stable_semantic_ids"),
         (Feature::Tuples, needs_tuples, "tuples"),
         (Feature::PrefixSpread, needs_spread, "prefix_spread"),
         (Feature::FanOut, needs_fan_out, "fan_out"),
+        (
+            Feature::ApplicationPlans,
+            needs_application_plans,
+            "application_plans",
+        ),
     ] {
         if needed && !has_feature(program, required) {
             return Err(malformed(
@@ -2889,6 +3054,7 @@ mod tests {
                 primitive_id: 5,
                 signature_id: 9,
                 implementation_id: 9,
+                application_plan_id: 1,
                 primitive_origin: origin,
                 lift: LiftMode::Vector,
                 result_element_type: ScalarType::Int,
@@ -2947,6 +3113,7 @@ mod tests {
                 primitive_id: 19,
                 signature_id: 34,
                 implementation_id: 34,
+                application_plan_id: 2,
                 primitive_origin: origin,
                 lift: LiftMode::DynamicVector,
                 result_element_type: ScalarType::Int,
@@ -3014,6 +3181,7 @@ mod tests {
                 primitive_id: 19,
                 signature_id: 34,
                 implementation_id: 34,
+                application_plan_id: 2,
                 primitive_origin: origin,
                 lift: LiftMode::DynamicVector,
                 result_element_type: ScalarType::Int,
@@ -3041,6 +3209,7 @@ mod tests {
                 primitive_id: 19,
                 signature_id: 34,
                 implementation_id: 34,
+                application_plan_id: 2,
                 primitive_origin: origin,
                 lift: LiftMode::DynamicVector,
                 result_element_type: ScalarType::Int,
@@ -3072,6 +3241,7 @@ mod tests {
                 primitive_id: 5,
                 signature_id: 9,
                 implementation_id: 9,
+                application_plan_id: 1,
                 primitive_origin: origin,
                 lift: LiftMode::Vector,
                 result_element_type: ScalarType::Int,
@@ -3148,6 +3318,7 @@ mod tests {
                 primitive_id: 5,
                 signature_id: 9,
                 implementation_id: 9,
+                application_plan_id: 1,
                 primitive_origin: OriginIndex(0),
                 lift: LiftMode::Scalar,
                 result_element_type: ScalarType::Int,
@@ -3275,6 +3446,7 @@ mod tests {
                 primitive_id: 1,
                 signature_id: 1,
                 implementation_id: 1,
+                application_plan_id: 1,
                 primitive_origin: origin,
                 lift: LiftMode::Scalar,
                 result_element_type: ScalarType::Int,
@@ -3353,6 +3525,7 @@ mod tests {
                 primitive_id: 1,
                 signature_id: 1,
                 implementation_id: 1,
+                application_plan_id: 1,
                 primitive_origin: origin,
                 lift: LiftMode::Scalar,
                 result_element_type: ScalarType::Int,
@@ -3751,6 +3924,7 @@ mod tests {
                 primitive_id: 5,
                 signature_id: 9,
                 implementation_id: 9,
+                application_plan_id: 1,
                 primitive_origin: origin,
                 lift: LiftMode::Scalar,
                 result_element_type: ScalarType::Int,
@@ -4017,6 +4191,25 @@ mod tests {
         *implementation_id = 35;
         verify_error(implementation, Invariant::InvalidSemanticIdentity);
 
+        let mut application_plan = vector_apply_program();
+        let NodeKind::SelectedApply {
+            ref mut application_plan_id,
+            ..
+        } = application_plan.nodes[2].kind
+        else {
+            panic!("fixture node kind changed");
+        };
+        *application_plan_id = 99;
+        assert_eq!(
+            application_plan.verify(),
+            Err(VerifyError::MalformedProgram(MalformedProgram {
+                invariant: Invariant::InvalidSemanticIdentity,
+                record: RecordKind::Node,
+                index: Some(2),
+                field: "application_plan_id",
+            }))
+        );
+
         let mut bad_primitive_origin = vector_apply_program();
         let NodeKind::SelectedApply {
             primitive_origin: ref mut origin,
@@ -4048,6 +4241,27 @@ mod tests {
         feature.features.clear();
         feature.module.ranges.features.count = 0;
         verify_error(feature, Invariant::MissingFeature);
+
+        let mut wrong_minor = vector_apply_program();
+        wrong_minor
+            .features
+            .push(Feature::ApplicationPlans.numeric());
+        wrong_minor.module.ranges.features.count += 1;
+        assert_eq!(
+            wrong_minor.verify(),
+            Err(VerifyError::MalformedProgram(MalformedProgram {
+                invariant: Invariant::UnsupportedVersion,
+                record: RecordKind::Module,
+                index: None,
+                field: "application_plans",
+            }))
+        );
+
+        let mut explicit = vector_apply_program();
+        explicit.module.semantic_minor = 1;
+        explicit.features.push(Feature::ApplicationPlans.numeric());
+        explicit.module.ranges.features.count += 1;
+        assert!(explicit.verify().is_ok());
     }
 
     #[test]
@@ -4143,6 +4357,7 @@ mod tests {
                         primitive_id: 19,
                         signature_id: 34,
                         implementation_id: 34,
+                        application_plan_id: 2,
                         primitive_origin: origin,
                         lift: LiftMode::DynamicVector,
                         result_element_type: ScalarType::Int,
@@ -4257,6 +4472,7 @@ mod tests {
                 primitive_id: 5,
                 signature_id: 9,
                 implementation_id: 9,
+                application_plan_id: 1,
                 primitive_origin: origin,
                 lift: LiftMode::Vector,
                 result_element_type: ScalarType::Int,
@@ -4583,6 +4799,7 @@ mod tests {
                     primitive_id: 1,
                     signature_id: 1,
                     implementation_id: 1,
+                    application_plan_id: 1,
                     primitive_origin: origin,
                     lift: LiftMode::Scalar,
                     result_element_type: ScalarType::Int,
@@ -4657,6 +4874,7 @@ mod tests {
                     primitive_id: 1,
                     signature_id: 1,
                     implementation_id: 1,
+                    application_plan_id: 1,
                     primitive_origin: origin,
                     lift: LiftMode::Scalar,
                     result_element_type: ScalarType::Int,

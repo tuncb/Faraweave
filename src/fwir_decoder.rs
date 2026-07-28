@@ -13,7 +13,7 @@ const HEADER_SIZE: usize = 32;
 const DIRECTORY_ENTRY_SIZE: usize = 24;
 const NONE: u32 = u32::MAX;
 const PRODUCER_SECTION_ID: u16 = 32769;
-const KNOWN_SECTION_SLOTS: usize = 17;
+const KNOWN_SECTION_SLOTS: usize = 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FwirDecodeLimits {
@@ -164,6 +164,7 @@ impl Section {
 struct DecodePlan {
     sections: [Option<Section>; KNOWN_SECTION_SLOTS],
     string_count: usize,
+    format_minor: u16,
 }
 
 fn record_offset(section: Section, index: usize) -> usize {
@@ -359,7 +360,8 @@ fn known_section(id: u16) -> Option<(usize, u16, usize)> {
         14 => Some((13, 3, 56)),
         15 => Some((14, 3, 12)),
         16 => Some((15, 3, 8)),
-        PRODUCER_SECTION_ID => Some((16, 0, 0)),
+        17 => Some((16, 3, 8)),
+        PRODUCER_SECTION_ID => Some((17, 0, 0)),
         _ => None,
     }
 }
@@ -1108,12 +1110,13 @@ fn preflight(bytes: &[u8], limits: &FwirDecodeLimits) -> Result<DecodePlan, Fwir
             None,
         ));
     }
-    if let Some(producer) = sections[16] {
+    if let Some(producer) = sections[17] {
         validate_producer(bytes, producer)?;
     }
     Ok(DecodePlan {
         sections,
         string_count,
+        format_minor: minor,
     })
 }
 
@@ -1200,9 +1203,12 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
         if reserved != 0 {
             return Err(record_error(features, index, 3, "reserved"));
         }
-        if id <= 4 {
+        if id <= 5 {
             if class != 0 {
                 return Err(record_error(features, index, 2, "feature_class"));
+            }
+            if id == 5 && plan.format_minor == 0 {
+                return Err(record_error(features, index, 0, "feature_format_minor"));
             }
         } else if class == 0 {
             return Err(error(
@@ -1218,8 +1224,21 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
     Ok(())
 }
 
+fn has_application_plans_feature(bytes: &[u8], plan: &DecodePlan) -> Result<bool, FwirDecodeError> {
+    let Some(features) = section(plan, 2) else {
+        return Ok(false);
+    };
+    for index in 0..features.record_count() {
+        if record_u16(bytes, features, index, 0)? == 5 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeError> {
     validate_features(bytes, plan)?;
+    let explicit_application_plans = has_application_plans_feature(bytes, plan)?;
 
     if let Some(sources) = section(plan, 4) {
         for index in 0..sources.record_count() {
@@ -1308,6 +1327,7 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
             }
         }
     }
+    let mut selected_nodes = 0_usize;
     if let Some(nodes) = section(plan, 14) {
         for index in 0..nodes.record_count() {
             let kind = record_u8(bytes, nodes, index, 0)?;
@@ -1334,7 +1354,11 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                     }
                 }
                 4 => {
-                    if !matches!(lift, 1..=3)
+                    selected_nodes = selected_nodes
+                        .checked_add(1)
+                        .ok_or_else(|| record_error(nodes, index, 0, "application_plan_count"))?;
+                    if !(matches!(lift, 1..=3)
+                        || (explicit_application_plans && matches!(lift, 4 | 5)))
                         || scalar_type_from_tag(result_element).is_none()
                         || arguments[0..3]
                             .iter()
@@ -1379,6 +1403,60 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                 _ => return Err(record_error(nodes, index, 0, "kind")),
             }
         }
+    }
+    match (
+        explicit_application_plans,
+        section(plan, 17),
+        selected_nodes,
+    ) {
+        (false, Some(plans), _) => {
+            return Err(record_error(plans, 0, 0, "application_plans_feature"));
+        }
+        (true, None, count) if count != 0 => {
+            return Err(error(
+                FwirDecodeErrorKind::NonCanonicalRecord {
+                    field: "missing_application_plans",
+                },
+                section(plan, 14).map_or(0, |nodes| nodes.offset),
+                Some(17),
+                None,
+            ));
+        }
+        (_, Some(plans), count) => {
+            if plans.record_count() != count {
+                return Err(record_error(plans, 0, 0, "application_plan_count"));
+            }
+            let Some(nodes) = section(plan, 14) else {
+                return Err(record_error(plans, 0, 0, "application_plan_node"));
+            };
+            let mut plan_index = 0;
+            for node_index in 0..nodes.record_count() {
+                if record_u8(bytes, nodes, node_index, 0)? != 4 {
+                    continue;
+                }
+                if record_u32(bytes, plans, plan_index, 0)?
+                    != u32::try_from(node_index).unwrap_or(u32::MAX)
+                {
+                    return Err(record_error(plans, plan_index, 0, "application_plan_node"));
+                }
+                let plan_id = record_u16(bytes, plans, plan_index, 4)?;
+                zero_bytes(bytes, plans, plan_index, 6, 2, "reserved")?;
+                let implementation = u16::try_from(record_u32(bytes, nodes, node_index, 32)?)
+                    .map_err(|_| record_error(nodes, node_index, 32, "semantic_id"))?;
+                let expected =
+                    crate::semantic_registry::implementation_from_numeric(implementation)
+                        .map(|descriptor| descriptor.application_plan.id.numeric())
+                        .map_err(|_| record_error(plans, plan_index, 4, "application_plan_id"))?;
+                if plan_id == 0
+                    || plan_id != expected
+                    || crate::semantic_registry::application_plan_from_numeric(plan_id).is_err()
+                {
+                    return Err(record_error(plans, plan_index, 4, "application_plan_id"));
+                }
+                plan_index += 1;
+            }
+        }
+        _ => {}
     }
     if let Some(ownership) = section(plan, 15) {
         for index in 0..ownership.record_count() {
@@ -1525,6 +1603,7 @@ fn reconstruct_program(
             ));
         }
     };
+    let explicit_application_plans = has_application_plans_feature(bytes, plan)?;
     let strings = section(plan, 3);
     let mut features = Vec::new();
     let mut source_units = Vec::new();
@@ -1643,7 +1722,7 @@ fn reconstruct_program(
     if let Some(records) = section(plan, 2) {
         for index in 0..records.record_count() {
             let id = record_u16(bytes, records, index, 0)?;
-            if id <= 4 {
+            if id <= 5 {
                 features.push(id);
             }
         }
@@ -1824,6 +1903,7 @@ fn reconstruct_program(
             });
         }
     }
+    let mut application_plan_record = 0_usize;
     if let Some(records) = section(plan, 14) {
         for index in 0..records.record_count() {
             let kind_tag = record_u8(bytes, records, index, 0)?;
@@ -1840,16 +1920,48 @@ fn reconstruct_program(
                         1 => LiftMode::Scalar,
                         2 => LiftMode::Vector,
                         3 => LiftMode::DynamicVector,
+                        4 => LiftMode::ContainerScalar,
+                        5 => LiftMode::ContainerVector,
                         _ => return Err(record_error(records, index, 2, "lift")),
                     };
                     let anchor = record_u32(bytes, records, index, 40)?;
+                    let implementation_id =
+                        u16::try_from(record_u32(bytes, records, index, 32)?)
+                            .map_err(|_| record_error(records, index, 32, "semantic_id"))?;
+                    let application_plan_id = if explicit_application_plans {
+                        let plans = section(plan, 17).ok_or_else(|| {
+                            error(
+                                FwirDecodeErrorKind::NonCanonicalRecord {
+                                    field: "missing_application_plans",
+                                },
+                                records.offset,
+                                Some(17),
+                                None,
+                            )
+                        })?;
+                        let value = record_u16(bytes, plans, application_plan_record, 4)?;
+                        application_plan_record =
+                            application_plan_record.checked_add(1).ok_or_else(|| {
+                                record_error(
+                                    plans,
+                                    application_plan_record,
+                                    4,
+                                    "application_plan_count",
+                                )
+                            })?;
+                        value
+                    } else {
+                        crate::semantic_registry::implementation_from_numeric(implementation_id)
+                            .map(|descriptor| descriptor.application_plan.id.numeric())
+                            .map_err(|_| record_error(records, index, 32, "application_plan_id"))?
+                    };
                     NodeKind::SelectedApply {
                         primitive_id: u16::try_from(record_u32(bytes, records, index, 24)?)
                             .map_err(|_| record_error(records, index, 24, "semantic_id"))?,
                         signature_id: u16::try_from(record_u32(bytes, records, index, 28)?)
                             .map_err(|_| record_error(records, index, 28, "semantic_id"))?,
-                        implementation_id: u16::try_from(record_u32(bytes, records, index, 32)?)
-                            .map_err(|_| record_error(records, index, 32, "semantic_id"))?,
+                        implementation_id,
+                        application_plan_id,
                         primitive_origin: OriginIndex(record_u32(bytes, records, index, 36)?),
                         lift,
                         result_element_type: scalar_type_from_tag(record_u8(
@@ -2447,9 +2559,12 @@ mod tests {
         }
     }
 
-    fn deep_program(depth: u32) -> VerifiedProgram {
+    fn planned_program(depth: u32, explicit_application_plans: bool) -> VerifiedProgram {
         let mut builder = RawProgramBuilder::new();
         must(builder.push_feature(Feature::StableSemanticIds.numeric()));
+        if explicit_application_plans {
+            must(builder.push_feature(Feature::ApplicationPlans.numeric()));
+        }
         let source = must(builder.push_source_unit(SourceUnit {
             diagnostic_name: "deep.fw".to_owned(),
             byte_length: 1,
@@ -2493,6 +2608,7 @@ mod tests {
                     primitive_id: 1,
                     signature_id: 1,
                     implementation_id: 1,
+                    application_plan_id: 1,
                     primitive_origin: origin,
                     lift: LiftMode::Scalar,
                     result_element_type: ScalarType::Int,
@@ -2523,7 +2639,111 @@ mod tests {
             node: current,
             origin,
         }));
-        must(must(builder.finish()).verify())
+        let mut raw = must(builder.finish());
+        if explicit_application_plans {
+            raw.module.semantic_minor = 1;
+        }
+        must(raw.verify())
+    }
+
+    fn deep_program(depth: u32) -> VerifiedProgram {
+        planned_program(depth, false)
+    }
+
+    #[test]
+    fn application_plan_minor_extension_roundtrips_and_preserves_v1_0_bytes() {
+        let legacy = must(encode_fwir(
+            &planned_program(1, false),
+            &FwirEncodeOptions::default(),
+        ));
+        assert_eq!(read_u16(&legacy, 10, None, None), Ok(0));
+        let (_, legacy_nodes, legacy_nodes_length) = test_section(&legacy, 14);
+        let legacy_apply = legacy[legacy_nodes..legacy_nodes + legacy_nodes_length]
+            .chunks_exact(56)
+            .position(|record| record[0] == 4)
+            .map(|index| legacy_nodes + index * 56)
+            .unwrap_or(legacy_nodes);
+        assert_eq!(
+            read_u32(&legacy, legacy_apply + 52, Some(14), Some(1)),
+            Ok(0)
+        );
+        let decoded_legacy = must(decode_fwir(&legacy, &FwirDecodeLimits::default()));
+        let legacy_plan = decoded_legacy
+            .as_raw()
+            .nodes
+            .iter()
+            .find_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    application_plan_id,
+                    ..
+                } => Some(application_plan_id),
+                _ => None,
+            });
+        assert_eq!(legacy_plan, Some(1));
+        assert_eq!(
+            must(encode_fwir(&decoded_legacy, &FwirEncodeOptions::default())),
+            legacy
+        );
+
+        let explicit = must(encode_fwir(
+            &planned_program(1, true),
+            &FwirEncodeOptions::default(),
+        ));
+        assert_eq!(read_u16(&explicit, 10, None, None), Ok(1));
+        let (_, explicit_nodes, explicit_nodes_length) = test_section(&explicit, 14);
+        let explicit_apply = explicit[explicit_nodes..explicit_nodes + explicit_nodes_length]
+            .chunks_exact(56)
+            .position(|record| record[0] == 4)
+            .map(|index| explicit_nodes + index * 56)
+            .unwrap_or(explicit_nodes);
+        assert_eq!(
+            read_u32(&explicit, explicit_apply + 52, Some(14), Some(1)),
+            Ok(0)
+        );
+        let (_, explicit_plans, explicit_plans_length) = test_section(&explicit, 17);
+        assert_eq!(explicit_plans_length, 8);
+        assert_eq!(
+            read_u32(&explicit, explicit_plans, Some(17), Some(0)),
+            Ok(1)
+        );
+        assert_eq!(
+            read_u16(&explicit, explicit_plans + 4, Some(17), Some(0)),
+            Ok(1)
+        );
+        let decoded_explicit = must(decode_fwir(&explicit, &FwirDecodeLimits::default()));
+        assert_eq!(
+            must(encode_fwir(
+                &decoded_explicit,
+                &FwirEncodeOptions::default()
+            )),
+            explicit
+        );
+        assert!(matches!(
+            decode_fwir_with_allocation_failure(
+                &explicit,
+                &FwirDecodeLimits::default(),
+                FwirDecodeAllocationFailureInjection::at(FwirDecodeAllocationSite::Nodes)
+            ),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::AllocationUnavailable {
+                    site: FwirDecodeAllocationSite::Nodes
+                },
+                ..
+            })
+        ));
+
+        let mut unknown_plan = explicit;
+        put_u16_at(&mut unknown_plan, explicit_plans + 4, 99);
+        assert!(matches!(
+            decode_fwir(&unknown_plan, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                    field: "application_plan_id"
+                },
+                section_id: Some(17),
+                ..
+            })
+        ));
     }
 
     #[test]

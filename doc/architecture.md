@@ -26,6 +26,11 @@ lifting, shape, provenance, and ownership decisions; `src/interpreter.rs` and
 Native builds compile the output of that same C generator, so there is no
 separate native semantic backend.
 
+Semantic FWIR 1.1 application plans extend those selected IDs with registry
+owned operand-consumption, result-cardinality, and resource-work metadata.
+Physical section 17 records the selected plan for feature-5 artifacts, while
+1.0 artifacts reconstruct the same legacy plan from their implementation ID.
+
 `VerifiedProgram` is an in-process trust boundary, not a serialized ABI.
 Callers may build `RawProgram`, but only complete verification can construct a
 `VerifiedProgram`; decoding likewise returns nothing until physical checks and
