@@ -83,6 +83,8 @@ pub(crate) enum ScalarKernel {
     SubDouble,
     MulInt,
     MulDouble,
+    DivInt,
+    DivDouble,
     EqualsBool,
     EqualsInt,
     EqualsDouble,
@@ -189,9 +191,9 @@ impl InternalRegistryDiagnosticFailureInjection {
     }
 }
 
-const PRIMITIVE_COUNT: u16 = 19;
-const SIGNATURE_COUNT: u16 = 34;
-const IMPLEMENTATION_COUNT: u16 = 34;
+const PRIMITIVE_COUNT: u16 = 20;
+const SIGNATURE_COUNT: u16 = 36;
+const IMPLEMENTATION_COUNT: u16 = 36;
 const APPLICATION_PLAN_COUNT: u16 = 2;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
@@ -620,6 +622,28 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         GreaterThanDouble
     ),
     descriptor!(19, "iota", 34, 34, INT1, Int, Iota, IOTA_PLAN, IotaInt),
+    descriptor!(
+        20,
+        "div",
+        35,
+        35,
+        INT2,
+        Int,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        DivInt
+    ),
+    descriptor!(
+        20,
+        "div",
+        36,
+        36,
+        DOUBLE2,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        DivDouble
+    ),
 ];
 
 impl PrimitiveId {
@@ -895,6 +919,8 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::SubDouble => "sub_double",
         ScalarKernel::MulInt => "mul_int",
         ScalarKernel::MulDouble => "mul_double",
+        ScalarKernel::DivInt => "div_int",
+        ScalarKernel::DivDouble => "div_double",
         ScalarKernel::EqualsBool => "equals_bool",
         ScalarKernel::EqualsInt => "equals_int",
         ScalarKernel::EqualsDouble => "equals_double",
@@ -1359,6 +1385,8 @@ mod tests {
             (18, "greater_than"),
             (18, "greater_than"),
             (19, "iota"),
+            (20, "div"),
+            (20, "div"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1375,9 +1403,14 @@ mod tests {
             assert_eq!(Some(descriptor.implementation_id.numeric()), stable_row_id);
         }
         assert_eq!(primitive_from_name("inc"), primitive_from_numeric(1));
+        assert_eq!(primitive_from_name("div"), primitive_from_numeric(20));
         assert_eq!(
-            signature_from_numeric(34).map(|descriptor| descriptor.primitive_name),
-            Ok("iota")
+            signature_from_numeric(36).map(|descriptor| descriptor.primitive_name),
+            Ok("div")
+        );
+        assert_eq!(
+            implementation_from_numeric(36).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::DivDouble)
         );
         assert_eq!(
             implementation_from_numeric(34).map(|descriptor| descriptor.kernel),
@@ -1385,13 +1418,18 @@ mod tests {
         );
         assert_eq!(application_plan_from_numeric(1), Ok(ELEMENTWISE_PLAN));
         assert_eq!(application_plan_from_numeric(2), Ok(IOTA_PLAN));
-        assert!(SEMANTIC_REGISTRY[..33].iter().all(|descriptor| {
-            descriptor.application_plan == ELEMENTWISE_PLAN
-                && descriptor
-                    .parameters
-                    .iter()
-                    .all(|operand| operand.consumption == OperandConsumption::Elementwise)
-        }));
+        assert!(
+            SEMANTIC_REGISTRY
+                .iter()
+                .filter(|descriptor| descriptor.kernel != ScalarKernel::IotaInt)
+                .all(|descriptor| {
+                    descriptor.application_plan == ELEMENTWISE_PLAN
+                        && descriptor
+                            .parameters
+                            .iter()
+                            .all(|operand| operand.consumption == OperandConsumption::Elementwise)
+                })
+        );
         assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
@@ -1401,11 +1439,11 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(35),
+            signature_from_numeric(37),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(35),
+            implementation_from_numeric(37),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
@@ -1447,7 +1485,7 @@ mod tests {
             Err(RegistryValidationError::DuplicatePrimitiveName)
         );
 
-        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 1];
+        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 2];
         assert_eq!(
             validate_registry(missing),
             Err(RegistryValidationError::MissingPrimitiveId)

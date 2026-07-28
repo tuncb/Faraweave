@@ -332,16 +332,16 @@ fn cli_repl_internal_reports_registry_without_evaluating_source() {
             .lines()
             .filter(|line| line.starts_with("primitive "))
             .count(),
-        19
+        20
     );
     assert_eq!(
         stdout
             .lines()
             .filter(|line| line.starts_with("  signature "))
             .count(),
-        34
+        36
     );
-    assert!(stdout.ends_with("kernel=iota_int\n> 6\n> "));
+    assert!(stdout.ends_with("kernel=div_double\n> 6\n> "));
 }
 
 #[test]

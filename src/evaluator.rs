@@ -247,6 +247,8 @@ mod tests {
             ("add[1 2]", "3"),
             ("sub[5 2]", "3"),
             ("mul[3 4]", "12"),
+            ("div[-7 3]", "-2"),
+            ("div[1 2.0]", "0.5"),
             ("equals[1 1.0]", "true"),
             ("not_equals[1 2]", "true"),
             ("not[false]", "true"),
