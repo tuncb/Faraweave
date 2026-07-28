@@ -1,0 +1,3 @@
+# Issue #37 — elementwise division
+
+Primitive ID 20 appends `div` with signature and implementation IDs 35 for `Int, Int -> Int` and 36 for `Double, Double -> Double`; existing promotion selects the Double row for mixed numeric operands. Integer division checks a zero divisor before using checked truncation toward zero, so division by zero and `Int::MIN / -1` remain distinct structured domain failures without host panic or C undefined behavior. Double division uses the existing saved strict floating environment and canonical NaN boundary, while ordinary elementwise admission, work, cleanup, shape, and lowest-index rules remain unchanged.

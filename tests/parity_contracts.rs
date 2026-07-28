@@ -1,8 +1,8 @@
 use faraweave::{
-    AllocationFailureInjection, CompilerConfiguration, ErrorKind, EvaluationConfiguration,
-    ExecutionProfile, NativePlatform, ResourceLimits, ScalarType, Type, Value, evaluate_expression,
-    evaluate_expression_with_configuration, evaluate_source, format_type, format_value,
-    select_c_compiler,
+    AllocationFailureInjection, CompilerConfiguration, DomainErrorReason, ErrorKind,
+    EvaluationConfiguration, ExecutionProfile, NativePlatform, ResourceLimits, ScalarType,
+    SourceLocation, Type, Value, evaluate_expression, evaluate_expression_with_configuration,
+    evaluate_source, format_type, format_value, select_c_compiler,
 };
 
 fn formatted(source: &str) -> String {
@@ -19,6 +19,7 @@ fn s16_complete_elementwise_matrix() {
         ("add[10 (1 2)]", "(11 12)"),
         ("sub[(10 20) 2]", "(8 18)"),
         ("mul[(2 3) (4 5)]", "(8 15)"),
+        ("div[(8 9 10) 2]", "(4 4 5)"),
         ("equals[(1 2) 2.0]", "(false true)"),
         ("not_equals[(true false) true]", "(false true)"),
         ("not[(true false)]", "(false true)"),
@@ -45,6 +46,169 @@ fn s16_empty_singleton_promotion_and_shape_contracts() {
     assert_eq!(shape.kind, ErrorKind::ShapeMismatch);
     let type_error = evaluate_expression("add[(1) (true false)]").expect_err("type mismatch");
     assert_eq!(type_error.kind, ErrorKind::TypeError);
+    assert_eq!(formatted("div[Int() 0]"), "()");
+    assert_eq!(formatted("div[Int() Double()]"), "()");
+    assert_eq!(formatted("div[(7) 2]"), "(3)");
+    let div_shape = evaluate_expression("div[(1) (0 1)]").expect_err("shape before domain");
+    assert_eq!(div_shape.kind, ErrorKind::ShapeMismatch);
+}
+
+#[test]
+fn div_integer_faults_and_strict_binary64_are_exact() {
+    for (source, expected) in [
+        ("div[7 3]", "2"),
+        ("div[-7 3]", "-2"),
+        ("div[7 -3]", "-2"),
+        ("div[-7 -3]", "2"),
+        ("div[1 2.0]", "0.5"),
+        ("div[1.0 2]", "0.5"),
+        ("div[(8 9 10) (2 3 5)]", "(4 3 2)"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    let scalar_zero = evaluate_expression("div[7 0]").expect_err("integer division by zero");
+    assert_eq!(scalar_zero.kind, ErrorKind::DomainError);
+    assert_eq!(scalar_zero.message, "div failed: division_by_zero");
+    assert_eq!(scalar_zero.primitive.as_deref(), Some("div"));
+    let scalar_context = scalar_zero.domain.expect("structured division domain");
+    assert_eq!(scalar_context.reason, DomainErrorReason::DivisionByZero);
+    assert_eq!(
+        scalar_context.parameter_types,
+        [ScalarType::Int, ScalarType::Int]
+    );
+    assert_eq!(scalar_context.result_type, ScalarType::Int);
+    assert_eq!(scalar_context.operands, [Value::Int(7), Value::Int(0)]);
+    assert_eq!(scalar_context.element_index, None);
+
+    let lifted =
+        evaluate_expression("div[(8 9 10) (2 0 0)]").expect_err("lowest integer division failure");
+    assert_eq!(
+        lifted.message,
+        "div failed: division_by_zero at result index 1"
+    );
+    let lifted_context = lifted.domain.expect("lifted division context");
+    assert_eq!(lifted_context.reason, DomainErrorReason::DivisionByZero);
+    assert_eq!(lifted_context.operands, [Value::Int(9), Value::Int(0)]);
+    assert_eq!(lifted_context.element_index, Some(1));
+
+    let overflow =
+        evaluate_expression("div[-9223372036854775808 -1]").expect_err("integer division overflow");
+    assert_eq!(overflow.message, "div failed: integer_overflow");
+    let overflow_context = overflow.domain.expect("overflow context");
+    assert_eq!(overflow_context.reason, DomainErrorReason::IntegerOverflow);
+
+    let first = evaluate_expression("div[(-9223372036854775808 4) (-1 0)]")
+        .expect_err("lowest overflow precedes later zero");
+    let first_context = first.domain.expect("first fault context");
+    assert_eq!(first_context.reason, DomainErrorReason::IntegerOverflow);
+    assert_eq!(first_context.element_index, Some(0));
+
+    for (source, expected_bits) in [
+        ("div[1.0 0.0]", 0x7ff0_0000_0000_0000),
+        ("div[1 0.0]", 0x7ff0_0000_0000_0000),
+        ("div[-1.0 0.0]", 0xfff0_0000_0000_0000),
+        ("div[1.0 -0.0]", 0xfff0_0000_0000_0000),
+        ("div[-0.0 2.0]", 0x8000_0000_0000_0000),
+        ("div[1.0 inf]", 0x0000_0000_0000_0000),
+        ("div[1e-323 2.0]", 0x0000_0000_0000_0001),
+        ("div[0.0 0.0]", 0x7ff8_0000_0000_0000),
+        ("div[inf inf]", 0x7ff8_0000_0000_0000),
+        ("div[nan 1.0]", 0x7ff8_0000_0000_0000),
+    ] {
+        let value = evaluate_expression(source).expect(source).value;
+        let Value::Double(value) = value else {
+            panic!("{source} did not return Double");
+        };
+        assert_eq!(value.to_bits(), expected_bits, "{source}");
+    }
+}
+
+#[test]
+fn div_bool_operands_are_rejected_with_exact_public_type_diagnostics() {
+    let cases = [
+        (
+            "div[true 2]",
+            1,
+            5,
+            vec![
+                Type::Scalar(ScalarType::Bool),
+                Type::Scalar(ScalarType::Int),
+            ],
+        ),
+        (
+            "div[2 false]",
+            2,
+            7,
+            vec![
+                Type::Scalar(ScalarType::Int),
+                Type::Scalar(ScalarType::Bool),
+            ],
+        ),
+        (
+            "div[true false]",
+            1,
+            5,
+            vec![
+                Type::Scalar(ScalarType::Bool),
+                Type::Scalar(ScalarType::Bool),
+            ],
+        ),
+        (
+            "div[(true false) 2]",
+            1,
+            5,
+            vec![
+                Type::Vector(ScalarType::Bool),
+                Type::Scalar(ScalarType::Int),
+            ],
+        ),
+        (
+            "div[2.0 (true false)]",
+            2,
+            9,
+            vec![
+                Type::Scalar(ScalarType::Double),
+                Type::Vector(ScalarType::Bool),
+            ],
+        ),
+        (
+            "div[(1 2) false]",
+            2,
+            11,
+            vec![
+                Type::Vector(ScalarType::Int),
+                Type::Scalar(ScalarType::Bool),
+            ],
+        ),
+    ];
+
+    for (source, position, offset, actual_types) in cases {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.kind.diagnostic_name(), "TypeError", "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("div"), "{source}");
+        assert_eq!(error.argument_position, Some(position), "{source}");
+        assert_eq!(
+            error.location,
+            SourceLocation {
+                offset,
+                line: 1,
+                column: offset,
+            },
+            "{source}"
+        );
+        assert_eq!(error.span, None, "{source}");
+        assert_eq!(
+            error.message,
+            format!(
+                "div arguments do not match an accepted signature; first unsupported argument is {position}"
+            ),
+            "{source}"
+        );
+        assert!(error.expected_types.is_empty(), "{source}");
+        assert_eq!(error.actual_types, actual_types, "{source}");
+    }
 }
 
 #[test]
