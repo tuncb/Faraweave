@@ -26,7 +26,9 @@ strs.count	canonical-complete	string-count-limit
 strs.descriptor_offset	canonical-complete	string-offset
 strs.descriptor_length	canonical-complete	string-length
 strs.utf8	canonical-complete	string-utf8
-strs.unique_ordered_used	canonical-complete	string-order
+strs.unique	canonical-complete	string-duplicate
+strs.ordered	canonical-complete	string-out-of-order
+strs.used	canonical-complete	string-unused
 srcu.diagnostic_name	canonical-complete	source-name-index
 srcu.byte_length	canonical-complete	source-byte-length
 parm.slot	canonical-complete	parameter-slot

@@ -1,12 +1,14 @@
 use faraweave::{
     AllocationFailureInjection, EvaluationConfiguration, FwirDecodeErrorKind, FwirDecodeLimits,
-    FwirEncodeOptions, FwirProducerMetadata, ResourceErrorReason, ResourceEventKind, Value,
-    compile_source_to_verified_program, decode_fwir, emit_c_from_verified_program, encode_fwir,
-    evaluate_source_with_arguments_and_observer, evaluate_verified_program_with_arguments,
-    evaluate_verified_program_with_observer, inspect_fwir,
+    FwirEncodeOptions, FwirProducerMetadata, Invariant, RecordKind, ResourceErrorReason,
+    ResourceEventKind, Value, VerifyError, compile_source_to_verified_program, decode_fwir,
+    emit_c_from_verified_program, encode_fwir, evaluate_source_with_arguments_and_observer,
+    evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
+    inspect_fwir,
 };
 use std::collections::BTreeSet;
 use std::fs;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
@@ -23,7 +25,18 @@ enum ExpectedDecodeError {
     InvalidSectionLength,
     InvalidUtf8,
     NonCanonicalRecord(&'static str),
-    MalformedProgram,
+    MalformedProgram {
+        invariant: Invariant,
+        record: RecordKind,
+        index: Option<u32>,
+        field: &'static str,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChangedByteRange {
+    before: Range<usize>,
+    after: Range<usize>,
 }
 
 #[derive(Debug)]
@@ -31,6 +44,8 @@ struct MutationCase {
     target_requirement: &'static str,
     name: &'static str,
     bytes: Vec<u8>,
+    base_bytes: Vec<u8>,
+    changed_ranges: Vec<ChangedByteRange>,
     expected: ExpectedDecodeError,
     offset: u64,
     section_id: Option<u16>,
@@ -41,20 +56,64 @@ fn mutation(
     target_requirement: &'static str,
     name: &'static str,
     bytes: Vec<u8>,
-    expected: ExpectedDecodeError,
-    offset: usize,
-    section_id: Option<u16>,
-    record_index: Option<u32>,
+    base_bytes: Vec<u8>,
+    expected_diagnostic: (ExpectedDecodeError, usize, Option<u16>, Option<u32>),
 ) -> MutationCase {
+    let (expected, offset, section_id, record_index) = expected_diagnostic;
+    let changed_ranges = changed_byte_ranges(&base_bytes, &bytes);
     MutationCase {
         target_requirement,
         name,
         bytes,
+        base_bytes,
+        changed_ranges,
         expected,
         offset: offset as u64,
         section_id,
         record_index,
     }
+}
+
+fn changed_byte_ranges(before: &[u8], after: &[u8]) -> Vec<ChangedByteRange> {
+    if before.len() != after.len() {
+        let prefix = before
+            .iter()
+            .zip(after)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let suffix = before[prefix..]
+            .iter()
+            .rev()
+            .zip(after[prefix..].iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        return vec![ChangedByteRange {
+            before: prefix..before.len() - suffix,
+            after: prefix..after.len() - suffix,
+        }];
+    }
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, (left, right)) in before.iter().zip(after).enumerate() {
+        match (left == right, start) {
+            (false, None) => start = Some(index),
+            (true, Some(begin)) => {
+                ranges.push(ChangedByteRange {
+                    before: begin..index,
+                    after: begin..index,
+                });
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        ranges.push(ChangedByteRange {
+            before: begin..before.len(),
+            after: begin..after.len(),
+        });
+    }
+    ranges
 }
 
 fn assert_expected_decode_error(case: &MutationCase, error: &faraweave::FwirDecodeError) {
@@ -86,7 +145,20 @@ fn assert_expected_decode_error(case: &MutationCase, error: &faraweave::FwirDeco
             ExpectedDecodeError::NonCanonicalRecord(expected),
             FwirDecodeErrorKind::NonCanonicalRecord { field },
         ) => expected == *field,
-        (ExpectedDecodeError::MalformedProgram, FwirDecodeErrorKind::MalformedProgram(_)) => true,
+        (
+            ExpectedDecodeError::MalformedProgram {
+                invariant,
+                record,
+                index,
+                field,
+            },
+            FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(actual)),
+        ) => {
+            actual.invariant == invariant
+                && actual.record == record
+                && actual.index == index
+                && actual.field == field
+        }
         _ => false,
     };
     assert!(
@@ -224,6 +296,41 @@ fn empty_with_duplicate_module_section() -> Vec<u8> {
     bytes.extend_from_slice(&second);
     bytes.extend_from_slice(&empty[56..64]);
     bytes.extend_from_slice(&empty[56..64]);
+    bytes
+}
+
+fn string_section_payload(strings: &[&str]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    let mut offset = 0_u32;
+    for value in strings {
+        payload.extend_from_slice(&offset.to_le_bytes());
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        offset += value.len() as u32;
+    }
+    for value in strings {
+        payload.extend_from_slice(value.as_bytes());
+    }
+    payload
+}
+
+fn replace_section_payload(base: &[u8], section_id: u16, payload: &[u8]) -> Vec<u8> {
+    let (entry, offset, length) = section(base, section_id);
+    let mut bytes = base.to_vec();
+    bytes.splice(offset..offset + length, payload.iter().copied());
+    put_u64(&mut bytes, entry + 16, payload.len() as u64);
+    let delta = payload.len() as i64 - length as i64;
+    for index in 0..read_u32(&bytes, 20) as usize {
+        let directory_entry = 32 + index * 24;
+        let old_offset = read_u64(&bytes, directory_entry + 8);
+        if old_offset > offset as u64 {
+            put_u64(
+                &mut bytes,
+                directory_entry + 8,
+                (old_offset as i64 + delta) as u64,
+            );
+        }
+    }
     bytes
 }
 
@@ -402,8 +509,18 @@ fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
         ),
         ("string-utf8", mutate(&complete, string_data, &[0xff])),
         (
-            "string-order",
-            mutate(&complete, strings + 4, &1_u32.to_le_bytes()),
+            "string-duplicate",
+            replace_section_payload(&complete, 3, &string_section_payload(&["x", "x"])),
+        ),
+        ("string-out-of-order", {
+            let mut bytes = complete.clone();
+            bytes[string_data..string_data + 8].copy_from_slice(b"zzzzzzzz");
+            bytes[string_data + 8] = b'a';
+            bytes
+        }),
+        (
+            "string-unused",
+            mutate(&complete, parameters + 4, &0_u32.to_le_bytes()),
         ),
         (
             "source-name-index",
@@ -679,7 +796,9 @@ fn mutation_target(name: &str) -> &'static str {
         "string-offset" => "strs.descriptor_offset",
         "string-length" => "strs.descriptor_length",
         "string-utf8" => "strs.utf8",
-        "string-order" => "strs.unique_ordered_used",
+        "string-duplicate" => "strs.unique",
+        "string-out-of-order" => "strs.ordered",
+        "string-unused" => "strs.used",
         "source-name-index" => "srcu.diagnostic_name",
         "source-byte-length" => "srcu.byte_length",
         "parameter-slot" => "parm.slot",
@@ -879,11 +998,23 @@ fn targeted_mutations() -> Vec<MutationCase> {
                     Some(2),
                     Some(0),
                 ),
-                "string-offset" | "string-order" => (
+                "string-offset" => (
                     ExpectedDecodeError::NonCanonicalRecord("string_extent"),
                     strings + 4,
                     Some(3),
                     Some(0),
+                ),
+                "string-duplicate" | "string-out-of-order" => (
+                    ExpectedDecodeError::NonCanonicalRecord("string_order"),
+                    strings + 12,
+                    Some(3),
+                    Some(1),
+                ),
+                "string-unused" => (
+                    ExpectedDecodeError::NonCanonicalRecord("unused_string"),
+                    strings,
+                    Some(3),
+                    Some(1),
                 ),
                 "string-length" => (
                     ExpectedDecodeError::InvalidSectionLength,
@@ -1089,16 +1220,316 @@ fn targeted_mutations() -> Vec<MutationCase> {
                     Some(32769),
                     None,
                 ),
-                _ => (ExpectedDecodeError::MalformedProgram, 0, None, None),
+                "module-semantic-major" | "module-semantic-minor" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::UnsupportedVersion,
+                        record: RecordKind::Module,
+                        index: None,
+                        field: "semantic_version",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "module-parameter-header-origin" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::InvalidRecord,
+                        record: RecordKind::Module,
+                        index: None,
+                        field: "parameter_header_origin",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "source-byte-length" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::RangeOverflow,
+                        record: RecordKind::SourceUnit,
+                        index: Some(0),
+                        field: "byte_length",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "parameter-slot" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::InvalidRecord,
+                        record: RecordKind::Parameter,
+                        index: Some(0),
+                        field: "slot",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "parameter-declaration-origin" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Parameter,
+                        index: Some(0),
+                        field: "declaration_origin",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "parameter-name-origin" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Parameter,
+                        index: Some(0),
+                        field: "name_origin",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "type-element-index" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::NonPostorderReference,
+                        record: RecordKind::Type,
+                        index: Some(5),
+                        field: "elements",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "provenance-source" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Origin,
+                        index: Some(0),
+                        field: "source_unit",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "provenance-origin"
+                | "origin-begin-line"
+                | "origin-begin-column"
+                | "origin-end-offset"
+                | "origin-end-line"
+                | "origin-end-column" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::InvalidRecord,
+                        record: RecordKind::Origin,
+                        index: Some(0),
+                        field: "span",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "graph-edge-producer" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::NonPostorderReference,
+                        record: RecordKind::Edge,
+                        index: Some(0),
+                        field: "producer",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "graph-edge-position" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::InvalidRecord,
+                        record: RecordKind::Edge,
+                        index: Some(0),
+                        field: "argument_position",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "edge-origin" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Edge,
+                        index: Some(0),
+                        field: "origin",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "shape-check-position" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::InconsistentResultMetadata,
+                        record: RecordKind::Node,
+                        index: Some(20),
+                        field: "shape",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "branch-node-start" | "branch-node-count" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::RangeOverflow,
+                        record: RecordKind::Branch,
+                        index: Some(0),
+                        field: "nodes",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "branch-root" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::NonPostorderReference,
+                        record: RecordKind::Branch,
+                        index: Some(0),
+                        field: "nodes",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "branch-placeholder-origin" | "branch-origin" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Branch,
+                        index: Some(0),
+                        field: "origin",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "node-result-type" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Node,
+                        index: Some(10),
+                        field: "result_type",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "node-cardinality-length" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::InconsistentResultMetadata,
+                        record: RecordKind::Node,
+                        index: Some(10),
+                        field: "result",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "node-edge-start" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::RangeMismatch,
+                        record: RecordKind::Node,
+                        index: Some(10),
+                        field: "edges",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "node-edge-count" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::RangeOverflow,
+                        record: RecordKind::Node,
+                        index: Some(10),
+                        field: "edges",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "node-origin" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Node,
+                        index: Some(10),
+                        field: "origin",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "ownership-owner" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::AmbiguousOwnership,
+                        record: RecordKind::Ownership,
+                        index: Some(0),
+                        field: "owner",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "ownership-release-index" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::AmbiguousOwnership,
+                        record: RecordKind::Ownership,
+                        index: Some(0),
+                        field: "release_after",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "root-node" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Root,
+                        index: Some(0),
+                        field: "node",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                "root-origin" => (
+                    ExpectedDecodeError::MalformedProgram {
+                        invariant: Invariant::IndexOutOfBounds,
+                        record: RecordKind::Root,
+                        index: Some(0),
+                        field: "origin",
+                    },
+                    0,
+                    None,
+                    None,
+                ),
+                _ => panic!("mutation {name} has no exact expected diagnostic"),
+            };
+            let base_bytes = match name {
+                "format-minor-current-extension" => empty_with_extension(1, 0),
+                "header-magic"
+                | "format-major"
+                | "header-size"
+                | "directory-entry-size"
+                | "header-reserved"
+                | "directory-offset"
+                | "directory-id"
+                | "directory-flags"
+                | "directory-record-size"
+                | "directory-payload-offset"
+                | "directory-payload-length"
+                | "directory-known-section-duplicate"
+                | "trailing-byte" => example_bytes("empty"),
+                "producer-name"
+                | "producer-version"
+                | "producer-digest-algorithm"
+                | "producer-digest-length"
+                | "producer-digest-truncated" => producer.clone(),
+                _ => complete.clone(),
             };
             mutation(
                 target,
                 name,
                 bytes,
-                expected,
-                offset,
-                section_id,
-                record_index,
+                base_bytes,
+                (expected, offset, section_id, record_index),
             )
         })
         .collect()
@@ -1110,6 +1541,17 @@ fn deterministic_mutation_corpus_is_rejected_without_panic_or_partial_program() 
     let mut names = BTreeSet::new();
     for case in cases {
         assert!(names.insert(case.name), "duplicate mutation {}", case.name);
+        assert!(
+            !case.changed_ranges.is_empty(),
+            "{} changed no bytes",
+            case.name
+        );
+        assert_eq!(
+            case.changed_ranges,
+            changed_byte_ranges(&case.base_bytes, &case.bytes),
+            "{} changed-byte ranges",
+            case.name
+        );
         let first = decode_fwir(&case.bytes, &FwirDecodeLimits::default());
         let second = decode_fwir(&case.bytes, &FwirDecodeLimits::default());
         assert!(first.is_err(), "mutation {} was accepted", case.name);
