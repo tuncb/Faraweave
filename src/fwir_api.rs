@@ -171,12 +171,13 @@ pub fn inspect_fwir(program: &VerifiedProgram) -> Result<String, FwirInspectErro
     append_format(
         &mut output,
         format_args!(
-            "counts features={} sources={} parameters={} types={} constants={} nodes={} roots={}",
+            "counts features={} sources={} parameters={} types={} constants={} operation_references={} nodes={} roots={}",
             raw.features.len(),
             raw.source_units.len(),
             raw.parameters.len(),
             raw.types.len(),
             raw.constants.len(),
+            raw.operation_references.len(),
             raw.nodes.len(),
             raw.roots.len()
         ),
@@ -202,6 +203,12 @@ pub fn inspect_fwir(program: &VerifiedProgram) -> Result<String, FwirInspectErro
         append_format(
             &mut output,
             format_args!("constant[{index}] {constant:?}\n"),
+        )?;
+    }
+    for (index, reference) in raw.operation_references.iter().enumerate() {
+        append_format(
+            &mut output,
+            format_args!("operation_reference[{index}] {reference:?}\n"),
         )?;
     }
     output.push_str("canonical-hex ")?;

@@ -17,6 +17,7 @@ index_type!(TypeIndex);
 index_type!(ConstantIndex);
 index_type!(NodeIndex);
 index_type!(OriginIndex);
+index_type!(OperationReferenceIndex);
 index_type!(RootIndex);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -44,6 +45,7 @@ pub struct ProgramRanges {
     pub edges: IndexRange,
     pub shape_checks: IndexRange,
     pub origins: IndexRange,
+    pub operation_references: IndexRange,
     pub branches: IndexRange,
     pub ownership: IndexRange,
     pub roots: IndexRange,
@@ -64,6 +66,7 @@ pub enum Feature {
     Tuples = 2,
     PrefixSpread = 3,
     FanOut = 4,
+    OperationReferences = 6,
     ApplicationPlans = 5,
     BackendNativeMathV1 = 7,
 }
@@ -97,6 +100,14 @@ pub struct OriginSpan {
 pub struct Origin {
     pub source_unit: SourceUnitIndex,
     pub span: OriginSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationReference {
+    pub primitive_id: u16,
+    pub signature_id: u16,
+    pub implementation_id: u16,
+    pub origin: OriginIndex,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -261,6 +272,7 @@ pub struct RawProgram {
     pub edges: Vec<Edge>,
     pub shape_checks: Vec<u32>,
     pub origins: Vec<Origin>,
+    pub operation_references: Vec<OperationReference>,
     pub branches: Vec<FanOutBranch>,
     pub ownership: Vec<Ownership>,
     pub roots: Vec<Root>,
@@ -307,6 +319,7 @@ pub enum RecordKind {
     Constant,
     ConstantElement,
     Origin,
+    OperationReference,
     Node,
     Edge,
     ShapeCheck,
@@ -407,6 +420,7 @@ pub enum Arena {
     Edge,
     ShapeCheck,
     Origin,
+    OperationReference,
     Branch,
     Ownership,
     Root,
@@ -503,6 +517,7 @@ impl RawProgramBuilder {
                 edges: Vec::new(),
                 shape_checks: Vec::new(),
                 origins: Vec::new(),
+                operation_references: Vec::new(),
                 branches: Vec::new(),
                 ownership: Vec::new(),
                 roots: Vec::new(),
@@ -588,6 +603,20 @@ impl RawProgramBuilder {
     push_method!(push_edge, edges, Edge, Edge);
     push_method!(push_shape_check, shape_checks, u32, ShapeCheck);
     push_method!(push_origin, origins, Origin, Origin, OriginIndex);
+    pub fn push_operation_reference(
+        &mut self,
+        value: OperationReference,
+    ) -> Result<OperationReferenceIndex, BuildError> {
+        let index = reserve_one(
+            &mut self.raw.operation_references,
+            Arena::OperationReference,
+            &mut self.reservation_attempts,
+            self.fail_at_reservation,
+        )?;
+        self.raw.operation_references.push(value);
+        self.raw.module.semantic_minor = self.raw.module.semantic_minor.max(1);
+        Ok(OperationReferenceIndex(index))
+    }
     push_method!(push_branch, branches, FanOutBranch, Branch);
     push_method!(push_ownership, ownership, Ownership, Ownership);
     push_method!(push_root, roots, Root, Root, RootIndex);
@@ -608,6 +637,10 @@ impl RawProgramBuilder {
             edges: whole_range(self.raw.edges.len(), Arena::Edge)?,
             shape_checks: whole_range(self.raw.shape_checks.len(), Arena::ShapeCheck)?,
             origins: whole_range(self.raw.origins.len(), Arena::Origin)?,
+            operation_references: whole_range(
+                self.raw.operation_references.len(),
+                Arena::OperationReference,
+            )?,
             branches: whole_range(self.raw.branches.len(), Arena::Branch)?,
             ownership: whole_range(self.raw.ownership.len(), Arena::Ownership)?,
             roots: whole_range(self.raw.roots.len(), Arena::Root)?,
@@ -655,6 +688,7 @@ fn verify_program(
             Feature::PrefixSpread.numeric(),
             Feature::FanOut.numeric(),
             Feature::ApplicationPlans.numeric(),
+            Feature::OperationReferences.numeric(),
             Feature::BackendNativeMathV1.numeric(),
         ]
         .contains(&feature)
@@ -690,6 +724,17 @@ fn verify_program(
         ));
     }
     if program.module.semantic_minor == 0
+        && (has_feature(program, Feature::OperationReferences)
+            || !program.operation_references.is_empty())
+    {
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "operation_references_version",
+        ));
+    }
+    if program.module.semantic_minor == 0
         && program
             .features
             .binary_search(&Feature::BackendNativeMathV1.numeric())
@@ -707,6 +752,7 @@ fn verify_program(
     verify_types(program)?;
     verify_constants(program)?;
     verify_sources_and_origins(program)?;
+    verify_operation_references(program)?;
     verify_node_and_edge_references(program)?;
     verify_reachability(program, injection)?;
     verify_node_metadata(program, injection)?;
@@ -834,6 +880,12 @@ fn verify_module_ranges(program: &RawProgram) -> Result<(), VerifyError> {
         "ranges.origins",
     )?;
     exact_range(
+        ranges.operation_references,
+        program.operation_references.len(),
+        RecordKind::Module,
+        "ranges.operation_references",
+    )?;
+    exact_range(
         ranges.branches,
         program.branches.len(),
         RecordKind::Module,
@@ -932,6 +984,50 @@ fn verify_sources_and_origins(program: &RawProgram) -> Result<(), VerifyError> {
                 RecordKind::Origin,
                 record_index,
                 "span",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_operation_references(program: &RawProgram) -> Result<(), VerifyError> {
+    use crate::semantic_registry::{StructuralBehavior, implementation_from_numeric};
+
+    for (index, reference) in program.operation_references.iter().enumerate() {
+        let index = checked_index(index);
+        if !in_bounds(reference.origin.0, program.origins.len()) {
+            return Err(malformed(
+                Invariant::IndexOutOfBounds,
+                RecordKind::OperationReference,
+                index,
+                "origin",
+            ));
+        }
+        let descriptor =
+            implementation_from_numeric(reference.implementation_id).map_err(|_| {
+                malformed(
+                    Invariant::InvalidSemanticIdentity,
+                    RecordKind::OperationReference,
+                    index,
+                    "implementation_id",
+                )
+            })?;
+        if descriptor.primitive_id.numeric() != reference.primitive_id
+            || descriptor.signature_id.numeric() != reference.signature_id
+        {
+            return Err(malformed(
+                Invariant::InvalidSemanticIdentity,
+                RecordKind::OperationReference,
+                index,
+                "semantic_identity",
+            ));
+        }
+        if descriptor.behavior != StructuralBehavior::Elementwise {
+            return Err(malformed(
+                Invariant::InvalidSemanticIdentity,
+                RecordKind::OperationReference,
+                index,
+                "structural_behavior",
             ));
         }
     }
@@ -2833,6 +2929,7 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             .edges
             .iter()
             .any(|edge| matches!(edge.access, ValueAccess::FanOutOperandBorrow));
+    let needs_operation_references = !program.operation_references.is_empty();
     let needs_application_plans = program.nodes.iter().any(|node| {
         let NodeKind::SelectedApply {
             implementation_id, ..
@@ -2876,6 +2973,11 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             Feature::ApplicationPlans,
             needs_application_plans,
             "application_plans",
+        ),
+        (
+            Feature::OperationReferences,
+            needs_operation_references,
+            "operation_references",
         ),
         (
             Feature::BackendNativeMathV1,
@@ -2946,6 +3048,23 @@ mod tests {
         }));
         must(builder.push_root(Root { node, origin }));
         must(builder.finish())
+    }
+
+    fn operation_reference_program() -> RawProgram {
+        let mut program = scalar_program();
+        program.module.semantic_minor = 1;
+        program
+            .features
+            .push(Feature::OperationReferences.numeric());
+        program.module.ranges.features.count = 1;
+        program.operation_references.push(OperationReference {
+            primitive_id: 5,
+            signature_id: 9,
+            implementation_id: 9,
+            origin: OriginIndex(0),
+        });
+        program.module.ranges.operation_references.count = 1;
+        program
     }
 
     fn parameter_program() -> RawProgram {
@@ -4072,6 +4191,77 @@ mod tests {
         let mut mismatch = scalar_program();
         mismatch.module.ranges.nodes.count = 2;
         verify_error(mismatch, Invariant::RangeMismatch);
+    }
+
+    #[test]
+    fn operation_reference_identity_version_feature_and_depth_are_verified() {
+        assert!(operation_reference_program().verify().is_ok());
+
+        let mut version = operation_reference_program();
+        version.module.semantic_minor = 0;
+        verify_error(version, Invariant::UnsupportedVersion);
+
+        let mut feature = operation_reference_program();
+        feature.features.clear();
+        feature.module.ranges.features.count = 0;
+        verify_error(feature, Invariant::MissingFeature);
+
+        let mut primitive = operation_reference_program();
+        primitive.operation_references[0].primitive_id = 6;
+        verify_error(primitive, Invariant::InvalidSemanticIdentity);
+
+        let mut signature = operation_reference_program();
+        signature.operation_references[0].signature_id = 10;
+        verify_error(signature, Invariant::InvalidSemanticIdentity);
+
+        let mut implementation = operation_reference_program();
+        implementation.operation_references[0].implementation_id = 35;
+        verify_error(implementation, Invariant::InvalidSemanticIdentity);
+
+        let mut structural = operation_reference_program();
+        structural.operation_references[0] = OperationReference {
+            primitive_id: 19,
+            signature_id: 34,
+            implementation_id: 34,
+            origin: OriginIndex(0),
+        };
+        verify_error(structural, Invariant::InvalidSemanticIdentity);
+
+        let mut origin = operation_reference_program();
+        origin.operation_references[0].origin = OriginIndex(1);
+        verify_error(origin, Invariant::IndexOutOfBounds);
+
+        let mut deep = operation_reference_program();
+        deep.operation_references
+            .try_reserve_exact(4_095)
+            .expect("test reference reserve");
+        deep.operation_references.resize(
+            4_096,
+            OperationReference {
+                primitive_id: 5,
+                signature_id: 9,
+                implementation_id: 9,
+                origin: OriginIndex(0),
+            },
+        );
+        deep.module.ranges.operation_references.count = 4_096;
+        assert!(deep.verify().is_ok());
+    }
+
+    #[test]
+    fn operation_reference_builder_allocation_refusal_is_explicit() {
+        let mut builder = RawProgramBuilder::with_reservation_failure_at(0);
+        assert!(matches!(
+            builder.push_operation_reference(OperationReference {
+                primitive_id: 5,
+                signature_id: 9,
+                implementation_id: 9,
+                origin: OriginIndex(0),
+            }),
+            Err(BuildError::AllocationUnavailable {
+                arena: Arena::OperationReference,
+            })
+        ));
     }
 
     #[test]

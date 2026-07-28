@@ -1,7 +1,8 @@
 use faraweave::{
     AllocationFailureInjection, EvaluationConfiguration, Feature, FwirDecodeErrorKind,
-    FwirDecodeLimits, FwirEncodeOptions, FwirProducerMetadata, Invariant, RecordKind,
-    ResourceErrorReason, ResourceEventKind, Value, VerifyError, compile_source_to_verified_program,
+    FwirDecodeLimits, FwirEncodeOptions, FwirProducerMetadata, Invariant, OperationReference,
+    Origin, OriginPosition, OriginSpan, RawProgramBuilder, RecordKind, ResourceErrorReason,
+    ResourceEventKind, SourceUnit, Value, VerifyError, compile_source_to_verified_program,
     decode_fwir, emit_c_from_verified_program, encode_fwir,
     evaluate_source_with_arguments_and_observer, evaluate_verified_program_with_arguments,
     evaluate_verified_program_with_observer, inspect_fwir,
@@ -349,6 +350,51 @@ fn producer_artifact() -> Vec<u8> {
     .expect("canonical producer artifact")
 }
 
+fn operation_reference_artifact() -> Vec<u8> {
+    let mut builder = RawProgramBuilder::new();
+    builder
+        .push_feature(Feature::OperationReferences.numeric())
+        .expect("operation-reference feature");
+    let source = builder
+        .push_source_unit(SourceUnit {
+            diagnostic_name: "reference.fw".to_owned(),
+            byte_length: 4,
+        })
+        .expect("operation-reference source");
+    let origin = builder
+        .push_origin(Origin {
+            source_unit: source,
+            span: OriginSpan {
+                begin: OriginPosition {
+                    offset: 1,
+                    line: 1,
+                    column: 1,
+                },
+                end: OriginPosition {
+                    offset: 5,
+                    line: 1,
+                    column: 5,
+                },
+            },
+        })
+        .expect("operation-reference origin");
+    builder
+        .push_operation_reference(OperationReference {
+            primitive_id: 5,
+            signature_id: 9,
+            implementation_id: 9,
+            origin,
+        })
+        .expect("operation-reference record");
+    let program = builder
+        .finish()
+        .expect("operation-reference program")
+        .verify()
+        .expect("valid operation-reference program");
+    encode_fwir(&program, &FwirEncodeOptions::default())
+        .expect("canonical operation-reference artifact")
+}
+
 fn producer_mutations() -> Vec<(&'static str, Vec<u8>)> {
     let producer = producer_artifact();
     let (entry, offset, length) = section(&producer, 32769);
@@ -414,6 +460,49 @@ fn canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral() {
         );
     }
     assert_eq!(names, BTreeSet::from(["complete", "empty", "scalar-true"]));
+}
+
+#[test]
+fn operation_reference_artifact_is_versioned_canonical_and_roundtrippable() {
+    let bytes = operation_reference_artifact();
+    assert_eq!(read_u16(&bytes, 8), 1);
+    assert_eq!(read_u16(&bytes, 10), 1);
+    let (_, module, module_length) = section(&bytes, 1);
+    assert_eq!(module_length, 8);
+    assert_eq!(read_u16(&bytes, module), 1);
+    assert_eq!(read_u16(&bytes, module + 2), 1);
+    let (_, features, feature_length) = section(&bytes, 2);
+    assert_eq!(feature_length, 4);
+    assert_eq!(&bytes[features..features + feature_length], &[6, 0, 0, 0]);
+
+    let (entry, references, reference_length) = section(&bytes, 18);
+    assert_eq!(read_u16(&bytes, entry), 18);
+    assert_eq!(read_u16(&bytes, entry + 2), 3);
+    assert_eq!(read_u32(&bytes, entry + 4), 16);
+    assert_eq!(reference_length, 16);
+    assert_eq!(
+        &bytes[references..references + reference_length],
+        &[5, 0, 9, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+
+    let decoded = decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("canonical OPRF decode");
+    assert_eq!(
+        decoded.as_raw().features,
+        [Feature::OperationReferences.numeric()]
+    );
+    assert_eq!(
+        decoded.as_raw().operation_references,
+        [OperationReference {
+            primitive_id: 5,
+            signature_id: 9,
+            implementation_id: 9,
+            origin: faraweave::OriginIndex(0),
+        }]
+    );
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("canonical OPRF reencode"),
+        bytes
+    );
 }
 
 fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
@@ -873,8 +962,195 @@ fn mutation_target(name: &str) -> &'static str {
         "producer-digest-algorithm" => "prod.digest_algorithm",
         "producer-digest-length" => "prod.digest_length",
         "producer-digest-truncated" => "prod.digest",
+        "operation-reference-feature-missing" => "oprf.feature_required",
+        "operation-reference-format-minor" => "oprf.format_minor",
+        "operation-reference-semantic-minor" => "oprf.semantic_minor",
+        "operation-reference-record-size" => "oprf.record_size",
+        "operation-reference-record-count" => "oprf.record_count",
+        "operation-reference-reserved16" => "oprf.reserved16",
+        "operation-reference-reserved32" => "oprf.reserved32",
+        "operation-reference-primitive-mismatch" => "oprf.primitive_id",
+        "operation-reference-signature-mismatch" => "oprf.signature_id",
+        "operation-reference-implementation-mismatch" => "oprf.implementation_id",
+        "operation-reference-structural" => "oprf.structural_behavior",
+        "operation-reference-origin" => "oprf.origin",
         _ => panic!("mutation {name} has no explicit target requirement"),
     }
+}
+
+fn operation_reference_mutations() -> Vec<MutationCase> {
+    let canonical = operation_reference_artifact();
+    let (_, features, _) = section(&canonical, 2);
+    let (_, module, _) = section(&canonical, 1);
+    let (reference_entry, references, _) = section(&canonical, 18);
+    let directory_index = u32::try_from((reference_entry - 32) / 24).ok();
+    let mutate_u16 = |offset: usize, value: u16| {
+        let mut bytes = canonical.clone();
+        put_u16(&mut bytes, offset, value);
+        bytes
+    };
+    let mutate_u32 = |offset: usize, value: u32| {
+        let mut bytes = canonical.clone();
+        put_u32(&mut bytes, offset, value);
+        bytes
+    };
+    let mutate_u64 = |offset: usize, value: u64| {
+        let mut bytes = canonical.clone();
+        put_u64(&mut bytes, offset, value);
+        bytes
+    };
+    let semantic_error = |invariant, field| ExpectedDecodeError::MalformedProgram {
+        invariant,
+        record: RecordKind::Module,
+        index: None,
+        field,
+    };
+    let mut structural = canonical.clone();
+    put_u16(&mut structural, references, 19);
+    put_u16(&mut structural, references + 2, 34);
+    put_u16(&mut structural, references + 4, 34);
+
+    [
+        (
+            "operation-reference-feature-missing",
+            mutate_u16(features, Feature::BackendNativeMathV1.numeric()),
+            (
+                semantic_error(Invariant::MissingFeature, "operation_references"),
+                0,
+                None,
+                None,
+            ),
+        ),
+        (
+            "operation-reference-format-minor",
+            mutate_u16(10, 0),
+            (
+                ExpectedDecodeError::NonCanonicalRecord("feature_format_minor"),
+                features,
+                Some(2),
+                Some(0),
+            ),
+        ),
+        (
+            "operation-reference-semantic-minor",
+            mutate_u16(module + 2, 0),
+            (
+                semantic_error(
+                    Invariant::UnsupportedVersion,
+                    "operation_references_version",
+                ),
+                0,
+                None,
+                None,
+            ),
+        ),
+        (
+            "operation-reference-record-size",
+            mutate_u32(reference_entry + 4, 15),
+            (
+                ExpectedDecodeError::NonCanonicalDirectory("record_size"),
+                reference_entry + 4,
+                Some(18),
+                directory_index,
+            ),
+        ),
+        (
+            "operation-reference-record-count",
+            mutate_u64(reference_entry + 16, 8),
+            (
+                ExpectedDecodeError::InvalidSectionLength,
+                reference_entry + 16,
+                Some(18),
+                directory_index,
+            ),
+        ),
+        (
+            "operation-reference-reserved16",
+            mutate_u16(references + 6, 1),
+            (
+                ExpectedDecodeError::NonCanonicalRecord("reserved"),
+                references + 6,
+                Some(18),
+                Some(0),
+            ),
+        ),
+        (
+            "operation-reference-reserved32",
+            mutate_u32(references + 12, 1),
+            (
+                ExpectedDecodeError::NonCanonicalRecord("reserved"),
+                references + 12,
+                Some(18),
+                Some(0),
+            ),
+        ),
+        (
+            "operation-reference-primitive-mismatch",
+            mutate_u16(references, 6),
+            (
+                ExpectedDecodeError::NonCanonicalRecord("semantic_id"),
+                references,
+                Some(18),
+                Some(0),
+            ),
+        ),
+        (
+            "operation-reference-signature-mismatch",
+            mutate_u16(references + 2, 10),
+            (
+                ExpectedDecodeError::NonCanonicalRecord("semantic_id"),
+                references,
+                Some(18),
+                Some(0),
+            ),
+        ),
+        (
+            "operation-reference-implementation-mismatch",
+            mutate_u16(references + 4, 35),
+            (
+                ExpectedDecodeError::NonCanonicalRecord("semantic_id"),
+                references,
+                Some(18),
+                Some(0),
+            ),
+        ),
+        (
+            "operation-reference-structural",
+            structural,
+            (
+                ExpectedDecodeError::NonCanonicalRecord("semantic_id"),
+                references,
+                Some(18),
+                Some(0),
+            ),
+        ),
+        (
+            "operation-reference-origin",
+            mutate_u32(references + 8, u32::MAX),
+            (
+                ExpectedDecodeError::MalformedProgram {
+                    invariant: Invariant::IndexOutOfBounds,
+                    record: RecordKind::OperationReference,
+                    index: Some(0),
+                    field: "origin",
+                },
+                0,
+                None,
+                None,
+            ),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, bytes, expected)| {
+        mutation(
+            mutation_target(name),
+            name,
+            bytes,
+            canonical.clone(),
+            expected,
+        )
+    })
+    .collect()
 }
 
 fn targeted_mutations() -> Vec<MutationCase> {
@@ -917,7 +1193,8 @@ fn targeted_mutations() -> Vec<MutationCase> {
 
     let mut raw = named_mutations();
     raw.extend(producer_mutations());
-    raw.into_iter()
+    let mut cases: Vec<_> = raw
+        .into_iter()
         .map(|(name, bytes)| {
             let target = mutation_target(name);
             let (expected, offset, section_id, record_index) = match name {
@@ -1535,7 +1812,9 @@ fn targeted_mutations() -> Vec<MutationCase> {
                 (expected, offset, section_id, record_index),
             )
         })
-        .collect()
+        .collect();
+    cases.extend(operation_reference_mutations());
+    cases
 }
 
 #[test]
@@ -1921,6 +2200,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "compat-forward-minor",
         "compat-advisory-feature",
         "canonical-application-plans",
+        "canonical-operation-references",
     ]);
     let behavioral_evidence = BTreeSet::from([
         ("header.section_count", "section-count-limit"),
@@ -1963,6 +2243,18 @@ fn traceability_references_complete_executable_evidence_sets() {
         ("appl.implementation_match", "application-plan-id-mismatch"),
         ("appl.format_minor", "application-plan-format-minor"),
         ("appl.semantic_minor", "application-plan-semantic-minor"),
+        (
+            "oprf.section_presence",
+            "operation-reference-section-presence",
+        ),
+        (
+            "oprf.canonical_record",
+            "operation-reference-canonical-record",
+        ),
+        (
+            "oprf.canonical_roundtrip",
+            "operation-reference-canonical-roundtrip",
+        ),
         ("surfaces.source_memory_decoded", "differential-runtime"),
         ("surfaces.c_native", "strict-native-journey"),
         (
@@ -2011,6 +2303,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "bran.",
         "node.",
         "appl.",
+        "oprf.",
         "ownr.",
         "root.",
         "prod.",
