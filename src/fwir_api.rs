@@ -1,8 +1,7 @@
 use crate::{
     CEmissionResult, Error, ErrorKind, EvaluationConfiguration, FwirEncodeError, FwirEncodeOptions,
     NativeBuildRequest, NativeBuildResult, ProgramResult, RunnerEvaluationResult, SourceLocation,
-    VerifiedProgram, build_native, emit_verified_c_program, encode_fwir, evaluate_verified_program,
-    format_value,
+    VerifiedProgram, build_native, encode_fwir, evaluate_verified_program, format_value,
 };
 use std::fmt::Write as _;
 use std::path::Path;
@@ -107,7 +106,7 @@ pub fn emit_c_from_verified_program(
     program: &VerifiedProgram,
     configuration: EvaluationConfiguration,
 ) -> Result<CEmissionResult, Error> {
-    emit_verified_c_program(program, configuration)
+    crate::c_emitter::emit_verified_c_program(program, configuration)
 }
 
 /// Emits C and builds a native executable from the same verified program.

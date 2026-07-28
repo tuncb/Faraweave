@@ -122,16 +122,19 @@ fn run_ir_command(arguments: &[OsString]) -> Result<(), ()> {
     }
     let artifact_path = Path::new(&arguments[2]);
     let program = read_verified_artifact(artifact_path)?;
-    let argument_strings: Vec<&str> = arguments
-        .get(4..)
-        .unwrap_or_default()
-        .iter()
-        .map(|argument| {
-            argument.to_str().ok_or_else(|| {
-                eprintln!("error: unable to decode Unicode command line");
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    let raw_arguments = arguments.get(4..).unwrap_or_default();
+    let mut argument_strings = Vec::new();
+    argument_strings
+        .try_reserve_exact(raw_arguments.len())
+        .map_err(|_| {
+            eprintln!("error: unable to allocate command-line arguments");
+        })?;
+    for argument in raw_arguments {
+        let decoded = argument.to_str().ok_or_else(|| {
+            eprintln!("error: unable to decode Unicode command line");
+        })?;
+        argument_strings.push(decoded);
+    }
     match evaluate_verified_program_with_arguments(
         &program,
         &argument_strings,
