@@ -3,7 +3,8 @@ use crate::{
     LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, Origin, OriginIndex, OriginPosition,
     OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex, ProgramRanges, RawProgram,
     ReleaseAfter, Root, RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit,
-    SourceUnitIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram, VerifyError,
+    SourceUnitIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
+    VerifyAllocationFailureInjection, VerifyAllocationSite, VerifyError,
 };
 use std::collections::TryReserveError;
 
@@ -63,6 +64,7 @@ pub enum FwirDecodeAllocationSite {
     Ownership,
     Roots,
     StringUse,
+    Verifier(VerifyAllocationSite),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1974,14 +1976,26 @@ pub fn decode_fwir_with_allocation_failure(
     validate_record_canonicality(bytes, &plan)?;
     validate_string_use(bytes, &plan, injection)?;
     let raw = reconstruct_program(bytes, &plan, injection)?;
-    raw.verify().map_err(|verify_error| {
-        error(
-            FwirDecodeErrorKind::MalformedProgram(verify_error),
-            0,
-            None,
-            None,
-        )
-    })
+    let verify_injection = match injection.fail_at {
+        Some(FwirDecodeAllocationSite::Verifier(site)) => {
+            VerifyAllocationFailureInjection::at(site)
+        }
+        _ => VerifyAllocationFailureInjection::none(),
+    };
+    raw.verify_with_allocation_failure(verify_injection)
+        .map_err(|verify_error| {
+            let kind = match verify_error {
+                VerifyError::AllocationUnavailable { site } => {
+                    FwirDecodeErrorKind::AllocationUnavailable {
+                        site: FwirDecodeAllocationSite::Verifier(site),
+                    }
+                }
+                error @ VerifyError::MalformedProgram(_) => {
+                    FwirDecodeErrorKind::MalformedProgram(error)
+                }
+            };
+            error(kind, 0, None, None)
+        })
 }
 
 fn reserve_exact<T>(
@@ -2408,6 +2422,13 @@ mod tests {
             FwirDecodeAllocationSite::Ownership,
             FwirDecodeAllocationSite::Roots,
             FwirDecodeAllocationSite::StringUse,
+            FwirDecodeAllocationSite::Verifier(VerifyAllocationSite::DynamicShapeScratch),
+            FwirDecodeAllocationSite::Verifier(VerifyAllocationSite::ReachabilityBits),
+            FwirDecodeAllocationSite::Verifier(VerifyAllocationSite::ReachabilityWorklist),
+            FwirDecodeAllocationSite::Verifier(VerifyAllocationSite::FanOutBorrowContext),
+            FwirDecodeAllocationSite::Verifier(VerifyAllocationSite::OwnershipSinks),
+            FwirDecodeAllocationSite::Verifier(VerifyAllocationSite::OwnershipLastUse),
+            FwirDecodeAllocationSite::Verifier(VerifyAllocationSite::OwnershipRootOwner),
         ] {
             assert!(
                 matches!(
