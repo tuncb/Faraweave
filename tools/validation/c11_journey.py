@@ -180,6 +180,11 @@ def normalize_newlines(value: bytes) -> bytes:
     return value.replace(b"\r\n", b"\n")
 
 
+def canonical_artifact(name: str) -> bytes:
+    path = ROOT / "spec/examples" / f"fwir-v1-{name}.hex"
+    return bytes.fromhex(path.read_text(encoding="ascii"))
+
+
 def main() -> None:
     executable = Path(
         os.environ.get(
@@ -328,6 +333,108 @@ def main() -> None:
                     == generated_failure.stderr
                     == expected_failure,
                     "output-device failure diagnostic",
+                )
+
+        canonical_fixtures = [
+            ("empty", [], b""),
+            ("scalar-true", [], b"true\n"),
+            (
+                "complete",
+                ["3"],
+                b"[true 1 2.0 (1 2) 3]\n"
+                b"(3 4)\n"
+                b"3.0\n"
+                b"(2 3)\n"
+                b"(1 2 3)\n"
+                b"[(2 3 4) (11 12 13)]\n",
+            ),
+        ]
+        for name, arguments, expected in canonical_fixtures:
+            canonical = canonical_artifact(name)
+            artifact = work / f"canonical-{name}.fwir"
+            emitted = work / f"canonical-{name}.c"
+            generated = work / f"canonical-{name}-generated{suffix}"
+            built = work / f"canonical-{name}-built{suffix}"
+            artifact.write_bytes(canonical)
+
+            first_inspection = run(
+                [str(executable), "inspect-ir", str(artifact)],
+                environment=environment,
+            )
+            second_inspection = run(
+                [str(executable), "inspect-ir", str(artifact)],
+                environment=environment,
+            )
+            require(
+                first_inspection.stdout == second_inspection.stdout
+                and not first_inspection.stderr
+                and first_inspection.stdout.endswith(
+                    b"canonical-hex " + canonical.hex().encode("ascii") + b"\n"
+                ),
+                f"canonical inspection mismatch for {name}",
+            )
+            interpreted = run(
+                [str(executable), "run-ir", str(artifact), "--", *arguments],
+                environment=environment,
+            )
+            require(
+                normalize_newlines(interpreted.stdout) == expected
+                and not interpreted.stderr,
+                f"canonical interpreter mismatch for {name}",
+            )
+            run(
+                [
+                    str(executable),
+                    "emit-c-ir",
+                    str(artifact),
+                    "-o",
+                    str(emitted),
+                ],
+                environment=environment,
+            )
+            compile_c(compiler, environment, emitted, generated)
+            generated_result = run(
+                [str(generated), *arguments],
+                environment=environment,
+            )
+            require(
+                normalize_newlines(generated_result.stdout) == expected
+                and not generated_result.stderr,
+                f"canonical generated-C mismatch for {name}",
+            )
+            run(
+                [
+                    str(executable),
+                    "build-ir",
+                    str(artifact),
+                    "-o",
+                    str(built),
+                    "--cc",
+                    compiler,
+                ],
+                environment=environment,
+            )
+            built_result = run(
+                [str(built), *arguments],
+                environment=environment,
+            )
+            require(
+                normalize_newlines(built_result.stdout) == expected
+                and not built_result.stderr,
+                f"canonical native mismatch for {name}",
+            )
+            require(
+                artifact.read_bytes() == canonical,
+                f"canonical artifact changed while consumed: {name}",
+            )
+            if name == "scalar-true" and platform.system() == "Linux":
+                sanitized = work / "canonical-scalar-true-sanitized"
+                compile_c_sanitized(compiler, environment, emitted, sanitized)
+                sanitized_result = run([str(sanitized)], environment=environment)
+                require(
+                    sanitized_result.stdout == expected
+                    and not sanitized_result.stderr,
+                    "canonical ASan/UBSan generated-C journey",
                 )
 
         argument_fixture = ROOT / "tests/fixtures/parameterized-artifact-success.bennu"
