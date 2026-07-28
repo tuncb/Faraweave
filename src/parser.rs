@@ -1698,10 +1698,20 @@ mod tests {
             }
         ));
 
-        for source in ["@ add", "@1", "@", "@@add"] {
+        for source in ["@ add", "@1", "@", "@@add", "@# split\nadd"] {
             let error = parse(source).expect_err(source);
             assert_eq!(error.kind, ErrorKind::SyntaxError, "{source}");
+            assert_eq!(
+                error.message, "expected an adjacent built-in operation name after '@'",
+                "{source}"
+            );
         }
+        let trailing_comment =
+            parse("@add# trailing\n").expect("adjacent reference before comment");
+        assert!(matches!(
+            trailing_comment.roots[0].kind,
+            ExprKind::OperationReference { ref name, .. } if name == "add"
+        ));
         let bare = parse("add").expect("bare name retains old parse");
         assert!(matches!(
             bare.roots[0].kind,
