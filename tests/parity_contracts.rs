@@ -223,6 +223,55 @@ fn deep_unary_programs_use_iterative_parse_analysis_and_evaluation() {
 }
 
 #[test]
+fn line_comments_preserve_evaluation_and_compact_deep_paths() {
+    let program = evaluate_source("# prologue\r\n1# first\r\ninc[# argument\n1]# eof")
+        .expect("commented program");
+    assert_eq!(program.values, vec![Value::Int(1), Value::Int(2)]);
+    assert!(
+        evaluate_source("# comment-only 🦀")
+            .expect("comment-only program")
+            .values
+            .is_empty()
+    );
+
+    const DEPTH: usize = 256;
+    let mut unary = String::new();
+    for _ in 0..DEPTH {
+        unary.push_str("inc[# layer 🦀\r\n");
+    }
+    unary.push('1');
+    for _ in 0..DEPTH {
+        unary.push(']');
+    }
+    assert_eq!(
+        evaluate_expression(&unary)
+            .expect("commented deep unary")
+            .value,
+        Value::Int(DEPTH as i64 + 1)
+    );
+
+    let mut tuple = String::new();
+    for _ in 0..DEPTH {
+        tuple.push_str("[# layer\n");
+    }
+    tuple.push('1');
+    for _ in 0..DEPTH {
+        tuple.push(']');
+    }
+    let allocation_error = evaluate_expression_with_configuration(
+        &tuple,
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("commented deep tuple allocation refusal");
+    assert_eq!(allocation_error.kind, ErrorKind::ResourceError);
+}
+
+#[test]
 fn deep_structural_values_and_types_format_and_drop_iteratively() {
     const DEPTH: usize = 4_096;
     let source = format!("{}7{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
