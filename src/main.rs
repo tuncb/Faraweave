@@ -379,7 +379,8 @@ fn repl() -> Result<(), ()> {
                 line.pop();
             }
         }
-        if line.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+        let content = line.trim_start_matches([' ', '\t']);
+        if content.is_empty() || content.starts_with('#') {
             continue;
         }
         if line == ".internal" {
