@@ -116,7 +116,8 @@ mandatory semantic feature and class `1` is optional advisory metadata.
 Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`, and
-`4=FanOut`; zero is invalid. IDs 1 through 4 are semantic capabilities and
+`4=FanOut`, plus `7=BackendNativeMathV1`; zero is invalid. IDs 1 through 4 and
+7 are semantic capabilities and
 MUST have class `0`: pairing a known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
 
@@ -327,7 +328,7 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known IDs 1 through 4), tag, boolean, optional sentinel, unused
+   class `1` on known IDs 1 through 4 and 7), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after
@@ -438,7 +439,7 @@ issue rather than treating this comparison as authorization.
 
 ## 12. Accepted product, producer, and security policy
 
-Physical format 1.0, semantic contract 1.0, canonical program-identity bytes,
+Physical format 1.0, semantic contract 1.1, canonical program-identity bytes,
 the `.fwir` extension, and the library and CLI spellings above are the stable
 FWIR v1 product contract. A compatible addition uses the same-major
 forward-minor and explicitly optional advisory mechanisms in section 7;

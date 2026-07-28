@@ -1,8 +1,8 @@
 use crate::{
-    Cardinality, ConstantIndex, ConstantRecord, Conversion, Edge, FanOutBranch, IndexRange,
-    LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, Origin, OriginIndex, OriginPosition,
-    OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex, ProgramRanges, RawProgram,
-    ReleaseAfter, Root, RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit,
+    Cardinality, ConstantIndex, ConstantRecord, Conversion, Edge, FanOutBranch, Feature,
+    IndexRange, LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, Origin, OriginIndex,
+    OriginPosition, OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex, ProgramRanges,
+    RawProgram, ReleaseAfter, Root, RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit,
     SourceUnitIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
     VerifyAllocationFailureInjection, VerifyAllocationSite, VerifyError,
 };
@@ -1200,7 +1200,7 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
         if reserved != 0 {
             return Err(record_error(features, index, 3, "reserved"));
         }
-        if id <= 4 {
+        if matches!(id, 1..=4) || id == Feature::BackendNativeMathV1.numeric() {
             if class != 0 {
                 return Err(record_error(features, index, 2, "feature_class"));
             }
@@ -1643,7 +1643,7 @@ fn reconstruct_program(
     if let Some(records) = section(plan, 2) {
         for index in 0..records.record_count() {
             let id = record_u16(bytes, records, index, 0)?;
-            if id <= 4 {
+            if matches!(id, 1..=4) || id == Feature::BackendNativeMathV1.numeric() {
                 features.push(id);
             }
         }
@@ -2142,6 +2142,9 @@ mod tests {
         bytes.extend_from_slice(&id.to_le_bytes());
         bytes.push(class);
         bytes.push(0);
+        if id == Feature::BackendNativeMathV1.numeric() {
+            put_u16_at(&mut bytes, 82, 1);
+        }
         bytes
     }
 
@@ -2251,6 +2254,30 @@ mod tests {
             encode_fwir(&decoded, &FwirEncodeOptions::default()),
             Ok(example_bytes("empty"))
         );
+        let math = empty_with_feature(Feature::BackendNativeMathV1.numeric(), 0);
+        let decoded = match decode_fwir(&math, &FwirDecodeLimits::default()) {
+            Ok(value) => value,
+            Err(error) => panic!("backend-native math feature failed: {error:?}"),
+        };
+        assert_eq!(
+            encode_fwir(&decoded, &FwirEncodeOptions::default()),
+            Ok(math.clone())
+        );
+        let mut wrong_semantic_version = math;
+        put_u16_at(&mut wrong_semantic_version, 82, 0);
+        assert!(matches!(
+            decode_fwir(&wrong_semantic_version, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(crate::VerifyError::MalformedProgram(
+                    crate::MalformedProgram {
+                        invariant: crate::Invariant::UnsupportedVersion,
+                        field: "semantic_version",
+                        ..
+                    }
+                )),
+                ..
+            })
+        ));
         assert!(matches!(
             decode_fwir(&empty_with_feature(1, 1), &FwirDecodeLimits::default()),
             Err(FwirDecodeError {

@@ -100,6 +100,14 @@ const PRIMITIVE_COUNT: u16 = 19;
 const SIGNATURE_COUNT: u16 = 34;
 const IMPLEMENTATION_COUNT: u16 = 34;
 
+pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
+pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
+
+pub(crate) const fn is_backend_native_math_primitive(primitive_id: u16) -> bool {
+    primitive_id >= BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID
+        && primitive_id <= BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID
+}
+
 const INT1: &[ScalarType] = &[ScalarType::Int];
 const DOUBLE1: &[ScalarType] = &[ScalarType::Double];
 const BOOL1: &[ScalarType] = &[ScalarType::Bool];
@@ -534,6 +542,17 @@ mod tests {
             implementation_from_numeric(35),
             Err(RegistryLookupError::ImplementationId)
         );
+    }
+
+    #[test]
+    fn backend_native_math_primitive_reservation_is_narrow() {
+        assert!(!is_backend_native_math_primitive(28));
+        for primitive_id in
+            BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID..=BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID
+        {
+            assert!(is_backend_native_math_primitive(primitive_id));
+        }
+        assert!(!is_backend_native_math_primitive(39));
     }
 
     #[test]
