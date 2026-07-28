@@ -337,10 +337,7 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
     let mut closed = 0usize;
     let mut closing_end = leaf_token.span.end;
     while closed < depth {
-        while matches!(
-            tokens.get(index).map(|token| token.kind),
-            Some(TokenKind::Space | TokenKind::Newline)
-        ) {
+        while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
             index += 1;
         }
         match tokens.get(index) {
@@ -995,6 +992,7 @@ impl Parser {
             ));
         }
         self.index += 1;
+        self.skip_comment_trivia();
         let close = self
             .take()
             .ok_or_else(|| self.eof_error("missing closing delimiter"))?;
@@ -1341,6 +1339,18 @@ impl Parser {
 
     fn skip_inside(&mut self) {
         self.skip_newlines_and_spaces();
+    }
+
+    fn skip_comment_trivia(&mut self) {
+        let mut index = self.index;
+        let mut saw_comment = false;
+        while let Some(token) = self.tokens.get(index).filter(|token| is_trivia(token.kind)) {
+            saw_comment |= token.kind == TokenKind::Comment;
+            index += 1;
+        }
+        if saw_comment {
+            self.index = index;
+        }
     }
 
     fn has_separator(&self) -> bool {
@@ -1733,6 +1743,55 @@ mod tests {
         let program = parse(source).expect("comments are accepted as trivia");
         assert_eq!(program.parameters.len(), 1);
         assert_eq!(program.roots.len(), 2);
+    }
+
+    #[test]
+    fn typed_empty_vectors_accept_comment_trivia_and_preserve_close_diagnostics() {
+        for (source, expected_type) in [
+            ("Bool(# LF\n)", ScalarType::Bool),
+            ("Int( # CRLF\r\n )", ScalarType::Int),
+            ("Double(\n# UTF-8 🦀\n)", ScalarType::Double),
+        ] {
+            let program = parse(source).expect("commented typed empty");
+            let root = program.roots.first().expect("typed empty root");
+            match &root.kind {
+                ExprKind::Vector(actual_type, values) => {
+                    assert_eq!(*actual_type, expected_type);
+                    assert!(values.is_empty());
+                }
+                _ => panic!("expected typed empty vector"),
+            }
+            assert_eq!(root.span.begin.offset, 1);
+            assert_eq!(root.span.end.offset, source.len() + 1);
+        }
+
+        let eof_source = "Int(# no close";
+        let eof_error = parse(eof_source).expect_err("commented typed empty missing close");
+        assert_eq!(eof_error.kind, ErrorKind::SyntaxError);
+        assert_eq!(eof_error.message, "missing closing delimiter");
+        let eof_span = eof_error.span.expect("missing close insertion span");
+        assert_eq!(eof_span.begin.offset, eof_source.len() + 1);
+        assert_eq!(eof_span.begin, eof_span.end);
+
+        let invalid_close = parse("Bool(# comment\r\n]").expect_err("invalid typed empty close");
+        assert_eq!(invalid_close.kind, ErrorKind::SyntaxError);
+        assert_eq!(
+            invalid_close.message,
+            "vector elements must be scalar literals"
+        );
+        let invalid_span = invalid_close.span.expect("invalid close type span");
+        assert_eq!(invalid_span.begin.offset, 1);
+        assert_eq!(invalid_span.end.offset, 5);
+
+        let whitespace_only = parse("Int( )").expect_err("whitespace-only typed empty");
+        assert_eq!(whitespace_only.kind, ErrorKind::SyntaxError);
+        assert_eq!(
+            whitespace_only.message,
+            "vector elements must be scalar literals"
+        );
+        let whitespace_span = whitespace_only.span.expect("whitespace type span");
+        assert_eq!(whitespace_span.begin.offset, 1);
+        assert_eq!(whitespace_span.end.offset, 4);
     }
 
     #[test]

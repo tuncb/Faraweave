@@ -250,12 +250,14 @@ fn line_comments_preserve_evaluation_and_compact_deep_paths() {
         Value::Int(DEPTH as i64 + 1)
     );
 
-    let mut tuple = String::new();
-    for _ in 0..DEPTH {
-        tuple.push_str("[# layer\n");
+    const TUPLE_DEPTH: usize = 4_000;
+    let mut tuple = String::with_capacity(TUPLE_DEPTH * 2 + 32);
+    for _ in 0..TUPLE_DEPTH {
+        tuple.push('[');
     }
     tuple.push('1');
-    for _ in 0..DEPTH {
+    tuple.push_str("# closing trivia 🦀\r\n");
+    for _ in 0..TUPLE_DEPTH {
         tuple.push(']');
     }
     let allocation_error = evaluate_expression_with_configuration(
