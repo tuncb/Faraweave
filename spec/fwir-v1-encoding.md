@@ -97,6 +97,7 @@ its specified record size. A known section appears at most once.
 | 15 | `OWNR` | `3` | 12 | logical ownership and release |
 | 16 | `ROOT` | `3` | 8 | ordered program roots |
 | 17 | `APPL` | `3` | 8 | explicit application plans |
+| 18 | `OPRF` | `3` | 16 | stable built-in operation references |
 | 32769 | `PROD` | `0` | 0 | optional producer metadata |
 
 Every fixed-record section contains only consecutive records; its record count
@@ -117,11 +118,12 @@ mandatory semantic feature and class `1` is optional advisory metadata.
 Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`,
-`4=FanOut`, `5=ApplicationPlans`, and `7=BackendNativeMathV1`; zero is
-invalid. IDs 1 through 5 and 7 are semantic capabilities and
+`4=FanOut`, `5=ApplicationPlans`, `6=OperationReferences`, and
+`7=BackendNativeMathV1`; zero is invalid. IDs 1 through 7 are semantic capabilities and
 MUST have class `0`: pairing a known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
 Feature 5 requires semantic minor 1 and physical format minor 1.
+Feature 6 requires semantic minor 1 and physical format minor 1.
 Feature 7 requires semantic minor 1 but does not by itself raise the physical
 format minor.
 
@@ -219,6 +221,12 @@ node order. Application-plan IDs are nonzero, fit `u16`, and must match the
 selected implementation's registry descriptor. A v1.0 artifact omits `APPL`
 and reconstructs the plan from its validated implementation identity.
 
+`OPRF` is `primitive_id:u16, signature_id:u16, implementation_id:u16,
+reserved:u16, origin:u32, reserved:u32`. Both reserved fields are zero.
+Verification requires the three IDs to identify one closed registered
+elementwise descriptor and requires `origin` to be in range; inconsistent or
+structural identities are malformed rather than runtime-dispatched by name.
+
 ### 4.6 Producer metadata
 
 `PROD` is advisory and excluded from program identity. Its payload is
@@ -247,6 +255,7 @@ asserts provenance but conveys no trust.
 | `SelectedApply.application_plan_id` | `APPL` with feature 5; reconstructed from the validated implementation identity in v1.0 |
 | `edges`, `shape_checks` | `EDGE`, `SHCK` |
 | `origins` | `ORIG` |
+| `operation_references` | `OPRF` |
 | `branches` | `BRAN` |
 | `ownership` | `OWNR` |
 | `roots` | `ROOT` |
@@ -289,8 +298,11 @@ The physical format version and semantic contract version are separate.
 - The decoded `MODL` semantic version is passed unchanged to semantic
   verification. The current semantic verifier accepts major `1` and a minor
   no greater than its supported minor.
-- Format minor 1 is emitted exactly when feature 5 is present; feature 5 at
-  format or semantic minor 0 is noncanonical/unsupported.
+- Format minor 1 is emitted when feature 5 or feature 6 is present; either
+  sidecar feature at format or semantic minor 0 is noncanonical/unsupported.
+- `OPRF` records or feature `6=OperationReferences` require semantic version
+  1.1 and physical format minor 1. Semantic 1.0/physical 1.0 artifacts cannot
+  opt into that mandatory sidecar capability.
 - A lower format minor is accepted when the major matches and every required
   v1 section/record rule used by the artifact is supported.
 
@@ -347,8 +359,7 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known IDs 1 through 5 and 7), tag, boolean, optional sentinel,
-   unused
+   class `1` on known IDs 1 through 7), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after
@@ -387,10 +398,12 @@ not part of the artifact.
   bytes: source name `example.fw`, one source unit, Bool type, Bool constant
   with payload 1, one one-based origin spanning bytes 1 through 5 at line 1
   columns 1 through 5, one Constant node, one root release, and one root.
-- [Complete encoder surface](examples/fwir-v1-complete.hex) is a 4,413-byte
-  golden produced from one verified source program covering all 16 semantic
-  sections, all six node opcodes, every graph sidecar, sorted strings, and
-  exact binary64 payload bits.
+- [Semantic 1.0 encoder surface](examples/fwir-v1-complete.hex) is a
+  4,413-byte golden produced from one verified source program covering all 16
+  semantic-1.0 sections, all six node opcodes, every graph sidecar, sorted
+  strings, and exact binary64 payload bits. Operation-reference section 18 is
+  covered by constructed semantic-1.1 codec tests because no source consumer
+  exists in issue #38.
 
 Run:
 
