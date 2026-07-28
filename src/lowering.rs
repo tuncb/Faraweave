@@ -2,8 +2,9 @@ use crate::parser::parse;
 use crate::parser::{CallSyntax, Expr, ExprKind, Program, validate_parameter_declarations};
 use crate::primitive::resolve_names;
 use crate::semantic_registry::{
-    Conversion as RegistryConversion, SemanticDescriptor, StructuralBehavior, conversion,
-    descriptors, is_backend_native_math_primitive, primitive_from_name,
+    Conversion as RegistryConversion, OperandConsumption, ResultCardinality, SemanticDescriptor,
+    StructuralBehavior, conversion, descriptors, is_backend_native_math_primitive,
+    primitive_from_name,
 };
 use crate::typed_program::{
     BuildError, Cardinality, ConstantRecord, Edge, FanOutBranch, Feature, IndexRange, LiftMode,
@@ -87,6 +88,7 @@ struct Lowerer {
     needs_tuples: bool,
     needs_spread: bool,
     needs_fan_out: bool,
+    needs_application_plans: bool,
     needs_backend_native_math: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
@@ -386,6 +388,7 @@ fn lower_program_with_builder_and_diagnostics(
         needs_tuples: false,
         needs_spread: false,
         needs_fan_out: false,
+        needs_application_plans: false,
         needs_backend_native_math: false,
         placeholder: None,
         releases: Vec::new(),
@@ -480,6 +483,12 @@ fn lower_program_with_builder_and_diagnostics(
     }
     if lowerer.needs_fan_out {
         lowerer.builder.push_feature(Feature::FanOut.numeric())?;
+    }
+    if lowerer.needs_application_plans {
+        lowerer
+            .builder
+            .push_feature(Feature::ApplicationPlans.numeric())?;
+        lowerer.builder.set_semantic_minor(1);
     }
     if lowerer.needs_backend_native_math {
         lowerer.builder.set_semantic_minor(1);
@@ -1085,6 +1094,16 @@ impl Lowerer {
         operands: Vec<CallOperand>,
     ) -> Result<Lowered, LowerError> {
         let descriptor = select_descriptor(name, &operands, location, &mut self.diagnostics)?;
+        self.needs_application_plans |= descriptor
+            .parameters
+            .iter()
+            .any(|operand| operand.consumption == OperandConsumption::WholeVector)
+            || matches!(
+                descriptor.application_plan.result_cardinality,
+                ResultCardinality::Scalar
+                    | ResultCardinality::PreserveOperand(_)
+                    | ResultCardinality::OperandPlusOne(_)
+            );
         let edge_start = self.builder.finish_preview_edges()?;
         let mut static_anchor = None;
         let mut static_length = None;
@@ -1109,9 +1128,16 @@ impl Lowerer {
                     "selected operand is not scalar or vector",
                 ))
             })?;
-            let conversion = match conversion(actual, *accepted) {
+            let conversion = match conversion(actual, accepted.element_type) {
                 Some(RegistryConversion::Identity) => crate::Conversion::Identity,
                 Some(RegistryConversion::PromoteIntToDouble) => {
+                    if accepted.consumption == OperandConsumption::WholeVector {
+                        return Err(LowerError::Source(Error::new(
+                            ErrorKind::TypeError,
+                            SourceLocation::start(),
+                            "whole-vector operands do not permit implicit container conversion",
+                        )));
+                    }
                     crate::Conversion::PromoteIntToDouble
                 }
                 None => {
@@ -1122,7 +1148,18 @@ impl Lowerer {
                     )));
                 }
             };
-            if matches!(value_type, Type::Vector(_)) {
+            if accepted.consumption == OperandConsumption::WholeVector
+                && !matches!(value_type, Type::Vector(_))
+            {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    SourceLocation::start(),
+                    "selected whole-vector operand is not a vector",
+                )));
+            }
+            if accepted.consumption == OperandConsumption::Elementwise
+                && matches!(value_type, Type::Vector(_))
+            {
                 any_vector = true;
                 match operand_cardinality {
                     Some(Cardinality::StaticVector(length)) => {
@@ -1154,16 +1191,26 @@ impl Lowerer {
             })?;
         }
         if self.first_shape_error.is_none()
-            && let Some((anchor_index, expected)) =
-                operands
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, operand)| match operand.parts().3 {
+            && let Some((anchor_index, expected)) = operands
+                .iter()
+                .enumerate()
+                .zip(descriptor.parameters)
+                .find_map(|((index, operand), accepted)| {
+                    if accepted.consumption != OperandConsumption::Elementwise {
+                        return None;
+                    }
+                    match operand.parts().3 {
                         Some(Cardinality::StaticVector(length)) => Some((index, length)),
                         _ => None,
-                    })
+                    }
+                })
         {
-            for (index, operand) in operands.iter().enumerate() {
+            for (index, (operand, accepted)) in
+                operands.iter().zip(descriptor.parameters).enumerate()
+            {
+                if accepted.consumption != OperandConsumption::Elementwise {
+                    continue;
+                }
                 if index == anchor_index {
                     continue;
                 }
@@ -1213,8 +1260,12 @@ impl Lowerer {
             }
         }
         let shape_start = self.builder.finish_preview_shape_checks()?;
-        for (position, operand) in operands.iter().enumerate() {
-            if matches!(operand.parts().3, Some(Cardinality::DynamicVector)) {
+        for (position, (operand, accepted)) in
+            operands.iter().zip(descriptor.parameters).enumerate()
+        {
+            if accepted.consumption == OperandConsumption::Elementwise
+                && matches!(operand.parts().3, Some(Cardinality::DynamicVector))
+            {
                 self.builder.push_shape_check(
                     edge_start
                         .checked_add(u32::try_from(position).map_err(|_| {
@@ -1232,41 +1283,103 @@ impl Lowerer {
         }
         let shape_count = operands
             .iter()
-            .filter(|operand| matches!(operand.parts().3, Some(Cardinality::DynamicVector)))
+            .zip(descriptor.parameters)
+            .filter(|(operand, accepted)| {
+                accepted.consumption == OperandConsumption::Elementwise
+                    && matches!(operand.parts().3, Some(Cardinality::DynamicVector))
+            })
             .count();
-        let (record, value_type, cardinality, lift) =
-            if descriptor.behavior == StructuralBehavior::Iota {
-                (
-                    TypeRecord::Vector(descriptor.result),
-                    Type::Vector(descriptor.result),
-                    Some(Cardinality::DynamicVector),
-                    LiftMode::DynamicVector,
-                )
-            } else if any_vector {
-                (
-                    TypeRecord::Vector(descriptor.result),
-                    Type::Vector(descriptor.result),
-                    Some(if any_dynamic {
-                        Cardinality::DynamicVector
-                    } else {
-                        Cardinality::StaticVector(static_length.unwrap_or(0))
-                    }),
-                    LiftMode::Vector,
-                )
-            } else {
-                (
-                    TypeRecord::Scalar(descriptor.result),
-                    Type::Scalar(descriptor.result),
-                    Some(Cardinality::StaticScalar),
-                    LiftMode::Scalar,
-                )
+        let operand_cardinality = |position: u16| {
+            position
+                .checked_sub(1)
+                .and_then(|index| operands.get(usize::from(index)))
+                .and_then(|operand| operand.parts().3)
+        };
+        let (record, value_type, cardinality, lift) = if descriptor
+            .application_plan
+            .result_cardinality
+            == ResultCardinality::DynamicVector
+        {
+            (
+                TypeRecord::Vector(descriptor.result),
+                Type::Vector(descriptor.result),
+                Some(Cardinality::DynamicVector),
+                LiftMode::DynamicVector,
+            )
+        } else if descriptor.application_plan.result_cardinality == ResultCardinality::Elementwise
+            && any_vector
+        {
+            (
+                TypeRecord::Vector(descriptor.result),
+                Type::Vector(descriptor.result),
+                Some(if any_dynamic {
+                    Cardinality::DynamicVector
+                } else {
+                    Cardinality::StaticVector(static_length.unwrap_or(0))
+                }),
+                LiftMode::Vector,
+            )
+        } else if descriptor.application_plan.result_cardinality == ResultCardinality::Elementwise {
+            (
+                TypeRecord::Scalar(descriptor.result),
+                Type::Scalar(descriptor.result),
+                Some(Cardinality::StaticScalar),
+                LiftMode::Scalar,
+            )
+        } else if descriptor.application_plan.result_cardinality == ResultCardinality::Scalar {
+            (
+                TypeRecord::Scalar(descriptor.result),
+                Type::Scalar(descriptor.result),
+                Some(Cardinality::StaticScalar),
+                LiftMode::ContainerScalar,
+            )
+        } else {
+            let position = match descriptor.application_plan.result_cardinality {
+                ResultCardinality::PreserveOperand(position)
+                | ResultCardinality::OperandPlusOne(position) => position,
+                _ => {
+                    return Err(LowerError::Source(Error::new(
+                        ErrorKind::TypeError,
+                        SourceLocation::start(),
+                        "selected application plan has invalid result cardinality",
+                    )));
+                }
             };
+            let result_cardinality = match operand_cardinality(position) {
+                Some(Cardinality::StaticVector(length))
+                    if descriptor.application_plan.result_cardinality
+                        == ResultCardinality::OperandPlusOne(position) =>
+                {
+                    Some(Cardinality::StaticVector(length.checked_add(1).ok_or(
+                        LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::Node,
+                        }),
+                    )?))
+                }
+                Some(cardinality @ Cardinality::StaticVector(_))
+                | Some(cardinality @ Cardinality::DynamicVector) => Some(cardinality),
+                _ => {
+                    return Err(LowerError::Source(Error::new(
+                        ErrorKind::TypeError,
+                        SourceLocation::start(),
+                        "selected application plan requires a vector cardinality operand",
+                    )));
+                }
+            };
+            (
+                TypeRecord::Vector(descriptor.result),
+                Type::Vector(descriptor.result),
+                result_cardinality,
+                LiftMode::ContainerVector,
+            )
+        };
         let result_type = self.builder.push_type(record)?;
         let node = self.builder.push_node(Node {
             kind: NodeKind::SelectedApply {
                 primitive_id: descriptor.primitive_id.numeric(),
                 signature_id: descriptor.signature_id.numeric(),
                 implementation_id: descriptor.implementation_id.numeric(),
+                application_plan_id: descriptor.application_plan.id.numeric(),
                 primitive_origin,
                 lift,
                 result_element_type: descriptor.result,
@@ -1615,10 +1728,20 @@ fn select_descriptor(
         .filter_map(|descriptor| {
             let mut cost = 0;
             for (operand, accepted) in operands.iter().zip(descriptor.parameters) {
+                if accepted.consumption == OperandConsumption::WholeVector
+                    && !matches!(operand.parts().2, Type::Vector(_))
+                {
+                    return None;
+                }
                 let actual = scalar_element(operand.parts().2)?;
-                match conversion(actual, *accepted)? {
+                match conversion(actual, accepted.element_type)? {
                     RegistryConversion::Identity => {}
-                    RegistryConversion::PromoteIntToDouble => cost += 1,
+                    RegistryConversion::PromoteIntToDouble
+                        if accepted.consumption == OperandConsumption::Elementwise =>
+                    {
+                        cost += 1;
+                    }
+                    RegistryConversion::PromoteIntToDouble => return None,
                 }
             }
             Some((cost, descriptor))
@@ -1634,8 +1757,14 @@ fn select_descriptor(
                     .iter()
                     .zip(operands)
                     .take_while(|(accepted, operand)| {
-                        scalar_element(operand.parts().2)
-                            .is_some_and(|actual| conversion(actual, **accepted).is_some())
+                        (accepted.consumption == OperandConsumption::Elementwise
+                            || matches!(operand.parts().2, Type::Vector(_)))
+                            && scalar_element(operand.parts().2).is_some_and(|actual| {
+                                conversion(actual, accepted.element_type).is_some_and(|selected| {
+                                    selected == RegistryConversion::Identity
+                                        || accepted.consumption == OperandConsumption::Elementwise
+                                })
+                            })
                     })
                     .count()
             })
@@ -2297,7 +2426,7 @@ mod tests {
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 16_420_725_918_700_611_398);
+        assert_eq!(debug_digest(&matrix), 6_922_610_086_759_672_529);
 
         let depth = 256;
         let mut deep = String::new();
@@ -2322,7 +2451,7 @@ mod tests {
         unary.push('1');
         assert_eq!(
             debug_digest(&must_compile(&unary)),
-            16_033_402_538_388_638_440
+            1_075_039_349_663_838_020
         );
     }
 

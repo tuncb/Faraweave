@@ -168,6 +168,11 @@ required value kind is a source-program `ProfileError`. Unknown advisory
 metadata may be ignored only when its declaration explicitly says it has no
 semantic effect.
 
+Semantic minor 1 adds mandatory feature `ApplicationPlans` (numeric ID 5) for
+container-wide signatures. Its registry and typed-program rules are normative
+in [the container-wide application-plan contract](container-wide-application-plans.md);
+semantic 1.0 programs retain their previous feature set and behavior.
+
 ## 6. Nodes, edges, and evaluation order (`FWIR-SEM-006`)
 
 The abstract node kinds needed by the current language are:
@@ -228,6 +233,11 @@ Lowering must record every backend-relevant decision exactly once:
 10. ownership/borrow edges and logical release points;
 11. required diagnostic origins and stable semantic descriptors; and
 12. required module features.
+
+Container-wide signatures additionally record one stable application-plan ID
+whose registry meaning fixes whole-vector versus elementwise operand
+consumption, scalar/vector result-cardinality behavior, and deterministic work
+admission. Backends consume that verified identity directly.
 
 The stable conversion classes for the current language are:
 

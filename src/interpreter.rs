@@ -156,6 +156,7 @@ impl<'a> Interpreter<'a> {
             NodeKind::PrefixSpreadPrepare => self.execute_spread_prepare(index, node, location),
             NodeKind::SelectedApply {
                 implementation_id,
+                application_plan_id,
                 lift,
                 result_element_type,
                 shape,
@@ -164,6 +165,7 @@ impl<'a> Interpreter<'a> {
                 index,
                 node,
                 implementation_id,
+                application_plan_id,
                 lift,
                 result_element_type,
                 shape,
@@ -233,6 +235,7 @@ impl<'a> Interpreter<'a> {
         index: usize,
         node: crate::Node,
         implementation_id: u16,
+        application_plan_id: u16,
         lift: crate::LiftMode,
         result_type: ScalarType,
         shape: crate::ShapePlan,
@@ -252,6 +255,7 @@ impl<'a> Interpreter<'a> {
         }
         let applied = apply_implementation(
             implementation_id,
+            application_plan_id,
             &arguments,
             lift,
             result_type,

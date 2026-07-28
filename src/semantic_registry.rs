@@ -9,10 +9,55 @@ pub(crate) struct SignatureId(u16);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ImplementationId(u16);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ApplicationPlanId(u16);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Conversion {
     Identity,
     PromoteIntToDouble,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperandConsumption {
+    Elementwise,
+    WholeVector,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OperandDescriptor {
+    pub element_type: ScalarType,
+    pub consumption: OperandConsumption,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum ResultCardinality {
+    Elementwise,
+    Scalar,
+    DynamicVector,
+    PreserveOperand(u16),
+    OperandPlusOne(u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WorkAdmission {
+    Constant(u32),
+    ResultCardinality,
+    OperandCardinality(u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceAdmissionPlan {
+    pub work: WorkAdmission,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ApplicationPlan {
+    pub id: ApplicationPlanId,
+    pub result_cardinality: ResultCardinality,
+    pub resources: ResourceAdmissionPlan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,9 +110,10 @@ pub(crate) struct SemanticDescriptor {
     pub primitive_name: &'static str,
     pub signature_id: SignatureId,
     pub implementation_id: ImplementationId,
-    pub parameters: &'static [ScalarType],
+    pub parameters: &'static [OperandDescriptor],
     pub result: ScalarType,
     pub behavior: StructuralBehavior,
+    pub application_plan: ApplicationPlan,
     pub kernel: ScalarKernel,
 }
 
@@ -78,6 +124,7 @@ pub(crate) enum RegistryLookupError {
     PrimitiveId,
     SignatureId,
     ImplementationId,
+    ApplicationPlanId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,14 +138,55 @@ enum RegistryValidationError {
     UnknownPrimitiveId,
     UnknownSignatureId,
     UnknownImplementationId,
+    UnknownApplicationPlanId,
+    DuplicateApplicationPlanId,
+    MissingApplicationPlanId,
+    InvalidApplicationPlan,
     InconsistentPrimitiveIdentity,
     InconsistentSignatureIdentity,
     InconsistentImplementationIdentity,
+    InconsistentApplicationPlanIdentity,
 }
 
 const PRIMITIVE_COUNT: u16 = 19;
 const SIGNATURE_COUNT: u16 = 34;
 const IMPLEMENTATION_COUNT: u16 = 34;
+const APPLICATION_PLAN_COUNT: u16 = 2;
+
+const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
+    OperandDescriptor {
+        element_type,
+        consumption: OperandConsumption::Elementwise,
+    }
+}
+
+const INT1: &[OperandDescriptor] = &[elementwise(ScalarType::Int)];
+const DOUBLE1: &[OperandDescriptor] = &[elementwise(ScalarType::Double)];
+const BOOL1: &[OperandDescriptor] = &[elementwise(ScalarType::Bool)];
+const INT2: &[OperandDescriptor] = &[elementwise(ScalarType::Int), elementwise(ScalarType::Int)];
+const DOUBLE2: &[OperandDescriptor] = &[
+    elementwise(ScalarType::Double),
+    elementwise(ScalarType::Double),
+];
+const BOOL2: &[OperandDescriptor] = &[elementwise(ScalarType::Bool), elementwise(ScalarType::Bool)];
+
+const ELEMENTWISE_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(1),
+    result_cardinality: ResultCardinality::Elementwise,
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::ResultCardinality,
+    },
+};
+
+const IOTA_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(2),
+    result_cardinality: ResultCardinality::DynamicVector,
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::ResultCardinality,
+    },
+};
+
+const APPLICATION_PLANS: &[ApplicationPlan] = &[ELEMENTWISE_PLAN, IOTA_PLAN];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -108,16 +196,9 @@ pub(crate) const fn is_backend_native_math_primitive(primitive_id: u16) -> bool 
         && primitive_id <= BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID
 }
 
-const INT1: &[ScalarType] = &[ScalarType::Int];
-const DOUBLE1: &[ScalarType] = &[ScalarType::Double];
-const BOOL1: &[ScalarType] = &[ScalarType::Bool];
-const INT2: &[ScalarType] = &[ScalarType::Int, ScalarType::Int];
-const DOUBLE2: &[ScalarType] = &[ScalarType::Double, ScalarType::Double];
-const BOOL2: &[ScalarType] = &[ScalarType::Bool, ScalarType::Bool];
-
 macro_rules! descriptor {
     ($primitive:literal, $name:literal, $signature:literal, $implementation:literal,
-     $parameters:ident, $result:ident, $behavior:ident, $kernel:ident) => {
+     $parameters:ident, $result:ident, $behavior:ident, $plan:ident, $kernel:ident) => {
         SemanticDescriptor {
             primitive_id: PrimitiveId($primitive),
             primitive_name: $name,
@@ -126,6 +207,7 @@ macro_rules! descriptor {
             parameters: $parameters,
             result: ScalarType::$result,
             behavior: StructuralBehavior::$behavior,
+            application_plan: $plan,
             kernel: ScalarKernel::$kernel,
         }
     };
@@ -133,22 +215,182 @@ macro_rules! descriptor {
 
 // This is the single production owner of primitive names and all stable semantic IDs.
 pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
-    descriptor!(1, "inc", 1, 1, INT1, Int, Elementwise, IncInt),
-    descriptor!(1, "inc", 2, 2, DOUBLE1, Double, Elementwise, IncDouble),
-    descriptor!(2, "dec", 3, 3, INT1, Int, Elementwise, DecInt),
-    descriptor!(2, "dec", 4, 4, DOUBLE1, Double, Elementwise, DecDouble),
-    descriptor!(3, "neg", 5, 5, INT1, Int, Elementwise, NegInt),
-    descriptor!(3, "neg", 6, 6, DOUBLE1, Double, Elementwise, NegDouble),
-    descriptor!(4, "abs", 7, 7, INT1, Int, Elementwise, AbsInt),
-    descriptor!(4, "abs", 8, 8, DOUBLE1, Double, Elementwise, AbsDouble),
-    descriptor!(5, "add", 9, 9, INT2, Int, Elementwise, AddInt),
-    descriptor!(5, "add", 10, 10, DOUBLE2, Double, Elementwise, AddDouble),
-    descriptor!(6, "sub", 11, 11, INT2, Int, Elementwise, SubInt),
-    descriptor!(6, "sub", 12, 12, DOUBLE2, Double, Elementwise, SubDouble),
-    descriptor!(7, "mul", 13, 13, INT2, Int, Elementwise, MulInt),
-    descriptor!(7, "mul", 14, 14, DOUBLE2, Double, Elementwise, MulDouble),
-    descriptor!(8, "equals", 15, 15, BOOL2, Bool, Elementwise, EqualsBool),
-    descriptor!(8, "equals", 16, 16, INT2, Bool, Elementwise, EqualsInt),
+    descriptor!(
+        1,
+        "inc",
+        1,
+        1,
+        INT1,
+        Int,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        IncInt
+    ),
+    descriptor!(
+        1,
+        "inc",
+        2,
+        2,
+        DOUBLE1,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        IncDouble
+    ),
+    descriptor!(
+        2,
+        "dec",
+        3,
+        3,
+        INT1,
+        Int,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        DecInt
+    ),
+    descriptor!(
+        2,
+        "dec",
+        4,
+        4,
+        DOUBLE1,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        DecDouble
+    ),
+    descriptor!(
+        3,
+        "neg",
+        5,
+        5,
+        INT1,
+        Int,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        NegInt
+    ),
+    descriptor!(
+        3,
+        "neg",
+        6,
+        6,
+        DOUBLE1,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        NegDouble
+    ),
+    descriptor!(
+        4,
+        "abs",
+        7,
+        7,
+        INT1,
+        Int,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        AbsInt
+    ),
+    descriptor!(
+        4,
+        "abs",
+        8,
+        8,
+        DOUBLE1,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        AbsDouble
+    ),
+    descriptor!(
+        5,
+        "add",
+        9,
+        9,
+        INT2,
+        Int,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        AddInt
+    ),
+    descriptor!(
+        5,
+        "add",
+        10,
+        10,
+        DOUBLE2,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        AddDouble
+    ),
+    descriptor!(
+        6,
+        "sub",
+        11,
+        11,
+        INT2,
+        Int,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        SubInt
+    ),
+    descriptor!(
+        6,
+        "sub",
+        12,
+        12,
+        DOUBLE2,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        SubDouble
+    ),
+    descriptor!(
+        7,
+        "mul",
+        13,
+        13,
+        INT2,
+        Int,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        MulInt
+    ),
+    descriptor!(
+        7,
+        "mul",
+        14,
+        14,
+        DOUBLE2,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        MulDouble
+    ),
+    descriptor!(
+        8,
+        "equals",
+        15,
+        15,
+        BOOL2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        EqualsBool
+    ),
+    descriptor!(
+        8,
+        "equals",
+        16,
+        16,
+        INT2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        EqualsInt
+    ),
     descriptor!(
         8,
         "equals",
@@ -157,6 +399,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         DOUBLE2,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         EqualsDouble
     ),
     descriptor!(
@@ -167,6 +410,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         BOOL2,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         NotEqualsBool
     ),
     descriptor!(
@@ -177,6 +421,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         INT2,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         NotEqualsInt
     ),
     descriptor!(
@@ -187,13 +432,64 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         DOUBLE2,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         NotEqualsDouble
     ),
-    descriptor!(10, "not", 21, 21, BOOL1, Bool, Elementwise, NotBool),
-    descriptor!(11, "and", 22, 22, BOOL2, Bool, Elementwise, AndBool),
-    descriptor!(12, "or", 23, 23, BOOL2, Bool, Elementwise, OrBool),
-    descriptor!(13, "odd", 24, 24, INT1, Bool, Elementwise, OddInt),
-    descriptor!(14, "even", 25, 25, INT1, Bool, Elementwise, EvenInt),
+    descriptor!(
+        10,
+        "not",
+        21,
+        21,
+        BOOL1,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        NotBool
+    ),
+    descriptor!(
+        11,
+        "and",
+        22,
+        22,
+        BOOL2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        AndBool
+    ),
+    descriptor!(
+        12,
+        "or",
+        23,
+        23,
+        BOOL2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        OrBool
+    ),
+    descriptor!(
+        13,
+        "odd",
+        24,
+        24,
+        INT1,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        OddInt
+    ),
+    descriptor!(
+        14,
+        "even",
+        25,
+        25,
+        INT1,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        EvenInt
+    ),
     descriptor!(
         15,
         "is_positive",
@@ -202,6 +498,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         INT1,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         IsPositiveInt
     ),
     descriptor!(
@@ -212,6 +509,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         DOUBLE1,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         IsPositiveDouble
     ),
     descriptor!(
@@ -222,6 +520,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         INT1,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         IsNegativeInt
     ),
     descriptor!(
@@ -232,6 +531,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         DOUBLE1,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         IsNegativeDouble
     ),
     descriptor!(
@@ -242,6 +542,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         INT2,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         LessThanInt
     ),
     descriptor!(
@@ -252,6 +553,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         DOUBLE2,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         LessThanDouble
     ),
     descriptor!(
@@ -262,6 +564,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         INT2,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         GreaterThanInt
     ),
     descriptor!(
@@ -272,9 +575,10 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         DOUBLE2,
         Bool,
         Elementwise,
+        ELEMENTWISE_PLAN,
         GreaterThanDouble
     ),
-    descriptor!(19, "iota", 34, 34, INT1, Int, Iota, IotaInt),
+    descriptor!(19, "iota", 34, 34, INT1, Int, Iota, IOTA_PLAN, IotaInt),
 ];
 
 impl PrimitiveId {
@@ -293,6 +597,12 @@ impl SignatureId {
 
 impl ImplementationId {
     #[allow(dead_code)]
+    pub(crate) const fn numeric(self) -> u16 {
+        self.0
+    }
+}
+
+impl ApplicationPlanId {
     pub(crate) const fn numeric(self) -> u16 {
         self.0
     }
@@ -335,6 +645,16 @@ pub(crate) fn implementation_from_numeric(
         .ok_or(RegistryLookupError::ImplementationId)
 }
 
+pub(crate) fn application_plan_from_numeric(
+    numeric: u16,
+) -> Result<ApplicationPlan, RegistryLookupError> {
+    APPLICATION_PLANS
+        .iter()
+        .find(|plan| plan.id.numeric() == numeric)
+        .copied()
+        .ok_or(RegistryLookupError::ApplicationPlanId)
+}
+
 pub(crate) fn descriptors(
     primitive: PrimitiveId,
 ) -> impl Iterator<Item = &'static SemanticDescriptor> {
@@ -355,6 +675,15 @@ pub(crate) fn conversion(actual: ScalarType, accepted: ScalarType) -> Option<Con
 
 #[allow(dead_code)]
 fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryValidationError> {
+    validate_registry_with_application_plans(registry, APPLICATION_PLANS)
+}
+
+fn validate_registry_with_application_plans(
+    registry: &[SemanticDescriptor],
+    application_plans: &[ApplicationPlan],
+) -> Result<(), RegistryValidationError> {
+    validate_application_plan_catalog(application_plans)?;
+
     for descriptor in registry {
         if descriptor.primitive_id.numeric() == 0
             || descriptor.primitive_id.numeric() > PRIMITIVE_COUNT
@@ -370,6 +699,21 @@ fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryVali
             || descriptor.implementation_id.numeric() > IMPLEMENTATION_COUNT
         {
             return Err(RegistryValidationError::UnknownImplementationId);
+        }
+        if descriptor.application_plan.id.numeric() == 0
+            || descriptor.application_plan.id.numeric() > APPLICATION_PLAN_COUNT
+        {
+            return Err(RegistryValidationError::UnknownApplicationPlanId);
+        }
+        if !valid_application_plan(descriptor) {
+            return Err(RegistryValidationError::InvalidApplicationPlan);
+        }
+        if application_plans
+            .iter()
+            .find(|plan| plan.id == descriptor.application_plan.id)
+            .is_none_or(|plan| *plan != descriptor.application_plan)
+        {
+            return Err(RegistryValidationError::InconsistentApplicationPlanIdentity);
         }
     }
 
@@ -439,6 +783,7 @@ fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryVali
                 || descriptor.parameters != canonical.parameters
                 || descriptor.result != canonical.result
                 || descriptor.behavior != canonical.behavior
+                || descriptor.application_plan != canonical.application_plan
         }) {
             return Err(RegistryValidationError::InconsistentSignatureIdentity);
         }
@@ -451,6 +796,7 @@ fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryVali
                 || descriptor.parameters != canonical.parameters
                 || descriptor.result != canonical.result
                 || descriptor.behavior != canonical.behavior
+                || descriptor.application_plan != canonical.application_plan
                 || descriptor.kernel != canonical.kernel
         }) {
             return Err(RegistryValidationError::InconsistentImplementationIdentity);
@@ -458,6 +804,61 @@ fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryVali
     }
 
     Ok(())
+}
+
+fn validate_application_plan_catalog(
+    application_plans: &[ApplicationPlan],
+) -> Result<(), RegistryValidationError> {
+    for (index, plan) in application_plans.iter().enumerate() {
+        if plan.id.numeric() == 0 || plan.id.numeric() > APPLICATION_PLAN_COUNT {
+            return Err(RegistryValidationError::UnknownApplicationPlanId);
+        }
+        if application_plans
+            .iter()
+            .skip(index + 1)
+            .any(|other| other.id == plan.id)
+        {
+            return Err(RegistryValidationError::DuplicateApplicationPlanId);
+        }
+    }
+
+    for expected in 1..=APPLICATION_PLAN_COUNT {
+        if !application_plans
+            .iter()
+            .any(|plan| plan.id.numeric() == expected)
+        {
+            return Err(RegistryValidationError::MissingApplicationPlanId);
+        }
+    }
+
+    Ok(())
+}
+
+fn valid_application_plan(descriptor: &SemanticDescriptor) -> bool {
+    let whole_vector_at = |position: u16| {
+        position
+            .checked_sub(1)
+            .and_then(|index| descriptor.parameters.get(usize::from(index)))
+            .is_some_and(|operand| operand.consumption == OperandConsumption::WholeVector)
+    };
+    let result_valid = match descriptor.application_plan.result_cardinality {
+        ResultCardinality::Elementwise => descriptor
+            .parameters
+            .iter()
+            .all(|operand| operand.consumption == OperandConsumption::Elementwise),
+        ResultCardinality::DynamicVector => true,
+        ResultCardinality::Scalar => descriptor
+            .parameters
+            .iter()
+            .any(|operand| operand.consumption == OperandConsumption::WholeVector),
+        ResultCardinality::PreserveOperand(position)
+        | ResultCardinality::OperandPlusOne(position) => whole_vector_at(position),
+    };
+    let work_valid = match descriptor.application_plan.resources.work {
+        WorkAdmission::Constant(_) | WorkAdmission::ResultCardinality => true,
+        WorkAdmission::OperandCardinality(position) => whole_vector_at(position),
+    };
+    result_valid && work_valid
 }
 
 #[cfg(test)]
@@ -526,6 +927,15 @@ mod tests {
             implementation_from_numeric(34).map(|descriptor| descriptor.kernel),
             Ok(ScalarKernel::IotaInt)
         );
+        assert_eq!(application_plan_from_numeric(1), Ok(ELEMENTWISE_PLAN));
+        assert_eq!(application_plan_from_numeric(2), Ok(IOTA_PLAN));
+        assert!(SEMANTIC_REGISTRY[..33].iter().all(|descriptor| {
+            descriptor.application_plan == ELEMENTWISE_PLAN
+                && descriptor
+                    .parameters
+                    .iter()
+                    .all(|operand| operand.consumption == OperandConsumption::Elementwise)
+        }));
         assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
@@ -541,6 +951,10 @@ mod tests {
         assert_eq!(
             implementation_from_numeric(35),
             Err(RegistryLookupError::ImplementationId)
+        );
+        assert_eq!(
+            application_plan_from_numeric(3),
+            Err(RegistryLookupError::ApplicationPlanId)
         );
     }
 
@@ -601,6 +1015,12 @@ mod tests {
             validate_registry(&unknown),
             Err(RegistryValidationError::UnknownSignatureId)
         );
+        unknown[0].signature_id = SEMANTIC_REGISTRY[0].signature_id;
+        unknown[0].application_plan.id = ApplicationPlanId(APPLICATION_PLAN_COUNT + 1);
+        assert_eq!(
+            validate_registry(&unknown),
+            Err(RegistryValidationError::UnknownApplicationPlanId)
+        );
 
         let mut inconsistent = SEMANTIC_REGISTRY.to_vec();
         inconsistent[1].primitive_name = "increment";
@@ -650,6 +1070,17 @@ mod tests {
             Err(RegistryValidationError::InconsistentSignatureIdentity)
         );
 
+        const WHOLE_INT: &[OperandDescriptor] = &[OperandDescriptor {
+            element_type: ScalarType::Int,
+            consumption: OperandConsumption::WholeVector,
+        }];
+        let mut changed_consumption = SEMANTIC_REGISTRY.to_vec();
+        changed_consumption[0].parameters = WHOLE_INT;
+        assert_eq!(
+            validate_registry(&changed_consumption),
+            Err(RegistryValidationError::InvalidApplicationPlan)
+        );
+
         let mut changed_signature_result = SEMANTIC_REGISTRY.to_vec();
         changed_signature_result[0].result = ScalarType::Double;
         assert_eq!(
@@ -663,6 +1094,86 @@ mod tests {
             validate_registry(&changed_implementation_kernel),
             Err(RegistryValidationError::InconsistentImplementationIdentity)
         );
+
+        let mut changed_application_plan = SEMANTIC_REGISTRY.to_vec();
+        changed_application_plan[0].application_plan = ApplicationPlan {
+            id: ApplicationPlanId(1),
+            result_cardinality: ResultCardinality::Scalar,
+            resources: ResourceAdmissionPlan {
+                work: WorkAdmission::Constant(1),
+            },
+        };
+        assert_eq!(
+            validate_registry(&changed_application_plan),
+            Err(RegistryValidationError::InvalidApplicationPlan)
+        );
+    }
+
+    #[test]
+    fn application_plan_ids_reject_different_otherwise_valid_meanings() {
+        const WHOLE_INT: &[OperandDescriptor] = &[OperandDescriptor {
+            element_type: ScalarType::Int,
+            consumption: OperandConsumption::WholeVector,
+        }];
+        let mut conflicting = SEMANTIC_REGISTRY.to_vec();
+        conflicting[0].parameters = WHOLE_INT;
+        conflicting[0].application_plan = ApplicationPlan {
+            id: ApplicationPlanId(1),
+            result_cardinality: ResultCardinality::Scalar,
+            resources: ResourceAdmissionPlan {
+                work: WorkAdmission::OperandCardinality(1),
+            },
+        };
+
+        assert!(valid_application_plan(&conflicting[0]));
+        assert_eq!(
+            validate_registry(&conflicting),
+            Err(RegistryValidationError::InconsistentApplicationPlanIdentity)
+        );
+    }
+
+    #[test]
+    fn application_plan_catalog_rejects_missing_and_duplicate_ids() {
+        assert_eq!(
+            validate_registry_with_application_plans(SEMANTIC_REGISTRY, &[ELEMENTWISE_PLAN]),
+            Err(RegistryValidationError::MissingApplicationPlanId)
+        );
+        assert_eq!(
+            validate_registry_with_application_plans(
+                SEMANTIC_REGISTRY,
+                &[ELEMENTWISE_PLAN, IOTA_PLAN, IOTA_PLAN],
+            ),
+            Err(RegistryValidationError::DuplicateApplicationPlanId)
+        );
+    }
+
+    #[test]
+    fn container_plan_schema_validates_whole_vector_positions_and_resource_inputs() {
+        const WHOLE_INT: &[OperandDescriptor] = &[OperandDescriptor {
+            element_type: ScalarType::Int,
+            consumption: OperandConsumption::WholeVector,
+        }];
+        let mut descriptor = SEMANTIC_REGISTRY[0];
+        descriptor.parameters = WHOLE_INT;
+        descriptor.application_plan = ApplicationPlan {
+            id: ApplicationPlanId(2),
+            result_cardinality: ResultCardinality::Scalar,
+            resources: ResourceAdmissionPlan {
+                work: WorkAdmission::OperandCardinality(1),
+            },
+        };
+        assert!(valid_application_plan(&descriptor));
+
+        descriptor.application_plan.result_cardinality = ResultCardinality::PreserveOperand(1);
+        assert!(valid_application_plan(&descriptor));
+        descriptor.application_plan.result_cardinality = ResultCardinality::OperandPlusOne(1);
+        assert!(valid_application_plan(&descriptor));
+
+        descriptor.application_plan.result_cardinality = ResultCardinality::PreserveOperand(2);
+        assert!(!valid_application_plan(&descriptor));
+        descriptor.application_plan.result_cardinality = ResultCardinality::Scalar;
+        descriptor.application_plan.resources.work = WorkAdmission::OperandCardinality(2);
+        assert!(!valid_application_plan(&descriptor));
     }
 
     #[test]

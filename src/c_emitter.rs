@@ -3,7 +3,9 @@ use crate::parser::{
     first_tuple_location, parse, program_contains_tuple, validate_parameter_declarations,
 };
 use crate::primitive::resolve_names;
-use crate::semantic_registry::{SEMANTIC_REGISTRY, ScalarKernel, implementation_from_numeric};
+use crate::semantic_registry::{
+    SEMANTIC_REGISTRY, ScalarKernel, application_plan_from_numeric, implementation_from_numeric,
+};
 use crate::typed_program::{
     ConstantRecord, Conversion as IrConversion, Feature, IndexRange, LiftMode, Node, NodeKind,
     Origin, RawProgram, ScalarConstant, TypeRecord, ValueAccess, VerifiedProgram,
@@ -318,12 +320,15 @@ impl<'a> IrCGenerator<'a> {
             NodeKind::PrefixSpreadPrepare => self.emit_ir_spread_prepare(node)?,
             NodeKind::SelectedApply {
                 implementation_id,
+                application_plan_id,
                 primitive_origin: _,
                 lift,
                 result_element_type: _,
                 shape,
                 ..
-            } => self.emit_ir_selected(node, implementation_id, lift, shape)?,
+            } => {
+                self.emit_ir_selected(node, implementation_id, application_plan_id, lift, shape)?
+            }
             NodeKind::FanOut { branches, .. } => self.emit_ir_fan_out(node, branches)?,
         }
         self.definitions.push_str("}\n");
@@ -466,10 +471,17 @@ impl<'a> IrCGenerator<'a> {
         &mut self,
         node: Node,
         implementation_id: u16,
+        application_plan_id: u16,
         lift: LiftMode,
         shape: crate::ShapePlan,
     ) -> Result<(), Error> {
-        let _ = implementation_from_numeric(implementation_id).map_err(|_| emission_error())?;
+        let descriptor =
+            implementation_from_numeric(implementation_id).map_err(|_| emission_error())?;
+        let application_plan =
+            application_plan_from_numeric(application_plan_id).map_err(|_| emission_error())?;
+        if descriptor.application_plan != application_plan {
+            return Err(emission_error());
+        }
         let edges = range_slice(&self.program.edges, node.edges)?;
         let origin = self.origin(node.origin.0)?;
         writeln!(
@@ -580,6 +592,9 @@ impl<'a> IrCGenerator<'a> {
                 LiftMode::Scalar => 0,
                 LiftMode::Vector => 1,
                 LiftMode::DynamicVector => 2,
+                LiftMode::ContainerScalar | LiftMode::ContainerVector => {
+                    return Err(emission_error());
+                }
             }
         )
         .map_err(|_| emission_error())?;
