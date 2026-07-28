@@ -183,6 +183,14 @@ const IOTA_PLAN: ApplicationPlan = ApplicationPlan {
     },
 };
 
+pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
+pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
+
+pub(crate) const fn is_backend_native_math_primitive(primitive_id: u16) -> bool {
+    primitive_id >= BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID
+        && primitive_id <= BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID
+}
+
 macro_rules! descriptor {
     ($primitive:literal, $name:literal, $signature:literal, $implementation:literal,
      $parameters:ident, $result:ident, $behavior:ident, $plan:ident, $kernel:ident) => {
@@ -899,6 +907,17 @@ mod tests {
             application_plan_from_numeric(3),
             Err(RegistryLookupError::ApplicationPlanId)
         );
+    }
+
+    #[test]
+    fn backend_native_math_primitive_reservation_is_narrow() {
+        assert!(!is_backend_native_math_primitive(28));
+        for primitive_id in
+            BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID..=BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID
+        {
+            assert!(is_backend_native_math_primitive(primitive_id));
+        }
+        assert!(!is_backend_native_math_primitive(39));
     }
 
     #[test]

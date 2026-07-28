@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -185,6 +186,173 @@ def canonical_artifact(name: str) -> bytes:
     return bytes.fromhex(path.read_text(encoding="ascii"))
 
 
+def binary64(bits: int) -> float:
+    return struct.unpack(">d", bits.to_bytes(8, "big"))[0]
+
+
+def binary64_order_key(bits: int) -> int:
+    return (~bits & 0xFFFF_FFFF_FFFF_FFFF) if bits >> 63 else bits | (1 << 63)
+
+
+def validate_backend_native_math_policy(
+    compiler: str,
+    environment: dict[str, str],
+    work: Path,
+    suffix: str,
+) -> None:
+    cases = [
+        # operation, input bits, reference bits, maximum ULPs, absolute floor
+        (0, 0x4000000000000000, 0x3FF6A09E667F3BCD, 1, 0.0),
+        (0, 0x0000000000000001, 0x1E60000000000000, 1, 0.0),
+        (0, 0x7FEFFFFFFFFFFFFF, 0x5FEFFFFFFFFFFFFF, 1, 0.0),
+        (1, 0x3FF0000000000000, 0x4005BF0A8B145769, 4, 0.0),
+        (1, 0xC087400000000000, 0x0000000000000002, 4, 0.0),
+        (1, 0x40862E42FEFA39EF, 0x7FEFFFFFFFFFFF2A, 4, 0.0),
+        (2, 0x0000000000000001, 0xC0874385446D71C3, 4, 0.0),
+        (2, 0x3FF0000000000001, 0x3CAFFFFFFFFFFFFF, 4, 0.0),
+        (3, 0x0000000000000001, 0xC07434E6420F4374, 4, 0.0),
+        (3, 0x3FF0000000000001, 0x3C9BCB7B1526E50D, 4, 0.0),
+        (4, 0x7E37E43C8800759C, 0xBFEA2C16B010E385, 8, 2.0**-48),
+        (4, 0x0000000000000001, 0x0000000000000001, 8, 2.0**-48),
+        (5, 0x7E37E43C8800759C, 0xBFE2699022ADC4C1, 8, 2.0**-48),
+        (5, 0x0000000000000001, 0x3FF0000000000000, 8, 2.0**-48),
+        (6, 0x3FF921FB54442D17, 0x4329153D9443ED0B, 16, 2.0**-46),
+        (6, 0x3FF921FB54442D19, 0xC33617A15494767A, 16, 2.0**-46),
+        (6, 0x7E37E43C8800759C, 0x3FF6BE411F37AC77, 16, 2.0**-46),
+        (6, 0x0000000000000001, 0x0000000000000001, 16, 2.0**-46),
+        (7, 0x0000000000000001, 0x0000000000000000, 0, 0.0),
+        (7, 0x8000000000000001, 0xBFF0000000000000, 0, 0.0),
+        (8, 0x0000000000000001, 0x3FF0000000000000, 0, 0.0),
+        (8, 0x8000000000000001, 0x8000000000000000, 0, 0.0),
+        (9, 0x0000000000000001, 0x0000000000000000, 0, 0.0),
+        (9, 0x8000000000000001, 0x8000000000000000, 0, 0.0),
+        (7, 0x432FFFFFFFFFFFFF, 0x432FFFFFFFFFFFFE, 0, 0.0),
+        (8, 0x432FFFFFFFFFFFFF, 0x4330000000000000, 0, 0.0),
+        (9, 0x432FFFFFFFFFFFFF, 0x432FFFFFFFFFFFFE, 0, 0.0),
+        # Exact special values and signs; -1 means exact/classification mode.
+        (0, 0x8000000000000000, 0x8000000000000000, -1, 0.0),
+        (0, 0xBFF0000000000000, 0x7FF8000000000000, -1, 0.0),
+        (0, 0x7FF0000000000000, 0x7FF0000000000000, -1, 0.0),
+        (1, 0x8000000000000000, 0x3FF0000000000000, -1, 0.0),
+        (1, 0xFFF0000000000000, 0x0000000000000000, -1, 0.0),
+        (1, 0x7FF0000000000000, 0x7FF0000000000000, -1, 0.0),
+        (2, 0x8000000000000000, 0xFFF0000000000000, -1, 0.0),
+        (2, 0xBFF0000000000000, 0x7FF8000000000000, -1, 0.0),
+        (3, 0x0000000000000000, 0xFFF0000000000000, -1, 0.0),
+        (3, 0x3FF0000000000000, 0x0000000000000000, -1, 0.0),
+        (4, 0x8000000000000000, 0x8000000000000000, -1, 0.0),
+        (4, 0x7FF0000000000000, 0x7FF8000000000000, -1, 0.0),
+        (5, 0x8000000000000000, 0x3FF0000000000000, -1, 0.0),
+        (5, 0xFFF0000000000000, 0x7FF8000000000000, -1, 0.0),
+        (6, 0x8000000000000000, 0x8000000000000000, -1, 0.0),
+        (6, 0x7FF0000000000000, 0x7FF8000000000000, -1, 0.0),
+        (7, 0x8000000000000000, 0x8000000000000000, -1, 0.0),
+        (8, 0xFFF0000000000000, 0xFFF0000000000000, -1, 0.0),
+        (9, 0x7FF0000000000000, 0x7FF0000000000000, -1, 0.0),
+        (9, 0x7FF8000000000000, 0x7FF8000000000000, -1, 0.0),
+    ]
+    source = work / "backend-native-math-policy.c"
+    executable = work / f"backend-native-math-policy{suffix}"
+    initializers = ",\n".join(
+        f"    {{{operation}U, UINT64_C(0x{input_bits:016x})}}"
+        for operation, input_bits, _, _, _ in cases
+    )
+    source.write_text(
+        """
+#include <inttypes.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct { unsigned operation; uint64_t input; } Case;
+
+static double from_bits(uint64_t bits) {
+    double value;
+    (void)memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static uint64_t to_bits(double value) {
+    uint64_t bits;
+    (void)memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static double invoke(unsigned operation, double value) {
+    switch (operation) {
+        case 0U: return sqrt(value);
+        case 1U: return exp(value);
+        case 2U: return log(value);
+        case 3U: return log10(value);
+        case 4U: return sin(value);
+        case 5U: return cos(value);
+        case 6U: return tan(value);
+        case 7U: return floor(value);
+        case 8U: return ceil(value);
+        case 9U: return trunc(value);
+        default: return value;
+    }
+}
+
+int main(void) {
+    static const Case cases[] = {
+"""
+        + initializers
+        + """
+    };
+    size_t index;
+    for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        const uint64_t result = to_bits(invoke(cases[index].operation,
+                                               from_bits(cases[index].input)));
+        if (printf("%016" PRIx64 "\\n", result) < 0) return 1;
+    }
+    return 0;
+}
+""",
+        encoding="ascii",
+    )
+    compile_c(compiler, environment, source, executable)
+    result = run([str(executable)], environment=environment)
+    outputs = normalize_newlines(result.stdout).decode("ascii").splitlines()
+    require(len(outputs) == len(cases), "backend-native math result count")
+    for output, case in zip(outputs, cases):
+        operation, input_bits, reference_bits, max_ulps, max_absolute = case
+        actual_bits = int(output, 16)
+        if (
+            actual_bits & 0x7FF0_0000_0000_0000
+            == 0x7FF0_0000_0000_0000
+            and actual_bits & 0x000F_FFFF_FFFF_FFFF
+        ):
+            actual_bits = 0x7FF8_0000_0000_0000
+        if max_ulps < 0:
+            require(
+                actual_bits == reference_bits,
+                "backend-native math exact special "
+                f"operation={operation} input={input_bits:016x} "
+                f"actual={actual_bits:016x} reference={reference_bits:016x}",
+            )
+            continue
+        actual = binary64(actual_bits)
+        reference = binary64(reference_bits)
+        same_sign = (actual_bits >> 63) == (reference_bits >> 63)
+        ulps = abs(
+            binary64_order_key(actual_bits) - binary64_order_key(reference_bits)
+        )
+        require(
+            same_sign
+            and actual == actual
+            and abs(actual) != float("inf")
+            and (
+                ulps <= max_ulps
+                or abs(actual - reference) <= max_absolute
+            ),
+            "backend-native math envelope "
+            f"operation={operation} input={input_bits:016x} "
+            f"actual={actual_bits:016x} reference={reference_bits:016x}",
+        )
+
+
 def main() -> None:
     executable = Path(
         os.environ.get(
@@ -201,6 +369,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="faraweave-c11-") as temporary:
         work = Path(temporary)
+        validate_backend_native_math_policy(compiler, environment, work, suffix)
         fixtures = [
             (
                 ROOT / "tests/fixtures/public-path-success.bennu",

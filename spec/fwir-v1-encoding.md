@@ -117,11 +117,13 @@ mandatory semantic feature and class `1` is optional advisory metadata.
 Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`,
-`4=FanOut`, and `5=ApplicationPlans`; zero is invalid. IDs 1 through 5 are
-semantic capabilities and
+`4=FanOut`, `5=ApplicationPlans`, and `7=BackendNativeMathV1`; zero is
+invalid. IDs 1 through 5 and 7 are semantic capabilities and
 MUST have class `0`: pairing a known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
 Feature 5 requires semantic minor 1 and physical format minor 1.
+Feature 7 requires semantic minor 1 but does not by itself raise the physical
+format minor.
 
 `STRS` begins with `count:u32`, followed by `count` descriptors
 `offset:u32, length:u32`, followed by one concatenated byte area. Offsets are
@@ -345,7 +347,8 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known IDs 1 through 5), tag, boolean, optional sentinel, unused
+   class `1` on known IDs 1 through 5 and 7), tag, boolean, optional sentinel,
+   unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after

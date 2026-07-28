@@ -1,10 +1,10 @@
 use faraweave::{
-    AllocationFailureInjection, EvaluationConfiguration, FwirDecodeErrorKind, FwirDecodeLimits,
-    FwirEncodeOptions, FwirProducerMetadata, Invariant, RecordKind, ResourceErrorReason,
-    ResourceEventKind, Value, VerifyError, compile_source_to_verified_program, decode_fwir,
-    emit_c_from_verified_program, encode_fwir, evaluate_source_with_arguments_and_observer,
-    evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
-    inspect_fwir,
+    AllocationFailureInjection, EvaluationConfiguration, Feature, FwirDecodeErrorKind,
+    FwirDecodeLimits, FwirEncodeOptions, FwirProducerMetadata, Invariant, RecordKind,
+    ResourceErrorReason, ResourceEventKind, Value, VerifyError, compile_source_to_verified_program,
+    decode_fwir, emit_c_from_verified_program, encode_fwir,
+    evaluate_source_with_arguments_and_observer, evaluate_verified_program_with_arguments,
+    evaluate_verified_program_with_observer, inspect_fwir,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -281,6 +281,9 @@ fn empty_with_feature(id: u16, class: u8) -> Vec<u8> {
     bytes.extend_from_slice(&id.to_le_bytes());
     bytes.push(class);
     bytes.push(0);
+    if id == Feature::BackendNativeMathV1.numeric() {
+        put_u16(&mut bytes, 82, 1);
+    }
     bytes
 }
 
@@ -1635,6 +1638,21 @@ fn same_major_optional_compatibility_and_mandatory_rejection_are_exact() {
     assert_eq!(
         encode_fwir(&advisory, &FwirEncodeOptions::default()).expect("strip advisory feature"),
         canonical
+    );
+    let math = empty_with_feature(Feature::BackendNativeMathV1.numeric(), 0);
+    let decoded = decode_fwir(&math, &FwirDecodeLimits::default())
+        .expect("known backend-native math feature");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default())
+            .expect("retain mandatory backend-native math feature"),
+        math
+    );
+    assert!(
+        decode_fwir(
+            &empty_with_feature(Feature::BackendNativeMathV1.numeric(), 1),
+            &FwirDecodeLimits::default()
+        )
+        .is_err()
     );
     assert!(decode_fwir(&empty_with_feature(1, 1), &FwirDecodeLimits::default()).is_err());
     assert!(decode_fwir(&empty_with_feature(100, 0), &FwirDecodeLimits::default()).is_err());

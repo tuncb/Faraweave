@@ -1,8 +1,8 @@
 use crate::{
-    Cardinality, ConstantIndex, ConstantRecord, Conversion, Edge, FanOutBranch, IndexRange,
-    LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, Origin, OriginIndex, OriginPosition,
-    OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex, ProgramRanges, RawProgram,
-    ReleaseAfter, Root, RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit,
+    Cardinality, ConstantIndex, ConstantRecord, Conversion, Edge, FanOutBranch, Feature,
+    IndexRange, LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, Origin, OriginIndex,
+    OriginPosition, OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex, ProgramRanges,
+    RawProgram, ReleaseAfter, Root, RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit,
     SourceUnitIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
     VerifyAllocationFailureInjection, VerifyAllocationSite, VerifyError,
 };
@@ -1203,7 +1203,8 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
         if reserved != 0 {
             return Err(record_error(features, index, 3, "reserved"));
         }
-        if id <= 5 {
+        if id <= Feature::ApplicationPlans.numeric() || id == Feature::BackendNativeMathV1.numeric()
+        {
             if class != 0 {
                 return Err(record_error(features, index, 2, "feature_class"));
             }
@@ -1722,7 +1723,9 @@ fn reconstruct_program(
     if let Some(records) = section(plan, 2) {
         for index in 0..records.record_count() {
             let id = record_u16(bytes, records, index, 0)?;
-            if id <= 5 {
+            if id <= Feature::ApplicationPlans.numeric()
+                || id == Feature::BackendNativeMathV1.numeric()
+            {
                 features.push(id);
             }
         }
@@ -2254,6 +2257,9 @@ mod tests {
         bytes.extend_from_slice(&id.to_le_bytes());
         bytes.push(class);
         bytes.push(0);
+        if id == Feature::BackendNativeMathV1.numeric() {
+            put_u16_at(&mut bytes, 82, 1);
+        }
         bytes
     }
 
@@ -2363,6 +2369,30 @@ mod tests {
             encode_fwir(&decoded, &FwirEncodeOptions::default()),
             Ok(example_bytes("empty"))
         );
+        let math = empty_with_feature(Feature::BackendNativeMathV1.numeric(), 0);
+        let decoded = match decode_fwir(&math, &FwirDecodeLimits::default()) {
+            Ok(value) => value,
+            Err(error) => panic!("backend-native math feature failed: {error:?}"),
+        };
+        assert_eq!(
+            encode_fwir(&decoded, &FwirEncodeOptions::default()),
+            Ok(math.clone())
+        );
+        let mut wrong_semantic_version = math;
+        put_u16_at(&mut wrong_semantic_version, 82, 0);
+        assert!(matches!(
+            decode_fwir(&wrong_semantic_version, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(crate::VerifyError::MalformedProgram(
+                    crate::MalformedProgram {
+                        invariant: crate::Invariant::UnsupportedVersion,
+                        field: "semantic_version",
+                        ..
+                    }
+                )),
+                ..
+            })
+        ));
         assert!(matches!(
             decode_fwir(&empty_with_feature(1, 1), &FwirDecodeLimits::default()),
             Err(FwirDecodeError {
@@ -2560,10 +2590,21 @@ mod tests {
     }
 
     fn planned_program(depth: u32, explicit_application_plans: bool) -> VerifiedProgram {
+        planned_program_with_features(depth, explicit_application_plans, false)
+    }
+
+    fn planned_program_with_features(
+        depth: u32,
+        explicit_application_plans: bool,
+        backend_native_math: bool,
+    ) -> VerifiedProgram {
         let mut builder = RawProgramBuilder::new();
         must(builder.push_feature(Feature::StableSemanticIds.numeric()));
         if explicit_application_plans {
             must(builder.push_feature(Feature::ApplicationPlans.numeric()));
+        }
+        if backend_native_math {
+            must(builder.push_feature(Feature::BackendNativeMathV1.numeric()));
         }
         let source = must(builder.push_source_unit(SourceUnit {
             diagnostic_name: "deep.fw".to_owned(),
@@ -2640,7 +2681,7 @@ mod tests {
             origin,
         }));
         let mut raw = must(builder.finish());
-        if explicit_application_plans {
+        if explicit_application_plans || backend_native_math {
             raw.module.semantic_minor = 1;
         }
         must(raw.verify())
@@ -2744,6 +2785,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn application_plans_and_backend_native_math_features_coexist_canonically() {
+        let encoded = must(encode_fwir(
+            &planned_program_with_features(1, true, true),
+            &FwirEncodeOptions::default(),
+        ));
+        assert_eq!(read_u16(&encoded, 10, None, None), Ok(1));
+        let decoded = must(decode_fwir(&encoded, &FwirDecodeLimits::default()));
+        assert_eq!(
+            decoded.as_raw().features,
+            vec![
+                Feature::StableSemanticIds.numeric(),
+                Feature::ApplicationPlans.numeric(),
+                Feature::BackendNativeMathV1.numeric(),
+            ]
+        );
+        assert!(!decoded.as_raw().features.contains(&6));
+        assert_eq!(
+            must(encode_fwir(&decoded, &FwirEncodeOptions::default())),
+            encoded
+        );
     }
 
     #[test]

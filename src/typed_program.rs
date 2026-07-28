@@ -65,6 +65,7 @@ pub enum Feature {
     PrefixSpread = 3,
     FanOut = 4,
     ApplicationPlans = 5,
+    BackendNativeMathV1 = 7,
 }
 
 impl Feature {
@@ -654,6 +655,7 @@ fn verify_program(
             Feature::PrefixSpread.numeric(),
             Feature::FanOut.numeric(),
             Feature::ApplicationPlans.numeric(),
+            Feature::BackendNativeMathV1.numeric(),
         ]
         .contains(&feature)
         {
@@ -685,6 +687,19 @@ fn verify_program(
             RecordKind::Module,
             None,
             "application_plans",
+        ));
+    }
+    if program.module.semantic_minor == 0
+        && program
+            .features
+            .binary_search(&Feature::BackendNativeMathV1.numeric())
+            .is_ok()
+    {
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "semantic_version",
         ));
     }
     verify_module_ranges(program)?;
@@ -2841,6 +2856,17 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             },
         )
     });
+    let needs_backend_native_math = program.nodes.iter().any(|node| {
+        matches!(
+            node.kind,
+            NodeKind::SelectedApply {
+                primitive_id,
+                ..
+            } if crate::semantic_registry::is_backend_native_math_primitive(
+                primitive_id
+            )
+        )
+    });
     for (required, needed, field) in [
         (Feature::StableSemanticIds, needs_ids, "stable_semantic_ids"),
         (Feature::Tuples, needs_tuples, "tuples"),
@@ -2850,6 +2876,11 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             Feature::ApplicationPlans,
             needs_application_plans,
             "application_plans",
+        ),
+        (
+            Feature::BackendNativeMathV1,
+            needs_backend_native_math,
+            "backend_native_math_v1",
         ),
     ] {
         if needed && !has_feature(program, required) {

@@ -3,7 +3,8 @@ use crate::parser::{CallSyntax, Expr, ExprKind, Program, validate_parameter_decl
 use crate::primitive::resolve_names;
 use crate::semantic_registry::{
     Conversion as RegistryConversion, OperandConsumption, ResultCardinality, SemanticDescriptor,
-    StructuralBehavior, conversion, descriptors, primitive_from_name,
+    StructuralBehavior, conversion, descriptors, is_backend_native_math_primitive,
+    primitive_from_name,
 };
 use crate::typed_program::{
     BuildError, Cardinality, ConstantRecord, Edge, FanOutBranch, Feature, IndexRange, LiftMode,
@@ -88,6 +89,7 @@ struct Lowerer {
     needs_spread: bool,
     needs_fan_out: bool,
     needs_application_plans: bool,
+    needs_backend_native_math: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
     first_shape_error: Option<Error>,
@@ -387,6 +389,7 @@ fn lower_program_with_builder_and_diagnostics(
         needs_spread: false,
         needs_fan_out: false,
         needs_application_plans: false,
+        needs_backend_native_math: false,
         placeholder: None,
         releases: Vec::new(),
         first_shape_error: None,
@@ -486,6 +489,12 @@ fn lower_program_with_builder_and_diagnostics(
             .builder
             .push_feature(Feature::ApplicationPlans.numeric())?;
         lowerer.builder.set_semantic_minor(1);
+    }
+    if lowerer.needs_backend_native_math {
+        lowerer.builder.set_semantic_minor(1);
+        lowerer
+            .builder
+            .push_feature(Feature::BackendNativeMathV1.numeric())?;
     }
     Ok(lowerer.builder.finish()?.verify()?)
 }
@@ -1407,6 +1416,8 @@ impl Lowerer {
             }
         }
         self.needs_ids = true;
+        self.needs_backend_native_math |=
+            is_backend_native_math_primitive(descriptor.primitive_id.numeric());
         Ok(Lowered {
             node,
             result_type,
