@@ -4409,7 +4409,7 @@ mod tests {
         else {
             panic!("fixture node kind changed");
         };
-        *implementation_id = 35;
+        *implementation_id = 37;
         verify_error(implementation, Invariant::InvalidSemanticIdentity);
 
         let mut application_plan = vector_apply_program();
