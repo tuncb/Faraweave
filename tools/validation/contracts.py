@@ -213,6 +213,7 @@ def validate_fwir_conformance() -> None:
         "bran.",
         "node.",
         "appl.",
+        "oprf.",
         "ownr.",
         "root.",
         "prod.",
