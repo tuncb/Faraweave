@@ -67,6 +67,7 @@ pub(crate) enum StructuralBehavior {
     VectorLength,
     VectorSort,
     VectorSum,
+    VectorAllOf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +96,7 @@ pub(crate) enum ScalarKernel {
     SortDoubleVector,
     SumIntVector,
     SumDoubleVector,
+    AllOfBoolVector,
     EqualsBool,
     EqualsInt,
     EqualsDouble,
@@ -161,10 +163,10 @@ enum RegistryValidationError {
     InconsistentApplicationPlanIdentity,
 }
 
-const PRIMITIVE_COUNT: u16 = 23;
-const SIGNATURE_COUNT: u16 = 44;
-const IMPLEMENTATION_COUNT: u16 = 44;
-const APPLICATION_PLAN_COUNT: u16 = 5;
+const PRIMITIVE_COUNT: u16 = 24;
+const SIGNATURE_COUNT: u16 = 45;
+const IMPLEMENTATION_COUNT: u16 = 45;
+const APPLICATION_PLAN_COUNT: u16 = 6;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
     OperandDescriptor {
@@ -233,12 +235,21 @@ const SUM_PLAN: ApplicationPlan = ApplicationPlan {
     },
 };
 
+const ALL_OF_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(6),
+    result_cardinality: ResultCardinality::Scalar,
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::OperandCardinality(1),
+    },
+};
+
 const APPLICATION_PLANS: &[ApplicationPlan] = &[
     ELEMENTWISE_PLAN,
     IOTA_PLAN,
     LENGTH_PLAN,
     SORT_PLAN,
     SUM_PLAN,
+    ALL_OF_PLAN,
 ];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
@@ -742,6 +753,17 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         SUM_PLAN,
         SumDoubleVector
     ),
+    descriptor!(
+        24,
+        "all_of",
+        45,
+        45,
+        WHOLE_BOOL1,
+        Bool,
+        VectorAllOf,
+        ALL_OF_PLAN,
+        AllOfBoolVector
+    ),
 ];
 
 impl PrimitiveId {
@@ -1076,6 +1098,7 @@ mod tests {
             (22, "sort"),
             (23, "sum"),
             (23, "sum"),
+            (24, "all_of"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1096,6 +1119,7 @@ mod tests {
         assert_eq!(primitive_from_name("length"), primitive_from_numeric(21));
         assert_eq!(primitive_from_name("sort"), primitive_from_numeric(22));
         assert_eq!(primitive_from_name("sum"), primitive_from_numeric(23));
+        assert_eq!(primitive_from_name("all_of"), primitive_from_numeric(24));
         assert_eq!(
             signature_from_numeric(36).map(|descriptor| descriptor.primitive_name),
             Ok("div")
@@ -1129,6 +1153,14 @@ mod tests {
             Ok(ScalarKernel::SumDoubleVector)
         );
         assert_eq!(
+            signature_from_numeric(45).map(|descriptor| descriptor.primitive_name),
+            Ok("all_of")
+        );
+        assert_eq!(
+            implementation_from_numeric(45).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::AllOfBoolVector)
+        );
+        assert_eq!(
             implementation_from_numeric(34).map(|descriptor| descriptor.kernel),
             Ok(ScalarKernel::IotaInt)
         );
@@ -1137,6 +1169,7 @@ mod tests {
         assert_eq!(application_plan_from_numeric(3), Ok(LENGTH_PLAN));
         assert_eq!(application_plan_from_numeric(4), Ok(SORT_PLAN));
         assert_eq!(application_plan_from_numeric(5), Ok(SUM_PLAN));
+        assert_eq!(application_plan_from_numeric(6), Ok(ALL_OF_PLAN));
         assert!(
             SEMANTIC_REGISTRY
                 .iter()
@@ -1158,6 +1191,16 @@ mod tests {
                         && descriptor.parameters.len() == 1
                         && descriptor.result == descriptor.parameters[0].element_type
                         && descriptor.parameters[0].consumption == OperandConsumption::WholeVector
+                })
+        );
+        assert!(
+            SEMANTIC_REGISTRY
+                .iter()
+                .filter(|descriptor| descriptor.behavior == StructuralBehavior::VectorAllOf)
+                .all(|descriptor| {
+                    descriptor.application_plan == ALL_OF_PLAN
+                        && descriptor.parameters == WHOLE_BOOL1
+                        && descriptor.result == ScalarType::Bool
                 })
         );
         assert!(
@@ -1191,15 +1234,15 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(45),
+            signature_from_numeric(46),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(45),
+            implementation_from_numeric(46),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
-            application_plan_from_numeric(6),
+            application_plan_from_numeric(7),
             Err(RegistryLookupError::ApplicationPlanId)
         );
     }
@@ -1393,6 +1436,7 @@ mod tests {
                     LENGTH_PLAN,
                     SORT_PLAN,
                     SUM_PLAN,
+                    ALL_OF_PLAN,
                     IOTA_PLAN,
                 ],
             ),

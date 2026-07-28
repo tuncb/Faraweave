@@ -22,6 +22,7 @@ structural tuples. The public primitives are:
 | Container query | `length` |
 | Container transform | `sort` |
 | Numeric reduction | `sum` |
+| Boolean reduction | `all_of` |
 
 Calls use adjacent brackets (`sub[10 2.5]`) or right-associative prefix syntax
 (`inc iota 3`). Vectors use parentheses: `(1 2 3)`, `(false true)`,
@@ -59,6 +60,11 @@ NaN after positive infinity, while semantic work is exactly the input length.
 zero. Int addition is checked at every element; Double addition uses the
 strict binary64 arithmetic contract without reassociation, and the complete
 input length is charged as work before reduction.
+
+`all_of` accepts a Bool vector and returns true exactly when every element is
+true, including the empty-vector identity. Implementations may stop inspecting
+after the first false element, but they charge the complete input length before
+inspection so work limits and resource observers cannot reveal its position.
 
 The accepted [architecture](doc/architecture.md) and
 [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md) define
@@ -225,8 +231,9 @@ Anka is inspiration, not a compatibility target. Faraweave keeps explicit
 bracket calls, checked Int64 arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit
-currying, functions, effects, reductions other than `sum`, multidimensional
-arrays, or container-wide operations other than `length`, `sort`, and `sum`.
+currying, functions, effects, reductions other than `sum` and `all_of`,
+multidimensional arrays, or container-wide operations other than `length`,
+`sort`, `sum`, and `all_of`.
 
 Rust enums and vectors replace C++ tagged/plain records at the public boundary.
 Ordinary syntax remains visibly separated by parse, resolution, analysis, and

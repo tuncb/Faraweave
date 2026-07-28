@@ -505,6 +505,74 @@ fn sum_double_is_left_to_right_strict_and_preserves_special_value_bits() {
 }
 
 #[test]
+fn all_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_false_position() {
+    assert_eq!(formatted("all_of[Bool()]"), "true");
+    assert_eq!(formatted("all_of[(true true true true)]"), "true");
+    for source in [
+        "all_of[(false true true true)]",
+        "all_of[(true false true true)]",
+        "all_of[(true true false true)]",
+        "all_of[(true true true false)]",
+    ] {
+        assert_eq!(formatted(source), "false", "{source}");
+    }
+
+    for (count, expected) in [(0, true), (1, true), (6, true)] {
+        let result = faraweave::evaluate_source_with_arguments(
+            "parameters[n Int]\nall_of equals[iota n iota n]\n",
+            &[Value::Int(count)],
+            EvaluationConfiguration::default(),
+        )
+        .expect("dynamic parameterized all_of");
+        assert_eq!(result.values, [Value::Bool(expected)], "count {count}");
+    }
+    let dynamic_false = faraweave::evaluate_source_with_arguments(
+        "parameters[n Int]\nall_of equals[iota n (1 0 3)]\n",
+        &[Value::Int(3)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("dynamic false all_of");
+    assert_eq!(dynamic_false.values, [Value::Bool(false)]);
+}
+
+#[test]
+fn all_of_rejects_non_bool_vectors_scalars_and_tuples_statically() {
+    for (source, actual_type) in [
+        ("all_of[true]", Type::Scalar(ScalarType::Bool)),
+        ("all_of[(1 2)]", Type::Vector(ScalarType::Int)),
+        ("all_of[(1.0 2.0)]", Type::Vector(ScalarType::Double)),
+        (
+            "all_of[[true false]]",
+            Type::Tuple(vec![
+                Type::Scalar(ScalarType::Bool),
+                Type::Scalar(ScalarType::Bool),
+            ]),
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("all_of"), "{source}");
+        assert_eq!(error.argument_position, Some(1), "{source}");
+        assert_eq!(
+            error.location,
+            SourceLocation {
+                offset: 8,
+                line: 1,
+                column: 8,
+            },
+            "{source}"
+        );
+        assert_eq!(
+            error.message,
+            "all_of arguments do not match an accepted signature; first unsupported argument is 1",
+            "{source}"
+        );
+        assert_eq!(error.actual_types, [actual_type], "{source}");
+        assert!(error.expected_types.is_empty(), "{source}");
+    }
+}
+
+#[test]
 fn issue54_predicates_ordering_and_nan_contracts() {
     assert_eq!(formatted("odd[-9223372036854775807]"), "true");
     assert_eq!(formatted("even[-9223372036854775808]"), "true");
