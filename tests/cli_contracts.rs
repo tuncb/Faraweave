@@ -379,10 +379,7 @@ fn cli_repl_history_is_process_local_and_clear_remains_unsupported() {
 fn cli_repl_history_records_cls_before_meta_command_dispatch() {
     let result = repl_output(b".cls\r\n.history\n.exit\ninc 5\n");
     assert!(result.status.success());
-    assert_eq!(
-        result.stdout,
-        b"> > 1\t.cls\n2\t.history\n> "
-    );
+    assert_eq!(result.stdout, b"> > 1\t.cls\n2\t.history\n> ");
     assert!(result.stderr.is_empty());
 }
 
