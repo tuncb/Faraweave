@@ -364,8 +364,12 @@ not part of the artifact.
   one `MODL` section with semantic version 1.0 and no parameter-header origin.
 - [Scalar `true` program](examples/fwir-v1-scalar-true.hex) is exactly 422
   bytes: source name `example.fw`, one source unit, Bool type, Bool constant
-  with payload 1, one origin spanning bytes 0 through 4 at line 1 columns 1
-  through 5, one Constant node, one root release, and one root.
+  with payload 1, one one-based origin spanning bytes 1 through 5 at line 1
+  columns 1 through 5, one Constant node, one root release, and one root.
+- [Complete encoder surface](examples/fwir-v1-complete.hex) is a 4,413-byte
+  golden produced from one verified source program covering all 16 semantic
+  sections, all six node opcodes, every graph sidecar, sorted strings, and
+  exact binary64 payload bits.
 
 Run:
 

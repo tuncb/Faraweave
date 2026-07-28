@@ -4,6 +4,7 @@
 mod c_emitter;
 mod error;
 mod evaluator;
+mod fwir_encoder;
 mod interpreter;
 mod lowering;
 mod native_builder;
@@ -26,6 +27,11 @@ pub use evaluator::{
     evaluate_expression, evaluate_expression_with_configuration, evaluate_expression_with_observer,
     evaluate_runner_source, evaluate_source, evaluate_source_with_arguments,
     evaluate_source_with_arguments_and_observer, evaluate_source_with_configuration,
+};
+pub use fwir_encoder::{
+    FwirEncodeAllocationFailureInjection, FwirEncodeAllocationSite, FwirEncodeError,
+    FwirEncodeOptions, FwirOutputOperation, FwirProducerMetadata, encode_fwir,
+    encode_fwir_with_allocation_failure, encode_fwir_with_atomic_publication, write_fwir,
 };
 pub use interpreter::{evaluate_verified_program, evaluate_verified_program_with_observer};
 pub use native_builder::{
