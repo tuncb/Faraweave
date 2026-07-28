@@ -108,6 +108,20 @@ fn public_source_artifact_execution_c_and_resource_traces_are_differential() {
 }
 
 #[test]
+fn line_comments_preserve_source_length_and_lower_to_c() {
+    let source = "# prologue 🦀\r\ninc[# argument\n1]# eof";
+    let program =
+        compile_source_to_verified_program(source, "comments.faraweave").expect("compile comments");
+    assert_eq!(
+        program.as_raw().source_units[0].byte_length,
+        u32::try_from(source.len()).expect("fixture length")
+    );
+    let emitted =
+        emit_c_from_verified_program(&program, EvaluationConfiguration::default()).expect("emit C");
+    assert!(emitted.source.contains("Strict C11"));
+}
+
+#[test]
 fn public_compile_errors_and_argument_errors_preserve_phase_and_provenance() {
     let invalid =
         compile_source_to_fwir("inc[", &FwirEncodeOptions::default()).expect_err("invalid source");
