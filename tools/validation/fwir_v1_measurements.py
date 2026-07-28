@@ -90,10 +90,10 @@ def scalar_true_program(root_count: int = 1) -> dict:
     program["origins"] = [
         {
             "source_unit": 0,
-            "begin_offset": 0,
+            "begin_offset": 1,
             "begin_line": 1,
             "begin_column": 1,
-            "end_offset": 4,
+            "end_offset": 5,
             "end_line": 1,
             "end_column": 5,
         }
