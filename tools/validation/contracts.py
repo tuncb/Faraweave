@@ -32,6 +32,7 @@ def static_contracts() -> None:
     main = (ROOT / ".github/workflows/main.yml").read_text()
     validate_main_workflow(main)
     validate_release_workflows()
+    validate_fwir_conformance()
 
 
 def validate_main_workflow(main: str) -> None:
@@ -116,6 +117,113 @@ def validate_release_workflows() -> None:
         "publish.sh",
     ]:
         require(needle in future, f"future release missing {needle}")
+
+
+def fnv1a64(data: bytes) -> int:
+    value = 0xCBF29CE484222325
+    for byte in data:
+        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def validate_fwir_conformance() -> None:
+    corpus_path = ROOT / "tests/fixtures/fwir-v1-corpus.tsv"
+    traceability_path = ROOT / "tests/fixtures/fwir-v1-conformance.tsv"
+    corpus_rows = [
+        line.split("\t")
+        for line in corpus_path.read_text(encoding="utf-8").splitlines()[1:]
+        if line
+    ]
+    require(len(corpus_rows) == 3, "FWIR canonical corpus inventory")
+    require(
+        {row[0] for row in corpus_rows} == {"empty", "scalar-true", "complete"},
+        "FWIR canonical corpus names",
+    )
+    for row in corpus_rows:
+        require(len(row) == 5, f"FWIR corpus row width: {row!r}")
+        name, relative, length, digest, surfaces = row
+        require(
+            relative == f"spec/examples/fwir-v1-{name}.hex",
+            f"FWIR corpus path: {name}",
+        )
+        hex_text = (ROOT / relative).read_text(encoding="ascii")
+        artifact = bytes.fromhex(hex_text)
+        require(len(artifact) == int(length), f"FWIR corpus length: {name}")
+        require(f"{fnv1a64(artifact):016x}" == digest, f"FWIR corpus hash: {name}")
+        require(
+            artifact.startswith(b"FWIR\r\n\x1a\n"),
+            f"FWIR corpus magic: {name}",
+        )
+        require(
+            b"\\" not in artifact and not any(
+                window[4] == ord("-")
+                and window[7] == ord("-")
+                and window[10] == ord("T")
+                for window in (
+                    artifact[index : index + 19]
+                    for index in range(max(0, len(artifact) - 18))
+                )
+            ),
+            f"FWIR corpus host metadata: {name}",
+        )
+        required_surfaces = {
+            "decode",
+            "reencode",
+            "inspect",
+            "interpret",
+            "emit-c",
+            "native",
+        }
+        require(
+            required_surfaces <= set(surfaces.split(",")),
+            f"FWIR corpus surfaces: {name}",
+        )
+
+    traceability_rows = [
+        line.split("\t")
+        for line in traceability_path.read_text(encoding="utf-8").splitlines()[1:]
+        if line
+    ]
+    require(len(traceability_rows) >= 100, "FWIR conformance traceability count")
+    require(
+        all(len(row) == 3 and all(row) for row in traceability_rows),
+        "FWIR conformance traceability row",
+    )
+    requirements = [row[0] for row in traceability_rows]
+    require(
+        len(requirements) == len(set(requirements)),
+        "FWIR conformance traceability duplicate",
+    )
+    for prefix in (
+        "header.",
+        "directory.",
+        "modl.",
+        "feat.",
+        "strs.",
+        "srcu.",
+        "parm.",
+        "type.",
+        "tyel.",
+        "cons.",
+        "coel.",
+        "orig.",
+        "edge.",
+        "shck.",
+        "bran.",
+        "node.",
+        "ownr.",
+        "root.",
+        "prod.",
+        "compat.",
+        "limits.",
+        "decoder.",
+        "canonical.",
+        "surfaces.",
+    ):
+        require(
+            any(requirement.startswith(prefix) for requirement in requirements),
+            f"FWIR conformance traceability family: {prefix}",
+        )
 
 def package(target: str) -> None:
     require(target in {"linux-x64", "windows-x64", "macos-arm64"}, "unknown target")
