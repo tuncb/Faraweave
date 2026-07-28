@@ -376,6 +376,17 @@ fn cli_repl_history_is_process_local_and_clear_remains_unsupported() {
 }
 
 #[test]
+fn cli_repl_history_records_cls_before_meta_command_dispatch() {
+    let result = repl_output(b".cls\r\n.history\n.exit\ninc 5\n");
+    assert!(result.status.success());
+    assert_eq!(
+        result.stdout,
+        b"> > 1\t.cls\n2\t.history\n> "
+    );
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
 fn cli_repl_history_discards_oversized_input_and_recovers() {
     let mut transcript = vec![b'1'; 65_537];
     transcript.extend_from_slice(b"\n.history\n");
@@ -386,6 +397,47 @@ fn cli_repl_history_discards_oversized_input_and_recovers() {
         result.stderr,
         b"error: REPL input exceeds 65536 retained bytes\n"
     );
+}
+
+#[test]
+fn cli_repl_cls_is_crlf_exact_non_evaluating_and_redirect_safe() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut input = child.stdin.take().expect("REPL stdin");
+    input
+        .write_all(b".cls\r\ninc 5\n")
+        .expect("REPL .cls transcript");
+    drop(input);
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > 6\n> ");
+    assert!(!result.stdout.contains(&0x1b));
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
+fn cli_repl_cls_and_exit_commands_compose_without_evaluation() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut input = child.stdin.take().expect("REPL stdin");
+    input
+        .write_all(b".cls\r\n.exit\ninc 5\n")
+        .expect("REPL meta-command transcript");
+    drop(input);
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > ");
+    assert!(result.stderr.is_empty());
 }
 
 #[test]
