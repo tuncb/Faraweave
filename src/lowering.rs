@@ -7,9 +7,10 @@ use crate::semantic_registry::{
 };
 use crate::typed_program::{
     BuildError, Cardinality, ConstantRecord, Edge, FanOutBranch, Feature, IndexRange, LiftMode,
-    Node, NodeIndex, NodeKind, Origin, OriginIndex, OriginPosition, OriginSpan, Ownership,
-    OwnershipMode, Parameter, RawProgramBuilder, ReleaseAfter, Root, RootIndex, ScalarConstant,
-    ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram, VerifyError,
+    Node, NodeIndex, NodeKind, OperationReference, Origin, OriginIndex, OriginPosition, OriginSpan,
+    Ownership, OwnershipMode, Parameter, RawProgramBuilder, ReleaseAfter, Root, RootIndex,
+    ScalarConstant, ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
+    VerifyError,
 };
 use crate::{Error, ErrorKind, ScalarType, SourceLocation, SourceSpan, Type, Value};
 use std::fmt::Write as _;
@@ -94,7 +95,7 @@ struct Lowerer {
 }
 
 #[derive(Default)]
-struct DiagnosticReservations {
+pub(crate) struct DiagnosticReservations {
     refuse_next: bool,
 }
 
@@ -158,6 +159,7 @@ pub(crate) fn compile_parsed_source_with_name(
     program: &Program,
 ) -> Result<VerifiedProgram, CompileError> {
     validate_parameter_declarations(program)?;
+    validate_operation_reference_positions(program)?;
     resolve_names(program)?;
     validate_program_arities(program)?;
     lower_program(source, diagnostic_name, program)
@@ -167,6 +169,78 @@ pub(crate) fn compile_parsed_source_with_name(
 enum StructuralValue {
     NonTuple,
     Tuple(usize),
+}
+
+fn validate_operation_reference_positions(program: &Program) -> Result<(), LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(program.roots.len()).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.extend(program.roots.iter().rev().map(|root| (root, false)));
+    while let Some((expression, accepted)) = pending.pop() {
+        match &expression.kind {
+            ExprKind::OperationReference { .. } if accepted => {}
+            ExprKind::OperationReference { name, name_span } => {
+                let mut error = Error::at_span(
+                    ErrorKind::SyntaxError,
+                    *name_span,
+                    "built-in operation reference is not accepted in this position",
+                );
+                error.primitive = Some(try_clone_string(name, crate::Arena::OperationReference)?);
+                return Err(LowerError::Source(error));
+            }
+            ExprKind::Call {
+                name, arguments, ..
+            } => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                for (index, argument) in arguments.iter().enumerate().rev() {
+                    pending.push((argument, operation_reference_position(name, index)));
+                }
+            }
+            ExprKind::Tuple(elements) => {
+                pending.try_reserve(elements.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(elements.iter().rev().map(|element| (element, false)));
+            }
+            ExprKind::Fanout { operand, branches } => {
+                let additional = branches.len().checked_add(1).ok_or(LowerError::Build(
+                    BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    },
+                ))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(branches.iter().rev().map(|branch| (branch, false)));
+                pending.push((operand, false));
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Vector(_, _)
+            | ExprKind::DeepTuple { .. }
+            | ExprKind::UnaryChain { .. }
+            | ExprKind::Parameter(_)
+            | ExprKind::UnresolvedName { .. }
+            | ExprKind::Placeholder => {}
+        }
+    }
+    Ok(())
+}
+
+fn operation_reference_position(_consumer: &str, _zero_based_argument: usize) -> bool {
+    // Issue #38 introduces the carrier and resolver but no executable
+    // higher-order consumer. Future consumers extend this closed position map.
+    false
 }
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
@@ -235,6 +309,7 @@ fn validate_expr_arities(
         | ExprKind::Vector(_, _)
         | ExprKind::DeepTuple { .. }
         | ExprKind::Parameter(_)
+        | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => Ok(StructuralValue::NonTuple),
     }
 }
@@ -1656,6 +1731,160 @@ fn select_descriptor(
     Ok(selected)
 }
 
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct OperationReferenceConstraint<'a> {
+    pub parameter_types: &'a [Option<ScalarType>],
+    pub result_type: Option<ScalarType>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_operation_reference(
+    name: &str,
+    name_span: SourceSpan,
+    origin: OriginIndex,
+    constraint: OperationReferenceConstraint<'_>,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<OperationReference, CompileError> {
+    let primitive = match primitive_from_name(name) {
+        Ok(primitive) => primitive,
+        Err(_) => {
+            return Err(LowerError::Source(operation_reference_diagnostic(
+                name,
+                name_span,
+                "is not a registered built-in operation",
+                ErrorKind::UnknownPrimitive,
+                diagnostics,
+            )?));
+        }
+    };
+    let mut has_matching_arity = false;
+    let mut has_elementwise = false;
+    let mut minimum_cost = None;
+    let mut selected = None;
+    let mut ambiguous = false;
+    for descriptor in descriptors(primitive)
+        .filter(|descriptor| descriptor.parameters.len() == constraint.parameter_types.len())
+    {
+        has_matching_arity = true;
+        if descriptor.behavior != StructuralBehavior::Elementwise {
+            continue;
+        }
+        has_elementwise = true;
+        if constraint
+            .result_type
+            .is_some_and(|result| descriptor.result != result)
+        {
+            continue;
+        }
+        let mut cost = 0_u32;
+        let mut compatible = true;
+        for (actual, accepted) in constraint
+            .parameter_types
+            .iter()
+            .copied()
+            .zip(descriptor.parameters.iter().copied())
+        {
+            let Some(actual) = actual else {
+                continue;
+            };
+            match conversion(actual, accepted) {
+                Some(RegistryConversion::Identity) => {}
+                Some(RegistryConversion::PromoteIntToDouble) => cost += 1,
+                None => {
+                    compatible = false;
+                    break;
+                }
+            }
+        }
+        if !compatible {
+            continue;
+        }
+        match minimum_cost {
+            None => {
+                minimum_cost = Some(cost);
+                selected = Some(descriptor);
+                ambiguous = false;
+            }
+            Some(current) if cost < current => {
+                minimum_cost = Some(cost);
+                selected = Some(descriptor);
+                ambiguous = false;
+            }
+            Some(current) if cost == current => ambiguous = true,
+            Some(_) => {}
+        }
+    }
+    if !has_matching_arity {
+        return Err(LowerError::Source(operation_reference_diagnostic(
+            name,
+            name_span,
+            "referenced operation has incompatible arity",
+            ErrorKind::ArityError,
+            diagnostics,
+        )?));
+    }
+    if !has_elementwise {
+        return Err(LowerError::Source(operation_reference_diagnostic(
+            name,
+            name_span,
+            "referenced operation has unsupported structural behavior",
+            ErrorKind::TypeError,
+            diagnostics,
+        )?));
+    }
+    if ambiguous {
+        return Err(LowerError::Source(operation_reference_diagnostic(
+            name,
+            name_span,
+            "referenced operation overload is ambiguous",
+            ErrorKind::TypeError,
+            diagnostics,
+        )?));
+    }
+    let Some(descriptor) = selected else {
+        return Err(LowerError::Source(operation_reference_diagnostic(
+            name,
+            name_span,
+            "referenced operation has no compatible signature",
+            ErrorKind::TypeError,
+            diagnostics,
+        )?));
+    };
+    Ok(OperationReference {
+        primitive_id: descriptor.primitive_id.numeric(),
+        signature_id: descriptor.signature_id.numeric(),
+        implementation_id: descriptor.implementation_id.numeric(),
+        origin,
+    })
+}
+
+fn operation_reference_diagnostic(
+    name: &str,
+    name_span: SourceSpan,
+    reason: &str,
+    kind: ErrorKind,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<Error, LowerError> {
+    let capacity = name
+        .len()
+        .checked_add(reason.len())
+        .and_then(|length| length.checked_add(8))
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::OperationReference,
+        }))?;
+    let mut message = String::new();
+    diagnostics.try_reserve(&mut message, capacity, crate::Arena::OperationReference)?;
+    write!(&mut message, "@{name} {reason}").map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::OperationReference,
+        })
+    })?;
+    let mut error = Error::at_span(kind, name_span, message);
+    error.primitive = Some(try_clone_string(name, crate::Arena::OperationReference)?);
+    Ok(error)
+}
+
 fn scalar_element(value_type: &Type) -> Option<ScalarType> {
     match value_type {
         Type::Scalar(scalar) | Type::Vector(scalar) => Some(*scalar),
@@ -1739,6 +1968,7 @@ fn placeholder_span(expression: &Expr) -> Option<SourceSpan> {
         | ExprKind::DeepTuple { .. }
         | ExprKind::UnaryChain { .. }
         | ExprKind::Parameter(_)
+        | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => None,
     }
 }
@@ -1841,6 +2071,176 @@ mod tests {
         let explicit = must_compile("parameters[]\n");
         assert!(explicit.as_raw().parameters.is_empty());
         assert!(explicit.module().parameter_header_origin.is_some());
+    }
+
+    #[test]
+    fn operation_references_are_rejected_outside_registered_consumer_positions() {
+        for (source, offset) in [("@add\n", 2), ("add[@add 1]\n", 6)] {
+            let error = must_source_error(source);
+            assert_eq!(error.kind, ErrorKind::SyntaxError, "{source}");
+            assert_eq!(error.location.offset, offset, "{source}");
+            assert_eq!(
+                error.message,
+                "built-in operation reference is not accepted in this position"
+            );
+            assert_eq!(error.primitive.as_deref(), Some("add"));
+        }
+
+        let mut deep = String::new();
+        deep.try_reserve_exact(24_576).expect("test source reserve");
+        for _ in 0..4_096 {
+            deep.push_str("1\n");
+        }
+        deep.push_str("@add\n");
+        let error = must_source_error(&deep);
+        assert_eq!(error.kind, ErrorKind::SyntaxError);
+        assert_eq!(error.location.line, 4_097);
+    }
+
+    #[test]
+    fn constrained_operation_reference_resolution_is_stable_and_closed() {
+        let span = SourceSpan {
+            begin: SourceLocation {
+                offset: 2,
+                line: 1,
+                column: 2,
+            },
+            end: SourceLocation {
+                offset: 5,
+                line: 1,
+                column: 5,
+            },
+        };
+        let mut diagnostics = DiagnosticReservations::default();
+        let selected = resolve_operation_reference(
+            "add",
+            span,
+            OriginIndex(7),
+            OperationReferenceConstraint {
+                parameter_types: &[Some(ScalarType::Int), Some(ScalarType::Int)],
+                result_type: Some(ScalarType::Int),
+            },
+            &mut diagnostics,
+        )
+        .expect("constrained reference");
+        assert_eq!(
+            selected,
+            OperationReference {
+                primitive_id: 5,
+                signature_id: 9,
+                implementation_id: 9,
+                origin: OriginIndex(7),
+            }
+        );
+
+        let promoted = resolve_operation_reference(
+            "add",
+            span,
+            OriginIndex(8),
+            OperationReferenceConstraint {
+                parameter_types: &[Some(ScalarType::Int), Some(ScalarType::Double)],
+                result_type: Some(ScalarType::Double),
+            },
+            &mut diagnostics,
+        )
+        .expect("promoted reference");
+        assert_eq!(
+            (
+                promoted.primitive_id,
+                promoted.signature_id,
+                promoted.implementation_id,
+            ),
+            (5, 10, 10)
+        );
+
+        for (name, parameters, result, message) in [
+            (
+                "add",
+                &[None, None][..],
+                None,
+                "@add referenced operation overload is ambiguous",
+            ),
+            (
+                "iota",
+                &[Some(ScalarType::Int)][..],
+                Some(ScalarType::Int),
+                "@iota referenced operation has unsupported structural behavior",
+            ),
+            (
+                "not",
+                &[Some(ScalarType::Bool), Some(ScalarType::Bool)][..],
+                Some(ScalarType::Bool),
+                "@not referenced operation has incompatible arity",
+            ),
+            (
+                "add",
+                &[Some(ScalarType::Bool), Some(ScalarType::Bool)][..],
+                Some(ScalarType::Bool),
+                "@add referenced operation has no compatible signature",
+            ),
+        ] {
+            let error = resolve_operation_reference(
+                name,
+                span,
+                OriginIndex(0),
+                OperationReferenceConstraint {
+                    parameter_types: parameters,
+                    result_type: result,
+                },
+                &mut diagnostics,
+            )
+            .expect_err(name);
+            let CompileError::Source(error) = error else {
+                panic!("expected source error for {name}");
+            };
+            assert_eq!(error.message, message);
+        }
+        let unknown = resolve_operation_reference(
+            "missing",
+            span,
+            OriginIndex(0),
+            OperationReferenceConstraint {
+                parameter_types: &[],
+                result_type: None,
+            },
+            &mut diagnostics,
+        )
+        .expect_err("unknown reference");
+        assert!(matches!(
+            unknown,
+            CompileError::Source(Error {
+                kind: ErrorKind::UnknownPrimitive,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn operation_reference_diagnostic_allocation_refusal_is_explicit() {
+        let span = SourceSpan {
+            begin: SourceLocation::start(),
+            end: SourceLocation {
+                offset: 4,
+                line: 1,
+                column: 4,
+            },
+        };
+        let result = resolve_operation_reference(
+            "add",
+            span,
+            OriginIndex(0),
+            OperationReferenceConstraint {
+                parameter_types: &[None, None],
+                result_type: None,
+            },
+            &mut DiagnosticReservations { refuse_next: true },
+        );
+        assert!(matches!(
+            result,
+            Err(CompileError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::OperationReference,
+            }))
+        ));
     }
 
     #[test]
@@ -2287,7 +2687,7 @@ mod tests {
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 16_420_725_918_700_611_398);
+        assert_eq!(debug_digest(&matrix), 14_424_161_000_485_755_386);
 
         let depth = 256;
         let mut deep = String::new();
@@ -2301,7 +2701,7 @@ mod tests {
         }
         assert_eq!(
             debug_digest(&must_compile(&deep)),
-            17_055_416_865_788_300_019
+            13_509_599_112_709_267_319
         );
 
         let mut unary = String::new();
@@ -2312,7 +2712,7 @@ mod tests {
         unary.push('1');
         assert_eq!(
             debug_digest(&must_compile(&unary)),
-            16_033_402_538_388_638_440
+            3_417_619_594_787_678_344
         );
     }
 

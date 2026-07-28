@@ -96,7 +96,11 @@ its specified record size. A known section appears at most once.
 | 14 | `NODE` | `3` | 56 | executable nodes |
 | 15 | `OWNR` | `3` | 12 | logical ownership and release |
 | 16 | `ROOT` | `3` | 8 | ordered program roots |
+| 18 | `OPRF` | `3` | 16 | stable built-in operation references |
 | 32769 | `PROD` | `0` | 0 | optional producer metadata |
+
+Section ID 17 is allocated to issue #36's application-plan records and is not
+defined or accepted by issue #38 in isolation.
 
 Every fixed-record section contains only consecutive records; its record count
 is `payload_length / record_size`.
@@ -115,9 +119,10 @@ A `FEAT` record is `id:u16`, `class:u8`, `reserved:u8`. Class `0` is a
 mandatory semantic feature and class `1` is optional advisory metadata.
 Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
-Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`, and
-`4=FanOut`; zero is invalid. IDs 1 through 4 are semantic capabilities and
-MUST have class `0`: pairing a known current ID with class `1` is a
+Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`,
+`4=FanOut`, and `6=OperationReferences`; ID 5 is allocated to issue #36 and
+zero is invalid. Known semantic capabilities MUST have class `0`: pairing a
+known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
 
 `STRS` begins with `count:u32`, followed by `count` descriptors
@@ -206,6 +211,12 @@ outside SelectedApply.
 Release kind is `1=Node` or `2=Root`. `ROOT` is
 `node:u32, origin:u32`.
 
+`OPRF` is `primitive_id:u16, signature_id:u16, implementation_id:u16,
+reserved:u16, origin:u32, reserved:u32`. Both reserved fields are zero.
+Verification requires the three IDs to identify one closed registered
+elementwise descriptor and requires `origin` to be in range; inconsistent or
+structural identities are malformed rather than runtime-dispatched by name.
+
 ### 4.6 Producer metadata
 
 `PROD` is advisory and excluded from program identity. Its payload is
@@ -233,6 +244,7 @@ asserts provenance but conveys no trust.
 | `nodes`, including every variant field | `NODE` |
 | `edges`, `shape_checks` | `EDGE`, `SHCK` |
 | `origins` | `ORIG` |
+| `operation_references` | `OPRF` |
 | `branches` | `BRAN` |
 | `ownership` | `OWNR` |
 | `roots` | `ROOT` |
@@ -275,6 +287,10 @@ The physical format version and semantic contract version are separate.
 - The decoded `MODL` semantic version is passed unchanged to semantic
   verification. The current semantic verifier accepts major `1` and a minor
   no greater than its supported minor.
+- `OPRF` records or feature `6=OperationReferences` require semantic version
+  1.1. Semantic 1.0 artifacts cannot opt into that mandatory capability;
+  semantic 1.1 without `OPRF` remains valid when every declared feature is
+  understood.
 - A lower format minor is accepted when the major matches and every required
   v1 section/record rule used by the artifact is supported.
 
@@ -327,7 +343,7 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known IDs 1 through 4), tag, boolean, optional sentinel, unused
+   class `1` on known semantic IDs), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after
@@ -366,10 +382,12 @@ not part of the artifact.
   bytes: source name `example.fw`, one source unit, Bool type, Bool constant
   with payload 1, one one-based origin spanning bytes 1 through 5 at line 1
   columns 1 through 5, one Constant node, one root release, and one root.
-- [Complete encoder surface](examples/fwir-v1-complete.hex) is a 4,413-byte
-  golden produced from one verified source program covering all 16 semantic
-  sections, all six node opcodes, every graph sidecar, sorted strings, and
-  exact binary64 payload bits.
+- [Semantic 1.0 encoder surface](examples/fwir-v1-complete.hex) is a
+  4,413-byte golden produced from one verified source program covering all 16
+  semantic-1.0 sections, all six node opcodes, every graph sidecar, sorted
+  strings, and exact binary64 payload bits. Operation-reference section 18 is
+  covered by constructed semantic-1.1 codec tests because no source consumer
+  exists in issue #38.
 
 Run:
 
@@ -438,7 +456,7 @@ issue rather than treating this comparison as authorization.
 
 ## 12. Accepted product, producer, and security policy
 
-Physical format 1.0, semantic contract 1.0, canonical program-identity bytes,
+Physical format 1.0, semantic contracts 1.0 and 1.1, canonical program-identity bytes,
 the `.fwir` extension, and the library and CLI spellings above are the stable
 FWIR v1 product contract. A compatible addition uses the same-major
 forward-minor and explicitly optional advisory mechanisms in section 7;

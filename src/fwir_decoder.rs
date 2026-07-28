@@ -1,8 +1,8 @@
 use crate::{
     Cardinality, ConstantIndex, ConstantRecord, Conversion, Edge, FanOutBranch, IndexRange,
-    LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, Origin, OriginIndex, OriginPosition,
-    OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex, ProgramRanges, RawProgram,
-    ReleaseAfter, Root, RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit,
+    LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, OperationReference, Origin, OriginIndex,
+    OriginPosition, OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex, ProgramRanges,
+    RawProgram, ReleaseAfter, Root, RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit,
     SourceUnitIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
     VerifyAllocationFailureInjection, VerifyAllocationSite, VerifyError,
 };
@@ -13,7 +13,7 @@ const HEADER_SIZE: usize = 32;
 const DIRECTORY_ENTRY_SIZE: usize = 24;
 const NONE: u32 = u32::MAX;
 const PRODUCER_SECTION_ID: u16 = 32769;
-const KNOWN_SECTION_SLOTS: usize = 17;
+const KNOWN_SECTION_SLOTS: usize = 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FwirDecodeLimits {
@@ -57,6 +57,7 @@ pub enum FwirDecodeAllocationSite {
     Constants,
     ConstantElements,
     Origins,
+    OperationReferences,
     Edges,
     ShapeChecks,
     Branches,
@@ -359,7 +360,8 @@ fn known_section(id: u16) -> Option<(usize, u16, usize)> {
         14 => Some((13, 3, 56)),
         15 => Some((14, 3, 12)),
         16 => Some((15, 3, 8)),
-        PRODUCER_SECTION_ID => Some((16, 0, 0)),
+        18 => Some((16, 3, 16)),
+        PRODUCER_SECTION_ID => Some((17, 0, 0)),
         _ => None,
     }
 }
@@ -1108,7 +1110,7 @@ fn preflight(bytes: &[u8], limits: &FwirDecodeLimits) -> Result<DecodePlan, Fwir
             None,
         ));
     }
-    if let Some(producer) = sections[16] {
+    if let Some(producer) = sections[17] {
         validate_producer(bytes, producer)?;
     }
     Ok(DecodePlan {
@@ -1200,7 +1202,7 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
         if reserved != 0 {
             return Err(record_error(features, index, 3, "reserved"));
         }
-        if id <= 4 {
+        if matches!(id, 1..=4 | 6) {
             if class != 0 {
                 return Err(record_error(features, index, 2, "feature_class"));
             }
@@ -1388,6 +1390,25 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
             zero_bytes(bytes, ownership, index, 5, 3, "reserved")?;
         }
     }
+    if let Some(references) = section(plan, 18) {
+        for index in 0..references.record_count() {
+            zero_bytes(bytes, references, index, 6, 2, "reserved")?;
+            zero_bytes(bytes, references, index, 12, 4, "reserved")?;
+            let primitive = record_u16(bytes, references, index, 0)?;
+            let signature = record_u16(bytes, references, index, 2)?;
+            let implementation = record_u16(bytes, references, index, 4)?;
+            let descriptor = crate::semantic_registry::implementation_from_numeric(implementation);
+            let valid = descriptor.is_ok_and(|descriptor| {
+                descriptor.primitive_id.numeric() == primitive
+                    && descriptor.signature_id.numeric() == signature
+                    && descriptor.behavior
+                        == crate::semantic_registry::StructuralBehavior::Elementwise
+            });
+            if !valid {
+                return Err(record_error(references, index, 0, "semantic_id"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1534,6 +1555,7 @@ fn reconstruct_program(
     let mut constants = Vec::new();
     let mut constant_elements = Vec::new();
     let mut origins = Vec::new();
+    let mut operation_references = Vec::new();
     let mut edges = Vec::new();
     let mut shape_checks = Vec::new();
     let mut branches = Vec::new();
@@ -1598,6 +1620,13 @@ fn reconstruct_program(
         section(plan, 10),
     )?;
     reserve_arena(
+        &mut operation_references,
+        section_count(plan, 18),
+        FwirDecodeAllocationSite::OperationReferences,
+        injection,
+        section(plan, 18),
+    )?;
+    reserve_arena(
         &mut edges,
         section_count(plan, 11),
         FwirDecodeAllocationSite::Edges,
@@ -1643,7 +1672,7 @@ fn reconstruct_program(
     if let Some(records) = section(plan, 2) {
         for index in 0..records.record_count() {
             let id = record_u16(bytes, records, index, 0)?;
-            if id <= 4 {
+            if matches!(id, 1..=4 | 6) {
                 features.push(id);
             }
         }
@@ -1913,6 +1942,16 @@ fn reconstruct_program(
             });
         }
     }
+    if let Some(records) = section(plan, 18) {
+        for index in 0..records.record_count() {
+            operation_references.push(OperationReference {
+                primitive_id: record_u16(bytes, records, index, 0)?,
+                signature_id: record_u16(bytes, records, index, 2)?,
+                implementation_id: record_u16(bytes, records, index, 4)?,
+                origin: OriginIndex(record_u32(bytes, records, index, 8)?),
+            });
+        }
+    }
 
     let parameter_header = read_u32(bytes, module_section.offset + 4, Some(1), Some(0))?;
     let ranges = ProgramRanges {
@@ -1927,6 +1966,7 @@ fn reconstruct_program(
         edges: whole_range(edges.len(), "edges")?,
         shape_checks: whole_range(shape_checks.len(), "shape_checks")?,
         origins: whole_range(origins.len(), "origins")?,
+        operation_references: whole_range(operation_references.len(), "operation_references")?,
         branches: whole_range(branches.len(), "branches")?,
         ownership: whole_range(ownership.len(), "ownership")?,
         roots: whole_range(roots.len(), "roots")?,
@@ -1953,6 +1993,7 @@ fn reconstruct_program(
         edges,
         shape_checks,
         origins,
+        operation_references,
         branches,
         ownership,
         roots,
@@ -2029,7 +2070,9 @@ fn reserve_exact<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Feature, FwirEncodeOptions, RawProgramBuilder, encode_fwir};
+    use crate::{
+        Feature, FwirEncodeOptions, Invariant, MalformedProgram, RawProgramBuilder, encode_fwir,
+    };
 
     fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
         match result {
@@ -2143,6 +2186,38 @@ mod tests {
         bytes.push(class);
         bytes.push(0);
         bytes
+    }
+
+    fn operation_reference_bytes() -> Vec<u8> {
+        let mut builder = RawProgramBuilder::new();
+        must(builder.push_feature(Feature::OperationReferences.numeric()));
+        let source = must(builder.push_source_unit(SourceUnit {
+            diagnostic_name: "reference.fw".to_owned(),
+            byte_length: 4,
+        }));
+        let origin = must(builder.push_origin(Origin {
+            source_unit: source,
+            span: OriginSpan {
+                begin: OriginPosition {
+                    offset: 1,
+                    line: 1,
+                    column: 1,
+                },
+                end: OriginPosition {
+                    offset: 5,
+                    line: 1,
+                    column: 5,
+                },
+            },
+        }));
+        must(builder.push_operation_reference(OperationReference {
+            primitive_id: 5,
+            signature_id: 9,
+            implementation_id: 9,
+            origin,
+        }));
+        let program = must(must(builder.finish()).verify());
+        must(encode_fwir(&program, &FwirEncodeOptions::default()))
     }
 
     #[test]
@@ -2264,6 +2339,85 @@ mod tests {
             decode_fwir(&empty_with_feature(100, 0), &FwirDecodeLimits::default()),
             Err(FwirDecodeError {
                 kind: FwirDecodeErrorKind::UnknownMandatoryExtension { id: 100 },
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            decode_fwir(&empty_with_feature(5, 0), &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::UnknownMandatoryExtension { id: 5 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_fwir(&empty_with_feature(6, 0), &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                    MalformedProgram {
+                        invariant: Invariant::UnsupportedVersion,
+                        ..
+                    }
+                )),
+                ..
+            })
+        ));
+        let mut supported_reference_feature = empty_with_feature(6, 0);
+        let (_, module, _) = test_section(&supported_reference_feature, 1);
+        put_u16_at(&mut supported_reference_feature, module + 2, 1);
+        assert!(decode_fwir(&supported_reference_feature, &FwirDecodeLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn operation_reference_records_reject_reserved_bytes_and_invalid_identity() {
+        let canonical = operation_reference_bytes();
+        let (_, references, length) = test_section(&canonical, 18);
+        assert_eq!(length, 16);
+
+        for offset in [references + 6, references + 12] {
+            let mut reserved = canonical.clone();
+            reserved[offset] = 1;
+            assert!(matches!(
+                decode_fwir(&reserved, &FwirDecodeLimits::default()),
+                Err(FwirDecodeError {
+                    kind: FwirDecodeErrorKind::NonCanonicalRecord { field: "reserved" },
+                    section_id: Some(18),
+                    ..
+                })
+            ));
+        }
+
+        for (relative, value) in [(0, 6_u16), (2, 10), (4, 35)] {
+            let mut identity = canonical.clone();
+            put_u16_at(&mut identity, references + relative, value);
+            assert!(matches!(
+                decode_fwir(&identity, &FwirDecodeLimits::default()),
+                Err(FwirDecodeError {
+                    kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                        field: "semantic_id"
+                    },
+                    section_id: Some(18),
+                    ..
+                })
+            ));
+        }
+        let mut structural = canonical;
+        put_u16_at(&mut structural, references, 19);
+        put_u16_at(&mut structural, references + 2, 34);
+        put_u16_at(&mut structural, references + 4, 34);
+        assert!(matches!(
+            decode_fwir_with_allocation_failure(
+                &structural,
+                &FwirDecodeLimits::default(),
+                FwirDecodeAllocationFailureInjection::at(
+                    FwirDecodeAllocationSite::OperationReferences
+                )
+            ),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                    field: "semantic_id"
+                },
+                section_id: Some(18),
                 ..
             })
         ));
@@ -2445,6 +2599,19 @@ mod tests {
                 "{site:?}"
             );
         }
+        let reference_bytes = operation_reference_bytes();
+        let site = FwirDecodeAllocationSite::OperationReferences;
+        assert!(matches!(
+            decode_fwir_with_allocation_failure(
+                &reference_bytes,
+                &FwirDecodeLimits::default(),
+                FwirDecodeAllocationFailureInjection::at(site)
+            ),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::AllocationUnavailable { site: actual },
+                ..
+            }) if actual == site
+        ));
     }
 
     fn deep_program(depth: u32) -> VerifiedProgram {

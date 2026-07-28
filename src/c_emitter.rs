@@ -1337,6 +1337,13 @@ mod ir_tests {
     use super::*;
     use crate::lowering::compile_source_with_name;
 
+    fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("fixture failed: {error:?}"),
+        }
+    }
+
     fn emit(source: &str) -> String {
         emit_with_configuration(
             source,
@@ -1530,6 +1537,37 @@ mod ir_tests {
         assert!(source.contains("static int fw_impl_34("));
         assert!(source.contains("return fw_apply_selected_iota(\"iota\""));
         assert!(!source.contains("fw_apply_scalar"));
+        assert!(!source.contains("primitive=="));
+    }
+
+    #[test]
+    fn operation_reference_identity_prepares_direct_c_dispatch_without_name_lookup() {
+        let reference = must(crate::lowering::resolve_operation_reference(
+            "add",
+            crate::SourceSpan {
+                begin: crate::SourceLocation::start(),
+                end: crate::SourceLocation {
+                    offset: 4,
+                    line: 1,
+                    column: 4,
+                },
+            },
+            crate::OriginIndex(0),
+            crate::lowering::OperationReferenceConstraint {
+                parameter_types: &[Some(crate::ScalarType::Int), Some(crate::ScalarType::Int)],
+                result_type: Some(crate::ScalarType::Int),
+            },
+            &mut crate::lowering::DiagnosticReservations::default(),
+        ));
+        let source = emit("add[1 2]\n");
+        assert!(source.contains(&format!(
+            "static int fw_kernel_{}(",
+            reference.implementation_id
+        )));
+        assert!(source.contains(&format!(
+            "static int fw_impl_{}(",
+            reference.implementation_id
+        )));
         assert!(!source.contains("primitive=="));
     }
 

@@ -65,6 +65,7 @@ fn validate_names(expression: &Expr) -> Result<(), Error> {
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
         | ExprKind::Parameter(_)
+        | ExprKind::OperationReference { .. }
         | ExprKind::Placeholder => {}
     }
     Ok(())
@@ -190,6 +191,34 @@ pub(crate) fn apply_implementation(
             Err(error)
         }
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn apply_operation_reference(
+    reference: &crate::OperationReference,
+    arguments: &[SelectedApplicationArgument<'_>],
+    lift: crate::LiftMode,
+    result_type: ScalarType,
+    location: SourceLocation,
+    resources: &mut ResourceContext,
+) -> Result<(Value, bool), Error> {
+    let descriptor = implementation_from_numeric(reference.implementation_id)
+        .map_err(|_| type_runtime_error("referenced operation", location))?;
+    if descriptor.primitive_id.numeric() != reference.primitive_id
+        || descriptor.signature_id.numeric() != reference.signature_id
+        || descriptor.result != result_type
+        || descriptor.parameters.len() != arguments.len()
+    {
+        return Err(type_runtime_error("referenced operation", location));
+    }
+    apply_implementation(
+        reference.implementation_id,
+        arguments,
+        lift,
+        result_type,
+        location,
+        resources,
+    )
 }
 
 pub(crate) fn implementation_name(implementation_id: u16) -> Option<&'static str> {
@@ -406,4 +435,99 @@ fn allocation_error(name: &str, location: SourceLocation) -> Error {
         location,
         format!("{name} failed: allocation_unavailable"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AllocationFailureInjection, Conversion, ExecutionProfile, OperationReference,
+        ResourceLimits,
+    };
+
+    fn context(limits: ResourceLimits) -> ResourceContext {
+        match ResourceContext::new(
+            ExecutionProfile::BoundedV2,
+            limits,
+            AllocationFailureInjection::default(),
+        ) {
+            Ok(context) => context,
+            Err(error) => panic!("resource context failed: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn stable_operation_reference_dispatch_uses_recorded_implementation_identity() {
+        let left = Value::Int(2);
+        let right = Value::Int(3);
+        let arguments = [
+            SelectedApplicationArgument {
+                value: &left,
+                conversion: Conversion::Identity,
+            },
+            SelectedApplicationArgument {
+                value: &right,
+                conversion: Conversion::Identity,
+            },
+        ];
+        let reference = OperationReference {
+            primitive_id: 5,
+            signature_id: 9,
+            implementation_id: 9,
+            origin: crate::OriginIndex(0),
+        };
+        let mut resources = context(ResourceLimits {
+            max_work_units: Some(1),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            apply_operation_reference(
+                &reference,
+                &arguments,
+                crate::LiftMode::Scalar,
+                ScalarType::Int,
+                SourceLocation::start(),
+                &mut resources,
+            ),
+            Ok((Value::Int(5), false))
+        );
+        assert_eq!(resources.usage.work_units, 1);
+
+        let mut refused = context(ResourceLimits {
+            max_work_units: Some(0),
+            ..ResourceLimits::default()
+        });
+        let error = apply_operation_reference(
+            &reference,
+            &arguments,
+            crate::LiftMode::Scalar,
+            ScalarType::Int,
+            SourceLocation::start(),
+            &mut refused,
+        )
+        .expect_err("work refusal");
+        assert_eq!(error.kind, ErrorKind::ResourceError);
+
+        let invalid = OperationReference {
+            implementation_id: 10,
+            ..reference
+        };
+        let mut resources = context(ResourceLimits {
+            max_work_units: Some(1),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            apply_operation_reference(
+                &invalid,
+                &arguments,
+                crate::LiftMode::Scalar,
+                ScalarType::Int,
+                SourceLocation::start(),
+                &mut resources,
+            )
+            .expect_err("mismatched identity")
+            .kind,
+            ErrorKind::TypeError
+        );
+    }
 }
