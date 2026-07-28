@@ -305,6 +305,97 @@ fn cli_repl_transcript_recovers_resets_and_rejects_program_headers() {
     assert!(stderr.contains("invalid parameter header"));
 }
 
+fn repl_output(transcript: &[u8]) -> std::process::Output {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let Some(mut input) = child.stdin.take() else {
+        panic!("REPL stdin was not piped");
+    };
+    input.write_all(transcript).expect("REPL transcript");
+    drop(input);
+    child.wait_with_output().expect("REPL output")
+}
+
+#[test]
+fn cli_repl_history_preserves_inclusion_text_numbering_and_crlf() {
+    let result = repl_output(b"\n \t\r\n# comment\r\nadd[1]\r\n.history\r\n");
+    assert!(result.status.success());
+    assert_eq!(
+        result.stdout,
+        b"> > > > > 1\t \t\n2\t# comment\n3\tadd[1]\n4\t.history\n> "
+    );
+    let stderr = String::from_utf8(result.stderr).expect("REPL stderr UTF-8");
+    assert!(stderr.contains("<repl>:1:1: ArityError:"));
+
+    let utf8 = repl_output("🦀\n.history\n".as_bytes());
+    assert!(utf8.status.success());
+    assert_eq!(utf8.stdout, "> > 1\t🦀\n2\t.history\n> ".as_bytes());
+    assert!(
+        String::from_utf8(utf8.stderr)
+            .expect("UTF-8 diagnostic")
+            .contains("InvalidByte")
+    );
+}
+
+#[test]
+fn cli_repl_eof_lone_cr_is_preserved_and_diagnosed() {
+    let result = repl_output(b"1\r");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > ");
+    assert_eq!(
+        result.stderr,
+        b"<repl>:1:2: InvalidByte: invalid source byte\n"
+    );
+}
+
+#[test]
+fn cli_repl_history_is_process_local_and_clear_remains_unsupported() {
+    let first = repl_output(b"1\n.history\n");
+    assert!(first.status.success());
+    assert_eq!(first.stdout, b"> 1\n> 1\t1\n2\t.history\n> ");
+    assert!(first.stderr.is_empty());
+
+    let fresh = repl_output(b".history\n");
+    assert!(fresh.status.success());
+    assert_eq!(fresh.stdout, b"> 1\t.history\n> ");
+    assert!(fresh.stderr.is_empty());
+
+    let clear = repl_output(b".clear\n.history\n");
+    assert!(clear.status.success());
+    assert_eq!(clear.stdout, b"> > 1\t.clear\n2\t.history\n> ");
+    assert!(
+        String::from_utf8(clear.stderr)
+            .expect("clear diagnostic")
+            .contains("MalformedLiteral")
+    );
+}
+
+#[test]
+fn cli_repl_history_records_cls_before_meta_command_dispatch() {
+    let result = repl_output(b".cls\r\n.history\n.exit\ninc 5\n");
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > 1\t.cls\n2\t.history\n> ");
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
+fn cli_repl_history_discards_oversized_input_and_recovers() {
+    let mut transcript = vec![b'1'; 65_537];
+    transcript.extend_from_slice(b"\n.history\n");
+    let result = repl_output(&transcript);
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> > 1\t.history\n> ");
+    assert_eq!(
+        result.stderr,
+        b"error: REPL input exceeds 65536 retained bytes\n"
+    );
+}
+
 #[test]
 fn cli_repl_cls_is_crlf_exact_non_evaluating_and_redirect_safe() {
     let mut child = Command::new(binary())

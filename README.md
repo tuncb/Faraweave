@@ -66,6 +66,13 @@ cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
 cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
+The REPL command `.history` prints the current process session's retained input
+with absolute entry numbers. Every nonempty submitted line is included exactly
+after LF or CRLF removal, including space/tab-only lines, failed expressions,
+and `.history` itself; the oldest entries are evicted to retain at most 100
+entries and 65,536 UTF-8 bytes. History is not persisted, and line navigation
+and `.clear` are not provided.
+
 Inside the REPL, the exact case-sensitive `.cls` meta-command clears and homes
 interactive Windows consoles or ANSI terminals with a nonempty, non-`dumb`
 `TERM`; Windows PTYs that are not native console screen buffers use the ANSI
