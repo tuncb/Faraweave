@@ -2811,6 +2811,13 @@ mod tests {
         planned_program_with_features(depth, explicit_application_plans, false, false)
     }
 
+    fn length_program() -> VerifiedProgram {
+        must(crate::lowering::compile_source_with_name(
+            "length[(1 2 3)]\n",
+            "length.faraweave",
+        ))
+    }
+
     fn planned_program_with_features(
         depth: u32,
         explicit_application_plans: bool,
@@ -3016,6 +3023,50 @@ mod tests {
                 record_index: Some(0),
             })
         );
+    }
+
+    #[test]
+    fn length_plan_roundtrips_and_malformed_physical_records_are_rejected() {
+        let encoded = must(encode_fwir(
+            &length_program(),
+            &FwirEncodeOptions::default(),
+        ));
+        assert_eq!(read_u16(&encoded, 10, None, None), Ok(1));
+        let (_, plans, plans_length) = test_section(&encoded, 17);
+        assert_eq!(plans_length, 8);
+        assert_eq!(read_u16(&encoded, plans + 4, Some(17), Some(0)), Ok(3));
+        let decoded = must(decode_fwir(&encoded, &FwirDecodeLimits::default()));
+        assert_eq!(
+            must(encode_fwir(&decoded, &FwirEncodeOptions::default())),
+            encoded
+        );
+
+        let mut wrong_plan = encoded.clone();
+        put_u16_at(&mut wrong_plan, plans + 4, 1);
+        assert_noncanonical_record(&wrong_plan, "application_plan_id", plans + 4, 17, Some(0));
+
+        let (_, nodes, nodes_length) = test_section(&encoded, 14);
+        let length_node = encoded[nodes..nodes + nodes_length]
+            .chunks_exact(56)
+            .position(|record| record[0] == 4 && test_u32(record, 24) == 21)
+            .map(|index| nodes + index * 56)
+            .unwrap_or(nodes);
+        let mut scalar_lift = encoded;
+        scalar_lift[length_node + 2] = 1;
+        assert!(matches!(
+            decode_fwir(&scalar_lift, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                    crate::MalformedProgram {
+                        invariant: crate::Invariant::InconsistentResultMetadata,
+                        record: crate::RecordKind::Node,
+                        field: "result",
+                        ..
+                    }
+                )),
+                ..
+            })
+        ));
     }
 
     #[test]

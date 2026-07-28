@@ -86,6 +86,21 @@ with feature 5 are rejected deterministically before allocation for execution
 or backend dispatch. Existing ownership, cleanup, provenance, diagnostics,
 resource observer order, and 1.0 canonical examples are unchanged.
 
+## Vector length (`FWIR-PLAN-005`)
+
+Primitive ID `21=length` has three whole-vector signatures: IDs 37, 38, and 39
+accept respectively Bool, Int, and Double vectors and use the matching
+implementation IDs. All three select application-plan ID 3, whose result is a
+scalar Int and whose work rule is `Constant(1)`; no implicit scalar or element
+conversion is permitted.
+
+The implementation borrows the already materialized vector, admits the one
+work unit, converts its host cardinality to Int with a checked conversion, and
+does not allocate or copy a result container. Empty vectors return zero,
+unrepresentable cardinality returns structured `SizeOverflow`, and the input is
+released according to its existing ownership edge after success or failure.
+Tuple and scalar operands fail during static signature selection.
+
 ## Evidence (`FWIR-PLAN-004`)
 
 Registry unit tests cover stable plan lookup and changed operand/plan
@@ -94,3 +109,8 @@ and exact malformed fields; codec tests cover byte-identical 1.0 round trips,
 explicit 1.1 round trips, unknown plan rejection, and reduced-stack deep
 graphs. The full Rust and strict-C11 journeys retain cross-backend value,
 failure, resource, and allocation-refusal parity for all existing plans.
+Issue #40 additionally maps `FWIR-PLAN-005` to
+`vector_length_records_container_plan_for_static_dynamic_and_empty_vectors`,
+`length_container_plan_roundtrips_and_dispatches_by_verified_identity`,
+`length_charges_constant_work_borrows_input_and_has_no_result_allocation`, and
+the strict C11 journey.

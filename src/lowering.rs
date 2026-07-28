@@ -2434,6 +2434,69 @@ mod tests {
     }
 
     #[test]
+    fn vector_length_records_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program = must_compile("length[(true false)]\nlength iota 3\nlength[Double()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 21,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3))
+                .collect::<Vec<_>>(),
+            [(37, 37, 3), (38, 38, 3), (39, 39, 3)]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.0.cardinality == Some(Cardinality::StaticScalar)
+                && apply.4 == LiftMode::ContainerScalar
+                && apply.5
+                    == ShapePlan {
+                        static_anchor: None,
+                        dynamic_checks: IndexRange::default(),
+                    }
+        }));
+        let cardinalities: Vec<_> = applies
+            .iter()
+            .map(|apply| {
+                raw.edges
+                    .get(apply.0.edges.start as usize)
+                    .and_then(|edge| edge.cardinality)
+            })
+            .collect();
+        assert_eq!(
+            cardinalities,
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
     fn prefix_spread_preserves_immediate_element_metadata() {
         let program = must_compile("add [1 (2 3)]\n");
         let raw = program.as_raw();
@@ -2833,10 +2896,11 @@ mod tests {
              (1 2)\n\
              [1 x]\n\
              inc[1]\n\
+             length[(1 2)]\n\
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 1_204_480_648_239_619_809);
+        assert_eq!(debug_digest(&matrix), 86_564_038_970_609_890);
 
         let depth = 256;
         let mut deep = String::new();

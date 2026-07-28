@@ -3,5 +3,6 @@ count
 ratio
 enabled
 iota[count]
+length iota count
 add[ratio count]
 not[enabled]

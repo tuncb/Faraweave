@@ -212,6 +212,64 @@ fn div_bool_operands_are_rejected_with_exact_public_type_diagnostics() {
 }
 
 #[test]
+fn length_accepts_all_vector_types_empty_and_dynamic_cardinalities() {
+    for (source, expected) in [
+        ("length[(true false true)]", "3"),
+        ("length[(7 -3 11 0)]", "4"),
+        ("length[(1.0 -0.0 inf nan)]", "4"),
+        ("length[Bool()]", "0"),
+        ("length[Int()]", "0"),
+        ("length[Double()]", "0"),
+        ("length iota 5", "5"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    let parameterized = faraweave::evaluate_source_with_arguments(
+        "parameters[n Int]\nlength iota n\n",
+        &[Value::Int(6)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("dynamic parameterized length");
+    assert_eq!(parameterized.values, [Value::Int(6)]);
+}
+
+#[test]
+fn length_rejects_scalar_and_tuple_inputs_with_exact_static_diagnostics() {
+    for (source, actual_type) in [
+        ("length[1]", Type::Scalar(ScalarType::Int)),
+        (
+            "length[[1 2]]",
+            Type::Tuple(vec![
+                Type::Scalar(ScalarType::Int),
+                Type::Scalar(ScalarType::Int),
+            ]),
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("length"), "{source}");
+        assert_eq!(error.argument_position, Some(1), "{source}");
+        assert_eq!(
+            error.location,
+            SourceLocation {
+                offset: 8,
+                line: 1,
+                column: 8,
+            },
+            "{source}"
+        );
+        assert_eq!(
+            error.message,
+            "length arguments do not match an accepted signature; first unsupported argument is 1",
+            "{source}"
+        );
+        assert_eq!(error.actual_types, [actual_type], "{source}");
+        assert!(error.expected_types.is_empty(), "{source}");
+    }
+}
+
+#[test]
 fn issue54_predicates_ordering_and_nan_contracts() {
     assert_eq!(formatted("odd[-9223372036854775807]"), "true");
     assert_eq!(formatted("even[-9223372036854775808]"), "true");
