@@ -1,7 +1,7 @@
 use faraweave::{
-    EvaluationConfiguration, FwirDecodeLimits, FwirEncodeOptions, ResourceErrorReason, Value,
-    compile_source_to_fwir, compile_source_to_fwir_with_name, compile_source_to_verified_program,
-    decode_fwir, emit_c_from_verified_program, encode_fwir,
+    DomainErrorReason, EvaluationConfiguration, FwirDecodeLimits, FwirEncodeOptions,
+    ResourceErrorReason, Value, compile_source_to_fwir, compile_source_to_fwir_with_name,
+    compile_source_to_verified_program, decode_fwir, emit_c_from_verified_program, encode_fwir,
     evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
     inspect_fwir,
 };
@@ -131,6 +131,44 @@ fn public_compile_errors_and_argument_errors_preserve_phase_and_provenance() {
     )
     .expect_err("argument");
     assert_eq!(error.kind, faraweave::ErrorKind::ArgumentError);
+}
+
+#[test]
+fn div_identity_domain_and_c_emission_survive_fwir_roundtrip() {
+    let source = "div[(8 9 10) (2 0 5)]\n";
+    let program =
+        compile_source_to_verified_program(source, "division.faraweave").expect("compile div");
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode div");
+    let decoded = decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified div");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode div"),
+        encoded
+    );
+
+    let direct =
+        evaluate_verified_program_with_arguments(&program, &[], EvaluationConfiguration::default())
+            .expect_err("direct division domain");
+    let loaded =
+        evaluate_verified_program_with_arguments(&decoded, &[], EvaluationConfiguration::default())
+            .expect_err("decoded division domain");
+    assert_eq!(loaded, direct);
+    assert_eq!(
+        direct.domain.as_ref().map(|context| context.reason),
+        Some(DomainErrorReason::DivisionByZero)
+    );
+    assert_eq!(
+        direct
+            .domain
+            .as_ref()
+            .and_then(|context| context.element_index),
+        Some(1)
+    );
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_kernel_35("));
+    assert!(emitted.source.contains("fw_selected_division_by_zero"));
+    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]

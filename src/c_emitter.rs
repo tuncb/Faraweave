@@ -239,6 +239,9 @@ impl<'a> IrCGenerator<'a> {
             ScalarKernel::MulInt => {
                 "int64_t a=args[0].i,b=args[1].i;if(a!=0&&((a==-1&&b==INT64_MIN)||(b==-1&&a==INT64_MIN)||(a>0&&((b>0&&a>INT64_MAX/b)||(b<0&&b<INT64_MIN/a)))||(a<0&&((b>0&&a<INT64_MIN/b)||(b<0&&a<INT64_MAX/b)))))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a*b);return 1;"
             }
+            ScalarKernel::DivInt => {
+                "int64_t a=args[0].i,b=args[1].i;if(b==INT64_C(0))return fw_selected_division_by_zero(name,line,column,index,vector_result);if(a==INT64_MIN&&b==-INT64_C(1))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a/b);return 1;"
+            }
             ScalarKernel::IncDouble => {
                 "fw_set_double(out,fw_double_arithmetic(args[0].d,1.0,FW_DOUBLE_ADD));return 1;"
             }
@@ -259,6 +262,9 @@ impl<'a> IrCGenerator<'a> {
             }
             ScalarKernel::MulDouble => {
                 "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_MUL));return 1;"
+            }
+            ScalarKernel::DivDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_DIV));return 1;"
             }
             ScalarKernel::EqualsBool => "fw_set_bool(out,args[0].b==args[1].b);return 1;",
             ScalarKernel::EqualsInt => "fw_set_bool(out,args[0].i==args[1].i);return 1;",
@@ -939,7 +945,7 @@ static void fw_restore_strict_environment(const FWStrictEnvironment *environment
 #else
 #error "Faraweave requires an x86-64 or AArch64 floating-point environment"
 #endif
-enum { FW_DOUBLE_ADD=0,FW_DOUBLE_SUB=1,FW_DOUBLE_MUL=2 };
+enum { FW_DOUBLE_ADD=0,FW_DOUBLE_SUB=1,FW_DOUBLE_MUL=2,FW_DOUBLE_DIV=3 };
 static double fw_double_arithmetic(double left,double right,int operation) {
   uint64_t left_bits=fw_double_bits(left),right_bits=fw_double_bits(right);
   int signs_differ=((left_bits^right_bits)&UINT64_C(0x8000000000000000))!=0U;
@@ -949,13 +955,17 @@ static double fw_double_arithmetic(double left,double right,int operation) {
        (operation==FW_DOUBLE_SUB&&!signs_differ)))||
      (operation==FW_DOUBLE_MUL&&
       ((fw_double_is_infinity(left)&&fw_double_is_zero(right))||
-       (fw_double_is_zero(left)&&fw_double_is_infinity(right)))))
+       (fw_double_is_zero(left)&&fw_double_is_infinity(right))))||
+     (operation==FW_DOUBLE_DIV&&
+      ((fw_double_is_zero(left)&&fw_double_is_zero(right))||
+       (fw_double_is_infinity(left)&&fw_double_is_infinity(right)))))
     return fw_double_from_bits(UINT64_C(0x7ff8000000000000));
   { FWStrictEnvironment environment;volatile double a=left,b=right,result=0.0;
     fw_begin_strict_environment(&environment);
     if(operation==FW_DOUBLE_ADD)result=a+b;
     else if(operation==FW_DOUBLE_SUB)result=a-b;
-    else result=a*b;
+    else if(operation==FW_DOUBLE_MUL)result=a*b;
+    else result=a/b;
     fw_restore_strict_environment(&environment);
     return fw_double_is_nan(result)
         ?fw_double_from_bits(UINT64_C(0x7ff8000000000000)):result;
@@ -1092,6 +1102,15 @@ static int fw_selected_integer_overflow(const char *name,size_t line,size_t colu
     return fw_fail("DomainError",fw_error_storage,line,column);
   }
   return fw_fail_primitive("DomainError",name,"integer_overflow",line,column);
+}
+static int fw_selected_division_by_zero(const char *name,size_t line,size_t column,
+                                        size_t index,int vector_result) {
+  if(vector_result){
+    (void)snprintf(fw_error_storage,sizeof(fw_error_storage),
+                   "%s failed: division_by_zero at result index %zu",name,index);
+    return fw_fail("DomainError",fw_error_storage,line,column);
+  }
+  return fw_fail_primitive("DomainError",name,"division_by_zero",line,column);
 }
 static FWV fw_scalar_at_selected(const FWV *value,size_t index,int conversion) {
   FWV result=fw_scalar_at(value,index);
@@ -1313,6 +1332,7 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   (void)fw_apply_selected;
   (void)fw_apply_selected_iota;
   (void)fw_selected_integer_overflow;
+  (void)fw_selected_division_by_zero;
   (void)fw_as_double;
   (void)fw_borrow;
   (void)fw_double_arithmetic;
@@ -1526,13 +1546,14 @@ mod ir_tests {
         let source = emit(
             "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
              abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
-             mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
+             mul[2 3]\nmul[2.0 3.0]\ndiv[7 3]\ndiv[7.0 3.0]\n\
+             equals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
              not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n",
         );
-        for implementation in 1..34 {
+        for implementation in (1..=36).filter(|implementation| *implementation != 34) {
             assert!(
                 source.contains(&format!("static int fw_kernel_{implementation}(")),
                 "missing kernel {implementation}"
@@ -1546,6 +1567,28 @@ mod ir_tests {
         assert!(source.contains("return fw_apply_selected_iota(\"iota\""));
         assert!(!source.contains("fw_apply_scalar"));
         assert!(!source.contains("primitive=="));
+    }
+
+    #[test]
+    fn div_kernels_guard_integer_ub_and_use_strict_binary64_division() {
+        let source = emit("div[7 3]\ndiv[7.0 3.0]\n");
+        let integer_start = source.find("static int fw_kernel_35(");
+        let integer = integer_start.map(|start| &source[start..]);
+        let zero_guard = integer.and_then(|body| body.find("b==INT64_C(0)"));
+        let overflow_guard = integer.and_then(|body| body.find("a==INT64_MIN&&b==-INT64_C(1)"));
+        let division = integer.and_then(|body| body.find("fw_set_int(out,a/b)"));
+        assert!(
+            matches!(
+                (zero_guard, overflow_guard, division),
+                (Some(zero), Some(overflow), Some(divide))
+                    if zero < overflow && overflow < divide
+            ),
+            "integer div guards do not precede the C division"
+        );
+        assert!(source.contains("fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_DIV)"));
+        assert!(source.contains("operation==FW_DOUBLE_DIV"));
+        assert!(source.contains("fw_selected_division_by_zero"));
+        assert!(source.contains("\"division_by_zero\""));
     }
 
     #[cfg(not(windows))]
@@ -1714,6 +1757,8 @@ mod ir_tests {
                 &["3"],
             ),
             ("parameters[x Int]\ninc[x]\n", &["9223372036854775807"]),
+            ("div[(8 9 10) (2 0 5)]\n", &[]),
+            ("div[-9223372036854775808 -1]\n", &[]),
             ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
         ];
         for (source, arguments) in corpus {
@@ -1816,7 +1861,8 @@ mod ir_tests {
     fn all_direct_selected_kernels_compile_strictly_and_match_direct_ir() {
         let source = "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
              abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
-             mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
+             mul[2 3]\nmul[2.0 3.0]\ndiv[7 3]\ndiv[7.0 3.0]\n\
+             equals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
              not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\

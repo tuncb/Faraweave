@@ -276,6 +276,29 @@ fn invoke_kernel(
     location: SourceLocation,
     element_index: Option<usize>,
 ) -> Result<Value, Error> {
+    if let (ScalarKernel::DivInt, [Value::Int(left), Value::Int(right)]) = (kernel, operands) {
+        if *right == 0 {
+            return Err(integer_domain_error(
+                producer,
+                operands,
+                result_type,
+                location,
+                element_index,
+                DomainErrorReason::DivisionByZero,
+            ));
+        }
+        return left.checked_div(*right).map(Value::Int).ok_or_else(|| {
+            integer_domain_error(
+                producer,
+                operands,
+                result_type,
+                location,
+                element_index,
+                DomainErrorReason::IntegerOverflow,
+            )
+        });
+    }
+
     let result = match (kernel, operands) {
         (ScalarKernel::IncInt, [Value::Int(value)]) => value.checked_add(1).map(Value::Int),
         (ScalarKernel::DecInt, [Value::Int(value)]) => value.checked_sub(1).map(Value::Int),
@@ -323,6 +346,13 @@ fn invoke_kernel(
                 Binary64Operation::Multiply,
             )))
         }
+        (ScalarKernel::DivDouble, [Value::Double(left), Value::Double(right)]) => {
+            Some(Value::Double(strict_float::arithmetic(
+                *left,
+                *right,
+                Binary64Operation::Divide,
+            )))
+        }
         (ScalarKernel::EqualsBool, [left, right])
         | (ScalarKernel::EqualsInt, [left, right])
         | (ScalarKernel::EqualsDouble, [left, right]) => Some(Value::Bool(equals(left, right))),
@@ -358,32 +388,54 @@ fn invoke_kernel(
         (ScalarKernel::GreaterThanDouble, [Value::Double(left), Value::Double(right)]) => {
             Some(Value::Bool(strict_float::less_than(*right, *left)))
         }
-        (ScalarKernel::IotaInt, _) => None,
+        (ScalarKernel::DivInt | ScalarKernel::IotaInt, _) => None,
         _ => None,
     };
     result.ok_or_else(|| {
-        let mut error = Error::new(
-            ErrorKind::DomainError,
-            location,
-            format!(
-                "{producer} failed: integer_overflow{}",
-                if let Some(index) = element_index {
-                    format!(" at result index {index}")
-                } else {
-                    String::new()
-                }
-            ),
-        );
-        error.primitive = Some(producer.to_owned());
-        error.domain = Some(DomainErrorContext {
-            reason: DomainErrorReason::IntegerOverflow,
-            parameter_types: operands.iter().filter_map(Value::scalar_type).collect(),
+        integer_domain_error(
+            producer,
+            operands,
             result_type,
-            operands: operands.to_vec(),
+            location,
             element_index,
-        });
-        error
+            DomainErrorReason::IntegerOverflow,
+        )
     })
+}
+
+fn integer_domain_error(
+    producer: &str,
+    operands: &[Value],
+    result_type: ScalarType,
+    location: SourceLocation,
+    element_index: Option<usize>,
+    reason: DomainErrorReason,
+) -> Error {
+    let reason_name = match reason {
+        DomainErrorReason::IntegerOverflow => "integer_overflow",
+        DomainErrorReason::DivisionByZero => "division_by_zero",
+    };
+    let mut error = Error::new(
+        ErrorKind::DomainError,
+        location,
+        format!(
+            "{producer} failed: {reason_name}{}",
+            if let Some(index) = element_index {
+                format!(" at result index {index}")
+            } else {
+                String::new()
+            }
+        ),
+    );
+    error.primitive = Some(producer.to_owned());
+    error.domain = Some(DomainErrorContext {
+        reason,
+        parameter_types: operands.iter().filter_map(Value::scalar_type).collect(),
+        result_type,
+        operands: operands.to_vec(),
+        element_index,
+    });
+    error
 }
 
 fn equals(left: &Value, right: &Value) -> bool {

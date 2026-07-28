@@ -1984,7 +1984,7 @@ mod tests {
 
     #[test]
     fn selected_calls_record_stable_ids_conversions_cardinality_and_origins() {
-        let program = must_compile("add[1 2.0]\ninc[(1 2)]\niota[3]\n");
+        let program = must_compile("add[1 2.0]\ndiv[7 2.0]\ninc[(1 2)]\niota[3]\n");
         let raw = program.as_raw();
         let applies: Vec<_> = raw
             .nodes
@@ -2008,18 +2008,24 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(applies.len(), 3);
+        assert_eq!(applies.len(), 4);
         assert_eq!((applies[0].1, applies[0].2, applies[0].3), (5, 10, 10));
         assert_eq!(
             raw.edges[0].conversion,
             crate::Conversion::PromoteIntToDouble
         );
         assert_eq!(raw.edges[1].conversion, crate::Conversion::Identity);
-        assert_eq!(applies[1].4, LiftMode::Vector);
-        assert_eq!(applies[1].0.cardinality, Some(Cardinality::StaticVector(2)));
-        assert_eq!(applies[1].5.static_anchor, Some(0));
-        assert_eq!(applies[2].4, LiftMode::DynamicVector);
-        assert_eq!(applies[2].0.cardinality, Some(Cardinality::DynamicVector));
+        assert_eq!((applies[1].1, applies[1].2, applies[1].3), (20, 36, 36));
+        assert_eq!(
+            raw.edges[2].conversion,
+            crate::Conversion::PromoteIntToDouble
+        );
+        assert_eq!(raw.edges[3].conversion, crate::Conversion::Identity);
+        assert_eq!(applies[2].4, LiftMode::Vector);
+        assert_eq!(applies[2].0.cardinality, Some(Cardinality::StaticVector(2)));
+        assert_eq!(applies[2].5.static_anchor, Some(0));
+        assert_eq!(applies[3].4, LiftMode::DynamicVector);
+        assert_eq!(applies[3].0.cardinality, Some(Cardinality::DynamicVector));
         assert_ne!(raw.edges[0].origin, raw.nodes[2].origin);
     }
 

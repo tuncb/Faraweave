@@ -13,7 +13,7 @@ structural tuples. The public primitives are:
 | Group | Primitives |
 | --- | --- |
 | Checked numeric unary | `inc`, `dec`, `neg`, `abs` |
-| Checked numeric dyadic | `add`, `sub`, `mul` |
+| Checked numeric dyadic | `add`, `sub`, `mul`, `div` |
 | Equality and logic | `equals`, `not_equals`, `not`, `and`, `or` |
 | Integer predicates | `odd`, `even` |
 | Numeric predicates | `is_positive`, `is_negative` |
@@ -36,9 +36,11 @@ This produces `[(2 3 4) (11 12 13)]`.
 Elementwise calls broadcast scalars over vectors and require equal vector
 lengths. Singleton vectors stay vectors. Exact overloads win; the only
 conversion is `Int` to `Double`. Integer arithmetic is checked and publishes no
-partial result on overflow. Double results canonicalize NaNs; signed zero,
-infinities, gradual underflow, and IEEE unordered comparisons are preserved.
-Canonical output includes visible `.0` for integral Doubles.
+partial result on overflow; integer `div` truncates toward zero and reports
+division by zero as a structured domain error. Double results canonicalize
+NaNs; signed zero, infinities, gradual underflow, IEEE division, and unordered
+comparisons are preserved. Canonical output includes visible `.0` for integral
+Doubles.
 
 The accepted [architecture](doc/architecture.md) and
 [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md) define
@@ -198,7 +200,7 @@ bracket calls, checked Int64 arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit
 currying, functions, effects, reductions, multidimensional arrays, `length`,
-or `divide`.
+or container-wide operations.
 
 Rust enums and vectors replace C++ tagged/plain records at the public boundary.
 Ordinary syntax remains visibly separated by parse, resolution, analysis, and
