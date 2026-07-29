@@ -865,7 +865,7 @@ fn write_registry_diagnostics(
                 operand_consumption_name(parameter.consumption),
             )
             .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
-            write_conversions(output, parameter.element_type)?;
+            write_conversions(output, *parameter)?;
             write!(output, "}}").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
         }
         write!(
@@ -888,13 +888,18 @@ fn write_registry_diagnostics(
 
 fn write_conversions(
     output: &mut impl Write,
-    accepted: ScalarType,
+    parameter: OperandDescriptor,
 ) -> Result<(), InternalRegistryDiagnosticError> {
     let mut first = true;
     for actual in [ScalarType::Bool, ScalarType::Int, ScalarType::Double] {
-        let Some(selected) = conversion(actual, accepted) else {
+        let Some(selected) = conversion(actual, parameter.element_type) else {
             continue;
         };
+        if parameter.consumption == OperandConsumption::WholeVector
+            && selected != Conversion::Identity
+        {
+            continue;
+        }
         if !first {
             write!(output, ",").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
         }
@@ -1323,6 +1328,21 @@ mod tests {
              application_plan=2 result_cardinality=dynamic_vector work=result_cardinality \
              kernel=iota_int\n"
         ));
+        assert!(output.contains(
+            "primitive id=21 name=length behavior=vector_length\n  signature id=37 \
+             implementation=37 parameters=[1:accepted=Bool,lift=whole_vector,\
+             actual={Bool:identity}] result=Int application_plan=3 result_cardinality=scalar \
+             work=constant(1) kernel=length_bool_vector\n  signature id=38 implementation=38 \
+             parameters=[1:accepted=Int,lift=whole_vector,actual={Int:identity}] result=Int \
+             application_plan=3 result_cardinality=scalar work=constant(1) \
+             kernel=length_int_vector\n  signature id=39 implementation=39 \
+             parameters=[1:accepted=Double,lift=whole_vector,actual={Double:identity}] result=Int \
+             application_plan=3 result_cardinality=scalar work=constant(1) \
+             kernel=length_double_vector\n"
+        ));
+        assert!(output.lines().all(|line| {
+            !line.contains("lift=whole_vector") || !line.contains("promote_int_to_double")
+        }));
 
         let mut reversed = SEMANTIC_REGISTRY.to_vec();
         reversed.reverse();
