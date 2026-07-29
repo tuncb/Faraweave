@@ -619,7 +619,7 @@ def main() -> None:
                     generated_main in generated_source,
                     "sqrt generated main declaration",
                 )
-                hostile_source.write_text(
+                hostile_generated_source = (
                     generated_source.replace(
                         generated_main,
                         "static int fw_generated_main(int argc, char **argv) {",
@@ -644,17 +644,22 @@ int main(int argc, char **argv) {
   int result;
   __asm__ volatile("mrs %0, fpcr":"=r"(original_control));
   __asm__ volatile("mrs %0, fpsr":"=r"(original_status));
-  requested_control=original_control|
-      UINT64_C(0x00009f00)|UINT64_C(0x00c00000)|UINT64_C(0x03000000);
+  requested_control=(original_control&~UINT64_C(0x00009f00))|
+      UINT64_C(0x00c00000)|UINT64_C(0x03000000);
   requested_status=original_status|UINT64_C(0x0000009f);
-  __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(requested_control):"memory");
+  __asm__ volatile("msr fpcr, %0\\n\\tisb"::"r"(requested_control):"memory");
   __asm__ volatile("msr fpsr, %0"::"r"(requested_status):"memory");
   __asm__ volatile("mrs %0, fpcr":"=r"(hostile_control));
   __asm__ volatile("mrs %0, fpsr":"=r"(hostile_status));
+  if((hostile_control&UINT64_C(0x00009f00))!=0U){
+    __asm__ volatile("msr fpcr, %0\\n\\tisb"::"r"(original_control):"memory");
+    __asm__ volatile("msr fpsr, %0"::"r"(original_status):"memory");
+    return 1;
+  }
   result=fw_generated_main(argc,argv);
   __asm__ volatile("mrs %0, fpcr":"=r"(restored_control));
   __asm__ volatile("mrs %0, fpsr":"=r"(restored_status));
-  __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(original_control):"memory");
+  __asm__ volatile("msr fpcr, %0\\n\\tisb"::"r"(original_control):"memory");
   __asm__ volatile("msr fpsr, %0"::"r"(original_status):"memory");
   if(result!=0)return result;
   if((hostile_control&(UINT64_C(0x00c00000)|UINT64_C(0x03000000)))!=
@@ -667,7 +672,43 @@ int main(int argc, char **argv) {
   return fw_generated_main(argc,argv);
 #endif
 }
-""",
+"""
+                )
+                require(
+                    '"msr fpcr, %0\\n\\tisb"' in hostile_generated_source,
+                    "sqrt hostile C wrapper escaped FPCR instruction separator",
+                )
+                require(
+                    '"msr fpcr, %0\n' not in hostile_generated_source,
+                    "sqrt hostile C wrapper contains a literal newline in an asm string",
+                )
+                require(
+                    "requested_control=(original_control&~UINT64_C(0x00009f00))|"
+                    in hostile_generated_source,
+                    "sqrt hostile C wrapper must clear AArch64 exception enables",
+                )
+                require(
+                    "if((hostile_control&UINT64_C(0x00009f00))!=0U){"
+                    in hostile_generated_source,
+                    "sqrt hostile C wrapper must reject a trapping FPCR",
+                )
+                require(
+                    hostile_generated_source.find(
+                        "if((hostile_control&UINT64_C(0x00009f00))!=0U){"
+                    )
+                    < hostile_generated_source.rfind(
+                        "result=fw_generated_main(argc,argv);"
+                    ),
+                    "sqrt hostile C wrapper must reject traps before FP execution",
+                )
+                require(
+                    "return restored_control==hostile_control&&"
+                    "restored_status==hostile_status?0:1;"
+                    in hostile_generated_source,
+                    "sqrt hostile C wrapper must require exact state restoration",
+                )
+                hostile_source.write_text(
+                    hostile_generated_source,
                     encoding="utf-8",
                 )
                 compile_c(
@@ -720,7 +761,7 @@ int main(int argc, char **argv) {
 #elif defined(__aarch64__)
   uint64_t original=UINT64_C(0),hostile,restored=UINT64_C(0);int result;
   __asm__ volatile("mrs %0, fpcr":"=r"(original));
-  hostile=original|UINT64_C(0x01c00000);
+  hostile=(original&~UINT64_C(0x00009f00))|UINT64_C(0x01c00000);
   __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(hostile):"memory");
   result=fw_generated_main(argc,argv);
   __asm__ volatile("mrs %0, fpcr":"=r"(restored));
