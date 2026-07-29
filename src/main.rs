@@ -126,24 +126,7 @@ fn run_ir_command(arguments: &[OsString]) -> Result<(), ()> {
         &argument_strings,
         faraweave::EvaluationConfiguration::default(),
     ) {
-        Ok(result) => {
-            let mut output = String::new();
-            let output_length = result.formatted.iter().try_fold(0usize, |total, value| {
-                total.checked_add(value.len())?.checked_add(1)
-            });
-            output
-                .try_reserve_exact(output_length.ok_or_else(|| {
-                    eprintln!("error: unable to allocate formatted output");
-                })?)
-                .map_err(|_| {
-                    eprintln!("error: unable to allocate formatted output");
-                })?;
-            for formatted in result.formatted {
-                output.push_str(&formatted);
-                output.push('\n');
-            }
-            publish_runner_stdout(output.as_bytes())
-        }
+        Ok(result) => publish_formatted_runner_output(&result.formatted),
         Err(error) => {
             report_error(logical_source_name(&program), &error);
             Err(())
@@ -186,6 +169,38 @@ impl CommandLineArgumentFailureInjection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormattedOutputFailure {
+    SizeOverflow,
+    AllocationUnavailable,
+}
+
+impl FormattedOutputFailure {
+    const fn diagnostic(self) -> &'static str {
+        "error: unable to allocate formatted output"
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FormattedOutputFailureInjection {
+    refuse_reservation: bool,
+}
+
+impl FormattedOutputFailureInjection {
+    const fn none() -> Self {
+        Self {
+            refuse_reservation: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn refuse_reservation() -> Self {
+        Self {
+            refuse_reservation: true,
+        }
+    }
+}
+
 fn collect_command_line_arguments(
     arguments: &[OsString],
     injection: CommandLineArgumentFailureInjection,
@@ -204,6 +219,43 @@ fn collect_command_line_arguments(
     Ok(decoded)
 }
 
+fn checked_formatted_output_length(
+    formatted_lengths: impl IntoIterator<Item = usize>,
+) -> Result<usize, FormattedOutputFailure> {
+    formatted_lengths
+        .into_iter()
+        .try_fold(0usize, |total, length| {
+            total
+                .checked_add(length)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(FormattedOutputFailure::SizeOverflow)
+        })
+}
+
+fn build_formatted_runner_output(
+    formatted: &[String],
+    injection: FormattedOutputFailureInjection,
+) -> Result<String, FormattedOutputFailure> {
+    let output_length = checked_formatted_output_length(formatted.iter().map(String::len))?;
+    let mut output = String::new();
+    if injection.refuse_reservation || output.try_reserve_exact(output_length).is_err() {
+        return Err(FormattedOutputFailure::AllocationUnavailable);
+    }
+    for value in formatted {
+        output.push_str(value);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn publish_formatted_runner_output(formatted: &[String]) -> Result<(), ()> {
+    let output = build_formatted_runner_output(formatted, FormattedOutputFailureInjection::none())
+        .map_err(|failure| {
+            eprintln!("{}", failure.diagnostic());
+        })?;
+    publish_runner_stdout(output.as_bytes())
+}
+
 fn run_command(arguments: &[OsString]) -> Result<(), ()> {
     if arguments.len() == 2 {
         eprintln!("error: expected one source path after 'run'");
@@ -215,25 +267,14 @@ fn run_command(arguments: &[OsString]) -> Result<(), ()> {
     }
     let path = Path::new(&arguments[2]);
     let source = read_source(path)?;
-    let argument_strings: Vec<&str> = arguments
-        .get(4..)
-        .unwrap_or_default()
-        .iter()
-        .map(|argument| {
-            argument.to_str().ok_or_else(|| {
-                eprintln!("error: unable to decode Unicode command line");
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    let raw_arguments = arguments.get(4..).unwrap_or_default();
+    let argument_strings =
+        collect_command_line_arguments(raw_arguments, CommandLineArgumentFailureInjection::none())
+            .map_err(|failure| {
+                eprintln!("{}", failure.diagnostic());
+            })?;
     match evaluate_runner_source(&source, &argument_strings) {
-        Ok(result) => {
-            let mut output = String::new();
-            for formatted in result.formatted {
-                output.push_str(&formatted);
-                output.push('\n');
-            }
-            publish_runner_stdout(output.as_bytes())
-        }
+        Ok(result) => publish_formatted_runner_output(&result.formatted),
         Err(error) => {
             report_error(&path.to_string_lossy(), &error);
             Err(())
@@ -926,9 +967,10 @@ fn report_argument_error(argument: &ArgumentErrorContext) {
 #[cfg(test)]
 mod output_tests {
     use super::{
-        CommandLineArgumentFailure, CommandLineArgumentFailureInjection, OutputFailureReason,
-        OutputPublicationFailure, ReplCommand, collect_command_line_arguments, publish_to,
-        repl_command,
+        CommandLineArgumentFailure, CommandLineArgumentFailureInjection, FormattedOutputFailure,
+        FormattedOutputFailureInjection, OutputFailureReason, OutputPublicationFailure,
+        ReplCommand, build_formatted_runner_output, checked_formatted_output_length,
+        collect_command_line_arguments, publish_to, repl_command,
     };
     use std::ffi::OsString;
     use std::io::{self, Write};
@@ -1032,6 +1074,38 @@ mod output_tests {
         assert_eq!(
             failure.diagnostic(),
             "error: unable to decode Unicode command line"
+        );
+    }
+
+    #[test]
+    fn formatted_output_size_is_checked_before_reservation() {
+        assert_eq!(checked_formatted_output_length([3, 0, 4]), Ok(10));
+        assert_eq!(
+            checked_formatted_output_length([usize::MAX]),
+            Err(FormattedOutputFailure::SizeOverflow)
+        );
+        assert_eq!(
+            checked_formatted_output_length([usize::MAX - 1, 0]),
+            Err(FormattedOutputFailure::SizeOverflow)
+        );
+    }
+
+    #[test]
+    fn formatted_output_reservation_refusal_is_explicit_and_transactional() {
+        let formatted = vec!["first".to_owned(), "é".to_owned()];
+        let failure = build_formatted_runner_output(
+            &formatted,
+            FormattedOutputFailureInjection::refuse_reservation(),
+        )
+        .expect_err("injected formatted output reservation refusal");
+        assert_eq!(failure, FormattedOutputFailure::AllocationUnavailable);
+        assert_eq!(
+            failure.diagnostic(),
+            "error: unable to allocate formatted output"
+        );
+        assert_eq!(
+            build_formatted_runner_output(&formatted, FormattedOutputFailureInjection::none()),
+            Ok("first\né\n".to_owned())
         );
     }
 
