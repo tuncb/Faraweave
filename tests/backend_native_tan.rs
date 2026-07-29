@@ -8,6 +8,7 @@ use faraweave::{
 };
 
 const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+const MAX_ULPS: u64 = 16;
 const MAX_ABSOLUTE_ERROR: f64 = 1.421_085_471_520_200_4e-14;
 
 fn double(source: &str) -> f64 {
@@ -25,15 +26,20 @@ fn order_key(bits: u64) -> u64 {
     }
 }
 
+fn finite_conforms(actual: f64, reference_bits: u64) -> bool {
+    let actual_bits = actual.to_bits();
+    let reference = f64::from_bits(reference_bits);
+    actual.is_finite()
+        && actual_bits >> 63 == reference_bits >> 63
+        && (order_key(actual_bits).abs_diff(order_key(reference_bits)) <= MAX_ULPS
+            || (actual - reference).abs() <= MAX_ABSOLUTE_ERROR)
+}
+
 fn assert_finite_envelope(source: &str, reference_bits: u64) {
     let actual = double(source);
     let actual_bits = actual.to_bits();
-    let reference = f64::from_bits(reference_bits);
-    assert!(actual.is_finite(), "{source}");
-    assert_eq!(actual_bits >> 63, reference_bits >> 63, "{source}");
-    let ulps = order_key(actual_bits).abs_diff(order_key(reference_bits));
     assert!(
-        ulps <= 8 || (actual - reference).abs() <= MAX_ABSOLUTE_ERROR,
+        finite_conforms(actual, reference_bits),
         "{source}: actual={actual_bits:016x} reference={reference_bits:016x}"
     );
 }
@@ -219,9 +225,7 @@ fn tan_special_quadrants_boundaries_and_finite_envelope_are_public_semantics() {
         .iter()
         .zip([0x3ff8_eb24_5cbe_e3a6, 0xbff8_eb24_5cbe_e3a6])
     {
-        let reference_value = f64::from_bits(reference);
-        let ulps = order_key(value.to_bits()).abs_diff(order_key(reference));
-        assert!(ulps <= 8 || (*value - reference_value).abs() <= MAX_ABSOLUTE_ERROR);
+        assert!(finite_conforms(*value, reference));
     }
 
     let mut dynamic_results = evaluate_source_with_arguments(
@@ -241,10 +245,23 @@ fn tan_special_quadrants_boundaries_and_finite_envelope_are_public_semantics() {
         0xc001_7af6_2e09_50f8,
         0xbfc2_3ef7_1254_b86f,
     ]) {
-        let reference_value = f64::from_bits(reference);
-        let ulps = order_key(value.to_bits()).abs_diff(order_key(reference));
-        assert!(ulps <= 8 || (*value - reference_value).abs() <= MAX_ABSOLUTE_ERROR);
+        assert!(finite_conforms(*value, reference));
     }
+}
+
+#[test]
+fn tan_envelope_accepts_nine_through_sixteen_ulps() {
+    let reference_bits = 0x4090_0000_0000_0000;
+    for distance in 9..=MAX_ULPS {
+        assert!(
+            finite_conforms(f64::from_bits(reference_bits + distance), reference_bits),
+            "{distance} ULPs"
+        );
+    }
+    assert!(!finite_conforms(
+        f64::from_bits(reference_bits + MAX_ULPS + 1),
+        reference_bits
+    ));
 }
 
 #[test]
