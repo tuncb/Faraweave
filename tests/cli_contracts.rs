@@ -538,6 +538,50 @@ fn cli_run_is_extension_agnostic_and_transactional() {
 }
 
 #[test]
+fn cli_source_and_verified_fwir_accept_typed_empty_trivia() {
+    let directory = unique("typed-empty-trivia");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("typed-empty.faraweave");
+    let artifact = directory.join("typed-empty.fwir");
+    fs::write(
+        &source,
+        "Bool( \t)\nInt(\n)\nDouble(\t# mixed trivia\r\n )\n",
+    )
+    .expect("source");
+
+    let run = Command::new(binary())
+        .arg("run")
+        .arg(&source)
+        .output()
+        .expect("run source");
+    assert!(run.status.success(), "{:?}", run.stderr);
+    assert_eq!(run.stdout, b"()\n()\n()\n");
+    assert!(run.stderr.is_empty());
+
+    let compiled = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&source)
+        .args(["-o"])
+        .arg(&artifact)
+        .output()
+        .expect("compile IR");
+    assert!(compiled.status.success(), "{:?}", compiled.stderr);
+    assert!(compiled.stdout.is_empty());
+    assert!(compiled.stderr.is_empty());
+
+    let run_ir = Command::new(binary())
+        .arg("run-ir")
+        .arg(&artifact)
+        .output()
+        .expect("run IR");
+    assert!(run_ir.status.success(), "{:?}", run_ir.stderr);
+    assert_eq!(run_ir.stdout, b"()\n()\n()\n");
+    assert!(run_ir.stderr.is_empty());
+
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
 fn cli_parameters_and_diagnostics_contract() {
     let directory = unique("parameters");
     fs::create_dir_all(&directory).expect("mkdir");

@@ -53,6 +53,20 @@ fn s16_empty_singleton_promotion_and_shape_contracts() {
 }
 
 #[test]
+fn typed_empty_trivia_evaluates_with_its_declared_vector_type() {
+    for (source, expected) in [
+        ("Bool( \t)", Value::BoolVector(Vec::new())),
+        ("Int(\n)", Value::IntVector(Vec::new())),
+        (
+            "Double(\t# mixed trivia\r\n )",
+            Value::DoubleVector(Vec::new()),
+        ),
+    ] {
+        assert_eq!(evaluate_expression(source).expect(source).value, expected);
+    }
+}
+
+#[test]
 fn div_integer_faults_and_strict_binary64_are_exact() {
     for (source, expected) in [
         ("div[7 3]", "2"),
