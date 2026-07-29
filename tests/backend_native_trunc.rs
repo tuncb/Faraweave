@@ -116,29 +116,29 @@ fn trunc_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
         selections,
         vec![
             (
-                44,
-                44,
+                63,
+                63,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::Identity,
             ),
             (
-                44,
-                44,
+                63,
+                63,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                44,
-                44,
+                63,
+                63,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                44,
-                44,
+                63,
+                63,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
@@ -386,7 +386,7 @@ fn trunc_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     );
 
     let node = trunc_node(&bytes);
-    for (relative, replacement) in [(24, 37_u32), (28, 43), (32, 43)] {
+    for (relative, replacement) in [(24, 37_u32), (28, 62), (32, 62)] {
         let mut malformed = bytes.clone();
         malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
         let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
@@ -440,6 +440,6 @@ fn trunc_emitted_c_calls_math_h_trunc_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=trunc(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_trunc(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_44("));
-    assert!(source.contains("static int fw_impl_44("));
+    assert!(source.contains("static int fw_kernel_63("));
+    assert!(source.contains("static int fw_impl_63("));
 }

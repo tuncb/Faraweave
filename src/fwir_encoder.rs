@@ -10,7 +10,7 @@ const HEADER_SIZE: u64 = 32;
 const DIRECTORY_ENTRY_SIZE: u64 = 24;
 const MANDATORY_IDENTITY_FLAGS: u16 = 3;
 const NONE: u32 = u32::MAX;
-const MAX_SECTIONS: usize = 17;
+const MAX_SECTIONS: usize = 19;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FwirProducerMetadata {
@@ -94,6 +94,7 @@ struct Preflight {
     string_count: u32,
     string_reference_count: usize,
     total_size: usize,
+    format_minor: u16,
 }
 
 pub fn encode_fwir(
@@ -299,6 +300,13 @@ fn preflight(
     checked_count(raw.nodes.len(), "nodes")?;
     checked_count(raw.ownership.len(), "ownership")?;
     checked_count(raw.roots.len(), "roots")?;
+    checked_count(raw.operation_references.len(), "operation_references")?;
+    let application_plan_count = raw
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::SelectedApply { .. }))
+        .count();
+    checked_count(application_plan_count, "application_plans")?;
 
     let (string_count, string_reference_count, string_length) = string_pool_shape(program)?;
     let mut sections = [Section::default(); MAX_SECTIONS];
@@ -335,6 +343,24 @@ fn preflight(
         (14, 56, fixed_length(raw.nodes.len(), 56, "nodes")?),
         (15, 12, fixed_length(raw.ownership.len(), 12, "ownership")?),
         (16, 8, fixed_length(raw.roots.len(), 8, "roots")?),
+        (
+            17,
+            8,
+            if raw
+                .features
+                .binary_search(&crate::Feature::ApplicationPlans.numeric())
+                .is_ok()
+            {
+                fixed_length(application_plan_count, 8, "application_plans")?
+            } else {
+                0
+            },
+        ),
+        (
+            18,
+            16,
+            fixed_length(raw.operation_references.len(), 16, "operation_references")?,
+        ),
     ];
     for (id, record_size, length) in lengths {
         if id == 4 && string_count != 0 {
@@ -387,6 +413,15 @@ fn preflight(
         string_count,
         string_reference_count,
         total_size,
+        format_minor: u16::from(
+            raw.features
+                .binary_search(&crate::Feature::ApplicationPlans.numeric())
+                .is_ok()
+                || raw
+                    .features
+                    .binary_search(&crate::Feature::OperationReferences.numeric())
+                    .is_ok(),
+        ),
     })
 }
 
@@ -446,7 +481,7 @@ fn encode_header_and_directory(
 ) -> Result<(), FwirEncodeError> {
     output.extend_from_slice(MAGIC);
     put_u16(output, 1);
-    put_u16(output, 0);
+    put_u16(output, plan.format_minor);
     put_u32(output, 32);
     put_u16(output, 24);
     put_u16(output, 0);
@@ -679,6 +714,8 @@ fn encode_sections(
                 primitive_id,
                 signature_id,
                 implementation_id,
+                application_plan_id: _,
+                operation_reference,
                 primitive_origin,
                 lift,
                 result_element_type,
@@ -689,6 +726,8 @@ fn encode_sections(
                     LiftMode::Scalar => 1,
                     LiftMode::Vector => 2,
                     LiftMode::DynamicVector => 3,
+                    LiftMode::ContainerScalar => 4,
+                    LiftMode::ContainerVector => 5,
                 },
                 scalar_type(result_element_type),
                 [
@@ -699,7 +738,17 @@ fn encode_sections(
                     shape.static_anchor.unwrap_or(NONE),
                     shape.dynamic_checks.start,
                     shape.dynamic_checks.count,
-                    0,
+                    operation_reference
+                        .map(|index| {
+                            index
+                                .0
+                                .checked_add(1)
+                                .ok_or(FwirEncodeError::CountOverflow {
+                                    field: "node.operation_reference",
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or(0),
                 ],
             ),
             NodeKind::PrefixSpreadPrepare => (5, 0, 0, [0; 8]),
@@ -754,6 +803,31 @@ fn encode_sections(
         put_u32(output, root.node.0);
         put_u32(output, root.origin.0);
     }
+    if raw
+        .features
+        .binary_search(&crate::Feature::ApplicationPlans.numeric())
+        .is_ok()
+    {
+        for (index, node) in raw.nodes.iter().enumerate() {
+            if let NodeKind::SelectedApply {
+                application_plan_id,
+                ..
+            } = node.kind
+            {
+                put_u32(output, checked_count(index, "application_plan.node")?);
+                put_u16(output, application_plan_id);
+                put_u16(output, 0);
+            }
+        }
+    }
+    for reference in &raw.operation_references {
+        put_u16(output, reference.primitive_id);
+        put_u16(output, reference.signature_id);
+        put_u16(output, reference.implementation_id);
+        put_u16(output, 0);
+        put_u32(output, reference.origin.0);
+        put_u32(output, 0);
+    }
     if let Some(metadata) = options.producer_metadata {
         put_u32(output, 9);
         output.extend_from_slice(b"faraweave");
@@ -781,8 +855,9 @@ fn encode_sections(
 mod tests {
     use super::*;
     use crate::{
-        ConstantRecord, Node, NodeKind, Origin, OriginPosition, OriginSpan, Ownership,
-        RawProgramBuilder, ReleaseAfter, Root, ScalarConstant, SourceUnit, TypeRecord,
+        ConstantRecord, Feature, Node, NodeKind, OperationReference, Origin, OriginPosition,
+        OriginSpan, Ownership, RawProgramBuilder, ReleaseAfter, Root, ScalarConstant, SourceUnit,
+        TypeRecord,
     };
 
     fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
@@ -833,6 +908,52 @@ mod tests {
                     column: 5,
                 },
             },
+        }));
+        let node = must(builder.push_node(Node {
+            kind: NodeKind::Constant { constant },
+            result_type: value_type,
+            cardinality: Some(Cardinality::StaticScalar),
+            edges: crate::IndexRange::default(),
+            origin,
+        }));
+        must(builder.push_ownership(Ownership {
+            owner: node,
+            release_after: ReleaseAfter::Root(crate::RootIndex(0)),
+        }));
+        must(builder.push_root(Root { node, origin }));
+        must(must(builder.finish()).verify())
+    }
+
+    fn operation_reference_program() -> VerifiedProgram {
+        let mut builder = RawProgramBuilder::new();
+        must(builder.push_feature(Feature::OperationReferences.numeric()));
+        let source_unit = must(builder.push_source_unit(SourceUnit {
+            diagnostic_name: "reference.fw".to_owned(),
+            byte_length: 4,
+        }));
+        let value_type = must(builder.push_type(TypeRecord::Scalar(ScalarType::Bool)));
+        let constant =
+            must(builder.push_constant(ConstantRecord::Scalar(ScalarConstant::Bool(true))));
+        let origin = must(builder.push_origin(Origin {
+            source_unit,
+            span: OriginSpan {
+                begin: OriginPosition {
+                    offset: 1,
+                    line: 1,
+                    column: 1,
+                },
+                end: OriginPosition {
+                    offset: 5,
+                    line: 1,
+                    column: 5,
+                },
+            },
+        }));
+        must(builder.push_operation_reference(OperationReference {
+            primitive_id: 5,
+            signature_id: 9,
+            implementation_id: 9,
+            origin,
         }));
         let node = must(builder.push_node(Node {
             kind: NodeKind::Constant { constant },
@@ -971,6 +1092,31 @@ mod tests {
             constant_elements
                 .chunks_exact(12)
                 .any(|record| record[0] == 2 && record[4..12] == 1_i64.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn operation_reference_section_is_canonical_and_roundtrips() {
+        let encoded = must(encode_fwir(
+            &operation_reference_program(),
+            &FwirEncodeOptions::default(),
+        ));
+        let module = section(&encoded, 1).expect("MODL section");
+        assert_eq!(read_u16(module, 0), 1);
+        assert_eq!(read_u16(module, 2), 1);
+        assert_eq!(section(&encoded, 2), Some(&[6, 0, 0, 0][..]));
+        assert_eq!(
+            section(&encoded, 18),
+            Some(&[5, 0, 9, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..])
+        );
+        let decoded = must(crate::decode_fwir(
+            &encoded,
+            &crate::FwirDecodeLimits::default(),
+        ));
+        assert_eq!(decoded.as_raw().operation_references.len(), 1);
+        assert_eq!(
+            must(encode_fwir(&decoded, &FwirEncodeOptions::default())),
+            encoded
         );
     }
 

@@ -134,29 +134,29 @@ fn sin_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
         selections,
         vec![
             (
-                39,
-                39,
+                58,
+                58,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::Identity,
             ),
             (
-                39,
-                39,
+                58,
+                58,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                39,
-                39,
+                58,
+                58,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                39,
-                39,
+                58,
+                58,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
@@ -396,7 +396,7 @@ fn sin_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     );
 
     let node = sin_node(&bytes);
-    for (relative, replacement) in [(24, 32_u32), (28, 38), (32, 38)] {
+    for (relative, replacement) in [(24, 32_u32), (28, 57), (32, 57)] {
         let mut malformed = bytes.clone();
         malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
         let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
@@ -450,6 +450,6 @@ fn sin_emitted_c_calls_math_h_sin_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=sin(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_sin(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_39("));
-    assert!(source.contains("static int fw_impl_39("));
+    assert!(source.contains("static int fw_kernel_58("));
+    assert!(source.contains("static int fw_impl_58("));
 }

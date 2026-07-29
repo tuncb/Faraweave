@@ -1,0 +1,3 @@
+# Issue #41 — deterministic vector sort
+
+Implementation is based on dependency integration commit `d4149c45604d264010796b63454af18bdc66d12b`, which contains #40 and must not enter final integration until #40 merges. Primitive 22 appends signatures and implementations 40–42 plus plan 4, preserving the input cardinality and charging exactly one work unit per element with input and output live during output admission. Rust uses allocation-free unstable slice sorting after an explicit copy, while generated C uses in-place heapsort and the same total binary64 key, so comparison counts are not semantic and no dependency is added.

@@ -116,29 +116,29 @@ fn floor_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
         selections,
         vec![
             (
-                42,
-                42,
+                61,
+                61,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::Identity,
             ),
             (
-                42,
-                42,
+                61,
+                61,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                42,
-                42,
+                61,
+                61,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                42,
-                42,
+                61,
+                61,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
@@ -386,7 +386,7 @@ fn floor_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     );
 
     let node = floor_node(&bytes);
-    for (relative, replacement) in [(24, 35_u32), (28, 41), (32, 41)] {
+    for (relative, replacement) in [(24, 35_u32), (28, 60), (32, 60)] {
         let mut malformed = bytes.clone();
         malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
         let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
@@ -440,6 +440,6 @@ fn floor_emitted_c_calls_math_h_floor_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=floor(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_floor(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_42("));
-    assert!(source.contains("static int fw_impl_42("));
+    assert!(source.contains("static int fw_kernel_61("));
+    assert!(source.contains("static int fw_impl_61("));
 }
