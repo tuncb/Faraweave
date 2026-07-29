@@ -84,6 +84,28 @@ LOG10_OUTPUT_LEAVES = (
     (0x3FF0_0000_0000_0001, 4),
     (0x4073_4413_509F_79FF, 4),
 )
+SIN_OUTPUT = (
+    b"0.0\n-0.0\n(nan nan nan)\n"
+    b"(0.8414709848078965 0.49999999999999994 1.0 -1.0)\n"
+    b"(1.2246467991473532e-16 5.66553889764798e-16 -3.216245299353273e-16)\n"
+    b"5e-324\n-0.8178819121159085\n0.004961954789184062\n"
+)
+# Signed-zero leaves are exact. Every other numeric leaf uses
+# FWIR-MATH-003's eight-ULP-or-2^-48-absolute checked-reference envelope.
+SIN_OUTPUT_LEAVES = (
+    (0x0000_0000_0000_0000, 0, 0.0),
+    (0x8000_0000_0000_0000, 0, 0.0),
+    (0x3FEA_ED54_8F09_0CEE, 8, 2.0**-48),
+    (0x3FDF_FFFF_FFFF_FFFF, 8, 2.0**-48),
+    (0x3FF0_0000_0000_0000, 8, 2.0**-48),
+    (0xBFF0_0000_0000_0000, 8, 2.0**-48),
+    (0x3CA1_A626_3314_5C07, 8, 2.0**-48),
+    (0x3CC4_6989_8CC5_1702, 8, 2.0**-48),
+    (0xBCB7_2CEC_E675_D1FD, 8, 2.0**-48),
+    (0x0000_0000_0000_0001, 8, 2.0**-48),
+    (0xBFEA_2C16_B010_E385, 8, 2.0**-48),
+    (0x3F74_52FC_98B3_4E97, 8, 2.0**-48),
+)
 NUMERIC_LEAF = re.compile(
     rb"(?<![A-Za-z0-9_.])[-+]?(?:[0-9]+\.[0-9]+|[0-9]+)"
     rb"(?:e[-+]?[0-9]+)?(?![A-Za-z0-9_.])"
@@ -310,11 +332,11 @@ def numeric_leaf_view(output: bytes) -> tuple[bytes, list[bytes]]:
     return bytes(skeleton), leaves
 
 
-def backend_math_output_mismatch(
+def backend_math_output_mismatch_with_absolute(
     operation: str,
     actual: bytes,
     reference_output: bytes,
-    leaf_specs: tuple[tuple[int, int], ...],
+    leaf_specs: tuple[tuple[int, int, float], ...],
 ) -> str | None:
     reference_skeleton, reference_leaves = numeric_leaf_view(reference_output)
     actual_skeleton, actual_leaves = numeric_leaf_view(actual)
@@ -331,7 +353,7 @@ def backend_math_output_mismatch(
     for index, (actual_text, reference_text, leaf) in enumerate(
         zip(actual_leaves, reference_leaves, leaf_specs)
     ):
-        reference_bits, max_ulps = leaf
+        reference_bits, max_ulps, max_absolute = leaf
         try:
             actual_bits = binary64_bits(float(actual_text.decode("ascii")))
             formatted_reference_bits = binary64_bits(
@@ -356,9 +378,13 @@ def backend_math_output_mismatch(
         ulps = abs(
             binary64_order_key(actual_bits) - binary64_order_key(reference_bits)
         )
-        if ulps > max_ulps:
+        if (
+            ulps > max_ulps
+            and abs(actual_value - binary64(reference_bits)) > max_absolute
+        ):
             return (
-                f"{operation} numeric leaf {index} exceeds {max_ulps} ULP: "
+                f"{operation} numeric leaf {index} exceeds {max_ulps} ULP "
+                f"and absolute error {max_absolute}: "
                 f"actual={actual_bits:016x} reference={reference_bits:016x}"
             )
         if actual_text != canonical_binary64_text(actual_bits):
@@ -367,6 +393,20 @@ def backend_math_output_mismatch(
                 "changed canonical formatting"
             )
     return None
+
+
+def backend_math_output_mismatch(
+    operation: str,
+    actual: bytes,
+    reference_output: bytes,
+    leaf_specs: tuple[tuple[int, int], ...],
+) -> str | None:
+    return backend_math_output_mismatch_with_absolute(
+        operation,
+        actual,
+        reference_output,
+        tuple((bits, max_ulps, 0.0) for bits, max_ulps in leaf_specs),
+    )
 
 
 def sqrt_output_mismatch(
@@ -421,6 +461,19 @@ def log10_output_mismatch(
     )
 
 
+def sin_output_mismatch(
+    actual: bytes,
+    reference_output: bytes = SIN_OUTPUT,
+    leaf_specs: tuple[tuple[int, int, float], ...] = SIN_OUTPUT_LEAVES,
+) -> str | None:
+    return backend_math_output_mismatch_with_absolute(
+        "sin",
+        actual,
+        reference_output,
+        leaf_specs,
+    )
+
+
 def require_sqrt_output(actual: bytes, label: str) -> None:
     mismatch = sqrt_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
@@ -438,6 +491,11 @@ def require_log_output(actual: bytes, label: str) -> None:
 
 def require_log10_output(actual: bytes, label: str) -> None:
     mismatch = log10_output_mismatch(actual)
+    require(mismatch is None, f"{label}: {mismatch}")
+
+
+def require_sin_output(actual: bytes, label: str) -> None:
+    mismatch = sin_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
 
 
@@ -619,6 +677,59 @@ def validate_log10_output_comparator() -> None:
         )
 
 
+def validate_sin_output_comparator() -> None:
+    reference = b"0.5\n0.0\n-0.5\n"
+    leaves = (
+        (0x3FE0_0000_0000_0000, 8, 2.0**-48),
+        (0x0000_0000_0000_0000, 0, 0.0),
+        (0xBFE0_0000_0000_0000, 8, 2.0**-48),
+    )
+    require(
+        sin_output_mismatch(reference, reference, leaves) is None,
+        "sin comparator exact",
+    )
+    require(
+        sin_output_mismatch(
+            b"0.5000000000000009\n0.0\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "sin comparator +8 ULP",
+    )
+    require(
+        sin_output_mismatch(
+            b"0.49999999999999956\n0.0\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "sin comparator -8 ULP",
+    )
+    require(
+        sin_output_mismatch(
+            b"0.5000000000000036\n0.0\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "sin comparator absolute-error fallback",
+    )
+    for invalid, label in [
+        (b"0.5000000000000037\n0.0\n-0.5\n", "outside mixed envelope"),
+        (b"0.5\n-0.0\n-0.5\n", "signed zero"),
+        (b"-0.5\n0.0\n-0.5\n", "finite sign"),
+        (b"0.5\n0.0\nnan\n", "special value"),
+        (b"(0.5)\n0.0\n-0.5\n", "structure"),
+        (b"0.50\n0.0\n-0.5\n", "canonical formatting"),
+        (b"-0.5\n0.0\n0.5\n", "root order"),
+    ]:
+        require(
+            sin_output_mismatch(invalid, reference, leaves) is not None,
+            f"sin comparator accepted invalid {label}",
+        )
+
+
 def validate_backend_native_math_policy(
     compiler: str,
     environment: dict[str, str],
@@ -783,6 +894,7 @@ def main() -> None:
     validate_exp_output_comparator()
     validate_log_output_comparator()
     validate_log10_output_comparator()
+    validate_sin_output_comparator()
     executable = Path(
         os.environ.get(
             "FARAWEAVE_EXE",
@@ -834,6 +946,11 @@ def main() -> None:
                 ROOT / "tests/fixtures/backend-native-log10.bennu",
                 [],
                 LOG10_OUTPUT,
+            ),
+            (
+                ROOT / "tests/fixtures/backend-native-sin.bennu",
+                [],
+                SIN_OUTPUT,
             ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
@@ -904,6 +1021,9 @@ def main() -> None:
             elif fixture.name == "backend-native-log10.bennu":
                 require_log10_output(generated_output, "generated log10 output")
                 require_log10_output(evaluator_output, "evaluator log10 output")
+            elif fixture.name == "backend-native-sin.bennu":
+                require_sin_output(generated_output, "generated sin output")
+                require_sin_output(evaluator_output, "evaluator sin output")
             else:
                 require(
                     generated_output == normalize_newlines(expected),
@@ -929,6 +1049,7 @@ def main() -> None:
                 "backend-native-exp.bennu",
                 "backend-native-log.bennu",
                 "backend-native-log10.bennu",
+                "backend-native-sin.bennu",
             }:
                 operation = fixture.stem.removeprefix("backend-native-")
                 hostile_source = work / f"{fixture.stem}-hostile.c"
@@ -1065,10 +1186,15 @@ int main(int argc, char **argv) {
                         hostile_output,
                         "log hostile generated-C output",
                     )
-                else:
+                elif operation == "log10":
                     require_log10_output(
                         hostile_output,
                         "log10 hostile generated-C output",
+                    )
+                else:
+                    require_sin_output(
+                        hostile_output,
+                        "sin hostile generated-C output",
                     )
             if index == 0:
                 hostile_source = work / "fixture-hostile-fp.c"
