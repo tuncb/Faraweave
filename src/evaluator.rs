@@ -258,6 +258,8 @@ mod tests {
             ("sum[(1 2 3)]", "6"),
             ("sum[(1.5 -0.5 2.0)]", "3.0"),
             ("sum[Double()]", "0.0"),
+            ("all_of[Bool()]", "true"),
+            ("all_of[(true true false)]", "false"),
             ("equals[1 1.0]", "true"),
             ("not_equals[1 2]", "true"),
             ("not[false]", "true"),

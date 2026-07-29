@@ -6,5 +6,6 @@ iota[count]
 length iota count
 sort iota count
 sum iota count
+all_of equals[iota count iota count]
 add[ratio count]
 not[enabled]
