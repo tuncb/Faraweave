@@ -65,6 +65,7 @@ pub(crate) struct ApplicationPlan {
 pub(crate) enum StructuralBehavior {
     Elementwise,
     Iota,
+    VectorLength,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +86,9 @@ pub(crate) enum ScalarKernel {
     MulDouble,
     DivInt,
     DivDouble,
+    LengthBoolVector,
+    LengthIntVector,
+    LengthDoubleVector,
     EqualsBool,
     EqualsInt,
     EqualsDouble,
@@ -191,15 +195,22 @@ impl InternalRegistryDiagnosticFailureInjection {
     }
 }
 
-const PRIMITIVE_COUNT: u16 = 20;
-const SIGNATURE_COUNT: u16 = 36;
-const IMPLEMENTATION_COUNT: u16 = 36;
-const APPLICATION_PLAN_COUNT: u16 = 2;
+const PRIMITIVE_COUNT: u16 = 21;
+const SIGNATURE_COUNT: u16 = 39;
+const IMPLEMENTATION_COUNT: u16 = 39;
+const APPLICATION_PLAN_COUNT: u16 = 3;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
     OperandDescriptor {
         element_type,
         consumption: OperandConsumption::Elementwise,
+    }
+}
+
+const fn whole_vector(element_type: ScalarType) -> OperandDescriptor {
+    OperandDescriptor {
+        element_type,
+        consumption: OperandConsumption::WholeVector,
     }
 }
 
@@ -212,6 +223,9 @@ const DOUBLE2: &[OperandDescriptor] = &[
     elementwise(ScalarType::Double),
 ];
 const BOOL2: &[OperandDescriptor] = &[elementwise(ScalarType::Bool), elementwise(ScalarType::Bool)];
+const WHOLE_BOOL1: &[OperandDescriptor] = &[whole_vector(ScalarType::Bool)];
+const WHOLE_INT1: &[OperandDescriptor] = &[whole_vector(ScalarType::Int)];
+const WHOLE_DOUBLE1: &[OperandDescriptor] = &[whole_vector(ScalarType::Double)];
 
 const ELEMENTWISE_PLAN: ApplicationPlan = ApplicationPlan {
     id: ApplicationPlanId(1),
@@ -229,7 +243,15 @@ const IOTA_PLAN: ApplicationPlan = ApplicationPlan {
     },
 };
 
-const APPLICATION_PLANS: &[ApplicationPlan] = &[ELEMENTWISE_PLAN, IOTA_PLAN];
+const LENGTH_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(3),
+    result_cardinality: ResultCardinality::Scalar,
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::Constant(1),
+    },
+};
+
+const APPLICATION_PLANS: &[ApplicationPlan] = &[ELEMENTWISE_PLAN, IOTA_PLAN, LENGTH_PLAN];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -644,6 +666,39 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         ELEMENTWISE_PLAN,
         DivDouble
     ),
+    descriptor!(
+        21,
+        "length",
+        37,
+        37,
+        WHOLE_BOOL1,
+        Int,
+        VectorLength,
+        LENGTH_PLAN,
+        LengthBoolVector
+    ),
+    descriptor!(
+        21,
+        "length",
+        38,
+        38,
+        WHOLE_INT1,
+        Int,
+        VectorLength,
+        LENGTH_PLAN,
+        LengthIntVector
+    ),
+    descriptor!(
+        21,
+        "length",
+        39,
+        39,
+        WHOLE_DOUBLE1,
+        Int,
+        VectorLength,
+        LENGTH_PLAN,
+        LengthDoubleVector
+    ),
 ];
 
 impl PrimitiveId {
@@ -810,7 +865,7 @@ fn write_registry_diagnostics(
                 operand_consumption_name(parameter.consumption),
             )
             .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
-            write_conversions(output, parameter.element_type)?;
+            write_conversions(output, *parameter)?;
             write!(output, "}}").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
         }
         write!(
@@ -833,13 +888,18 @@ fn write_registry_diagnostics(
 
 fn write_conversions(
     output: &mut impl Write,
-    accepted: ScalarType,
+    parameter: OperandDescriptor,
 ) -> Result<(), InternalRegistryDiagnosticError> {
     let mut first = true;
     for actual in [ScalarType::Bool, ScalarType::Int, ScalarType::Double] {
-        let Some(selected) = conversion(actual, accepted) else {
+        let Some(selected) = conversion(actual, parameter.element_type) else {
             continue;
         };
+        if parameter.consumption == OperandConsumption::WholeVector
+            && selected != Conversion::Identity
+        {
+            continue;
+        }
         if !first {
             write!(output, ",").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
         }
@@ -900,6 +960,7 @@ const fn structural_behavior_name(value: StructuralBehavior) -> &'static str {
     match value {
         StructuralBehavior::Elementwise => "elementwise",
         StructuralBehavior::Iota => "iota",
+        StructuralBehavior::VectorLength => "vector_length",
     }
 }
 
@@ -941,6 +1002,9 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::GreaterThanInt => "greater_than_int",
         ScalarKernel::GreaterThanDouble => "greater_than_double",
         ScalarKernel::IotaInt => "iota_int",
+        ScalarKernel::LengthBoolVector => "length_bool_vector",
+        ScalarKernel::LengthIntVector => "length_int_vector",
+        ScalarKernel::LengthDoubleVector => "length_double_vector",
     }
 }
 
@@ -1264,6 +1328,21 @@ mod tests {
              application_plan=2 result_cardinality=dynamic_vector work=result_cardinality \
              kernel=iota_int\n"
         ));
+        assert!(output.contains(
+            "primitive id=21 name=length behavior=vector_length\n  signature id=37 \
+             implementation=37 parameters=[1:accepted=Bool,lift=whole_vector,\
+             actual={Bool:identity}] result=Int application_plan=3 result_cardinality=scalar \
+             work=constant(1) kernel=length_bool_vector\n  signature id=38 implementation=38 \
+             parameters=[1:accepted=Int,lift=whole_vector,actual={Int:identity}] result=Int \
+             application_plan=3 result_cardinality=scalar work=constant(1) \
+             kernel=length_int_vector\n  signature id=39 implementation=39 \
+             parameters=[1:accepted=Double,lift=whole_vector,actual={Double:identity}] result=Int \
+             application_plan=3 result_cardinality=scalar work=constant(1) \
+             kernel=length_double_vector\n"
+        ));
+        assert!(output.lines().all(|line| {
+            !line.contains("lift=whole_vector") || !line.contains("promote_int_to_double")
+        }));
 
         let mut reversed = SEMANTIC_REGISTRY.to_vec();
         reversed.reverse();
@@ -1387,6 +1466,9 @@ mod tests {
             (19, "iota"),
             (20, "div"),
             (20, "div"),
+            (21, "length"),
+            (21, "length"),
+            (21, "length"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1404,6 +1486,7 @@ mod tests {
         }
         assert_eq!(primitive_from_name("inc"), primitive_from_numeric(1));
         assert_eq!(primitive_from_name("div"), primitive_from_numeric(20));
+        assert_eq!(primitive_from_name("length"), primitive_from_numeric(21));
         assert_eq!(
             signature_from_numeric(36).map(|descriptor| descriptor.primitive_name),
             Ok("div")
@@ -1413,21 +1496,41 @@ mod tests {
             Ok(ScalarKernel::DivDouble)
         );
         assert_eq!(
+            signature_from_numeric(39).map(|descriptor| descriptor.primitive_name),
+            Ok("length")
+        );
+        assert_eq!(
+            implementation_from_numeric(39).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::LengthDoubleVector)
+        );
+        assert_eq!(
             implementation_from_numeric(34).map(|descriptor| descriptor.kernel),
             Ok(ScalarKernel::IotaInt)
         );
         assert_eq!(application_plan_from_numeric(1), Ok(ELEMENTWISE_PLAN));
         assert_eq!(application_plan_from_numeric(2), Ok(IOTA_PLAN));
+        assert_eq!(application_plan_from_numeric(3), Ok(LENGTH_PLAN));
         assert!(
             SEMANTIC_REGISTRY
                 .iter()
-                .filter(|descriptor| descriptor.kernel != ScalarKernel::IotaInt)
+                .filter(|descriptor| descriptor.behavior == StructuralBehavior::Elementwise)
                 .all(|descriptor| {
                     descriptor.application_plan == ELEMENTWISE_PLAN
                         && descriptor
                             .parameters
                             .iter()
                             .all(|operand| operand.consumption == OperandConsumption::Elementwise)
+                })
+        );
+        assert!(
+            SEMANTIC_REGISTRY
+                .iter()
+                .filter(|descriptor| descriptor.behavior == StructuralBehavior::VectorLength)
+                .all(|descriptor| {
+                    descriptor.application_plan == LENGTH_PLAN
+                        && descriptor.result == ScalarType::Int
+                        && descriptor.parameters.len() == 1
+                        && descriptor.parameters[0].consumption == OperandConsumption::WholeVector
                 })
         );
         assert_eq!(
@@ -1439,15 +1542,15 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(37),
+            signature_from_numeric(40),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(37),
+            implementation_from_numeric(40),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
-            application_plan_from_numeric(3),
+            application_plan_from_numeric(4),
             Err(RegistryLookupError::ApplicationPlanId)
         );
     }
@@ -1485,7 +1588,7 @@ mod tests {
             Err(RegistryValidationError::DuplicatePrimitiveName)
         );
 
-        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 2];
+        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 3];
         assert_eq!(
             validate_registry(missing),
             Err(RegistryValidationError::MissingPrimitiveId)
@@ -1635,7 +1738,7 @@ mod tests {
         assert_eq!(
             validate_registry_with_application_plans(
                 SEMANTIC_REGISTRY,
-                &[ELEMENTWISE_PLAN, IOTA_PLAN, IOTA_PLAN],
+                &[ELEMENTWISE_PLAN, IOTA_PLAN, LENGTH_PLAN, IOTA_PLAN],
             ),
             Err(RegistryValidationError::DuplicateApplicationPlanId)
         );

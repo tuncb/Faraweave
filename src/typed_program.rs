@@ -3289,6 +3289,13 @@ mod tests {
         must(builder.finish())
     }
 
+    fn length_program() -> RawProgram {
+        match crate::lowering::compile_source_with_name("length[(1 2 3)]\n", "length.faraweave") {
+            Ok(program) => program.raw,
+            Err(error) => panic!("length fixture did not lower: {error}"),
+        }
+    }
+
     fn dynamic_shape_program() -> RawProgram {
         let mut builder = RawProgramBuilder::new();
         must(builder.push_feature(Feature::StableSemanticIds.numeric()));
@@ -4483,6 +4490,75 @@ mod tests {
         explicit.features.push(Feature::ApplicationPlans.numeric());
         explicit.module.ranges.features.count += 1;
         assert!(explicit.verify().is_ok());
+    }
+
+    #[test]
+    fn vector_length_plan_identity_container_mode_and_feature_are_verified() {
+        assert!(length_program().verify().is_ok());
+
+        let mut wrong_plan = length_program();
+        let Some(node) = wrong_plan.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 21,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing length node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut application_plan_id,
+            ..
+        } = node.kind
+        else {
+            panic!("length node kind changed");
+        };
+        *application_plan_id = 1;
+        verify_error(wrong_plan, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_lift = length_program();
+        let Some(node) = wrong_lift.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 21,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing length node");
+        };
+        let NodeKind::SelectedApply { ref mut lift, .. } = node.kind else {
+            panic!("length node kind changed");
+        };
+        *lift = LiftMode::Scalar;
+        verify_error(wrong_lift, Invariant::InconsistentResultMetadata);
+
+        let mut wrong_conversion = length_program();
+        let Some(node) = wrong_conversion.nodes.iter().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 21,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing length node");
+        };
+        wrong_conversion.edges[node.edges.start as usize].conversion =
+            Conversion::PromoteIntToDouble;
+        verify_error(wrong_conversion, Invariant::InvalidRecord);
+
+        let mut missing_feature = length_program();
+        missing_feature
+            .features
+            .retain(|feature| *feature != Feature::ApplicationPlans.numeric());
+        missing_feature.module.ranges.features.count =
+            u32::try_from(missing_feature.features.len()).unwrap_or(u32::MAX);
+        verify_error(missing_feature, Invariant::MissingFeature);
     }
 
     #[test]

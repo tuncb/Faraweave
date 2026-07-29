@@ -128,6 +128,32 @@ pub(crate) fn apply_implementation(
     }
 
     if matches!(
+        descriptor.kernel,
+        ScalarKernel::LengthBoolVector
+            | ScalarKernel::LengthIntVector
+            | ScalarKernel::LengthDoubleVector
+    ) {
+        let [argument] = arguments else {
+            return Err(type_runtime_error(producer, location));
+        };
+        if lift != crate::LiftMode::ContainerScalar
+            || result_type != ScalarType::Int
+            || argument.conversion != crate::Conversion::Identity
+        {
+            return Err(type_runtime_error(producer, location));
+        }
+        let length = match (descriptor.kernel, argument.value) {
+            (ScalarKernel::LengthBoolVector, Value::BoolVector(values)) => values.len(),
+            (ScalarKernel::LengthIntVector, Value::IntVector(values)) => values.len(),
+            (ScalarKernel::LengthDoubleVector, Value::DoubleVector(values)) => values.len(),
+            _ => return Err(type_runtime_error(producer, location)),
+        };
+        let work = admitted_work(application_plan, 1, arguments, producer, location)?;
+        return apply_vector_length(length, work, location, producer, resources)
+            .map(|value| (value, false));
+    }
+
+    if matches!(
         lift,
         crate::LiftMode::ContainerScalar | crate::LiftMode::ContainerVector
     ) {
@@ -418,7 +444,14 @@ fn invoke_kernel(
         (ScalarKernel::GreaterThanDouble, [Value::Double(left), Value::Double(right)]) => {
             Some(Value::Bool(strict_float::less_than(*right, *left)))
         }
-        (ScalarKernel::DivInt | ScalarKernel::IotaInt, _) => None,
+        (
+            ScalarKernel::DivInt
+            | ScalarKernel::LengthBoolVector
+            | ScalarKernel::LengthIntVector
+            | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::IotaInt,
+            _,
+        ) => None,
         _ => None,
     };
     result.ok_or_else(|| {
@@ -431,6 +464,19 @@ fn invoke_kernel(
             DomainErrorReason::IntegerOverflow,
         )
     })
+}
+
+fn apply_vector_length(
+    length: usize,
+    work: usize,
+    location: SourceLocation,
+    producer: &str,
+    resources: &mut ResourceContext,
+) -> Result<Value, Error> {
+    resources.charge_work(work, location, producer)?;
+    i64::try_from(length)
+        .map(Value::Int)
+        .map_err(|_| resources.size_overflow(Some(length), location, producer))
 }
 
 fn integer_domain_error(
@@ -628,5 +674,47 @@ mod tests {
             .kind,
             ErrorKind::TypeError
         );
+    }
+
+    #[test]
+    fn vector_length_maximum_and_overflow_seams_charge_before_conversion() {
+        let mut resources = context(ResourceLimits {
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        });
+        let representable = usize::try_from(i64::MAX).unwrap_or(usize::MAX);
+        assert_eq!(
+            apply_vector_length(
+                representable,
+                1,
+                SourceLocation::start(),
+                "length",
+                &mut resources
+            ),
+            Ok(Value::Int(i64::try_from(representable).unwrap_or(i64::MAX)))
+        );
+        assert_eq!(resources.usage.work_units, 1);
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let unrepresentable = usize::try_from(i64::MAX)
+                .ok()
+                .and_then(|maximum| maximum.checked_add(1))
+                .unwrap_or(usize::MAX);
+            let error = apply_vector_length(
+                unrepresentable,
+                1,
+                SourceLocation::start(),
+                "length",
+                &mut resources,
+            )
+            .expect_err("unrepresentable vector length");
+            assert_eq!(error.kind, ErrorKind::ResourceError);
+            let context = error.resource.expect("structured size overflow");
+            assert_eq!(context.reason, crate::ResourceErrorReason::SizeOverflow);
+            assert_eq!(context.requested_elements, Some(unrepresentable));
+            assert_eq!(resources.usage.work_units, 2);
+            assert_eq!(resources.usage.allocation_attempts, 0);
+        }
     }
 }

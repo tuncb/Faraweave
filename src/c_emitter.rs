@@ -200,6 +200,26 @@ impl<'a> IrCGenerator<'a> {
                 .map_err(|_| emission_error())?;
                 continue;
             }
+            if matches!(
+                descriptor.kernel,
+                ScalarKernel::LengthBoolVector
+                    | ScalarKernel::LengthIntVector
+                    | ScalarKernel::LengthDoubleVector
+            ) {
+                let crate::semantic_registry::WorkAdmission::Constant(work) =
+                    descriptor.application_plan.resources.work
+                else {
+                    return Err(emission_error());
+                };
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_length({},args,out,line,column,{}U); }}",
+                    c_string(descriptor.primitive_name),
+                    work,
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
             self.emit_selected_kernel(implementation, descriptor.kernel)?;
             writeln!(
                 self.definitions,
@@ -297,7 +317,10 @@ impl<'a> IrCGenerator<'a> {
             ScalarKernel::GreaterThanDouble => {
                 "fw_set_bool(out,fw_double_less_than(args[1].d,args[0].d));return 1;"
             }
-            ScalarKernel::IotaInt => return Err(emission_error()),
+            ScalarKernel::LengthBoolVector
+            | ScalarKernel::LengthIntVector
+            | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::IotaInt => return Err(emission_error()),
         };
         writeln!(
             self.definitions,
@@ -598,9 +621,8 @@ impl<'a> IrCGenerator<'a> {
                 LiftMode::Scalar => 0,
                 LiftMode::Vector => 1,
                 LiftMode::DynamicVector => 2,
-                LiftMode::ContainerScalar | LiftMode::ContainerVector => {
-                    return Err(emission_error());
-                }
+                LiftMode::ContainerScalar => 3,
+                LiftMode::ContainerVector => return Err(emission_error()),
             }
         )
         .map_err(|_| emission_error())?;
@@ -1163,6 +1185,13 @@ static int fw_apply_selected_iota(const char *name,const FWV *args,FWV *out,
   for(i=0U;i<length;++i)((int64_t *)out->data)[i]=(int64_t)i+1;
   return 1;
 }
+static int fw_apply_selected_length(const char *name,const FWV *args,FWV *out,
+                                    size_t line,size_t column,size_t work) {
+  if(!fw_charge_work(work,name,line,column))return 0;
+  if((uint64_t)args[0].len>UINT64_C(9223372036854775807))
+    return fw_fail_resource(name,"size_overflow",line,column);
+  fw_set_int(out,(int64_t)args[0].len);return 1;
+}
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
 static int fw_append(FWBuffer *buffer,const char *text) {
   size_t n=strlen(text),needed; char *grown;
@@ -1331,6 +1360,7 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   size_t supplied=argc>0?(size_t)argc-1U:0U,i,initialized=0U;FWV *values=NULL;FWBuffer output={0};int decoded;
   (void)fw_apply_selected;
   (void)fw_apply_selected_iota;
+  (void)fw_apply_selected_length;
   (void)fw_selected_integer_overflow;
   (void)fw_selected_division_by_zero;
   (void)fw_as_double;
@@ -1549,7 +1579,7 @@ mod ir_tests {
     }
 
     #[test]
-    fn every_selected_id_emits_a_direct_kernel_symbol_without_type_redispatch() {
+    fn every_selected_id_emits_direct_dispatch_without_type_redispatch() {
         let source = emit(
             "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
              abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
@@ -1558,7 +1588,8 @@ mod ir_tests {
              not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
-             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n",
+             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
+             length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n",
         );
         for implementation in (1..=36).filter(|implementation| *implementation != 34) {
             assert!(
@@ -1572,8 +1603,27 @@ mod ir_tests {
         }
         assert!(source.contains("static int fw_impl_34("));
         assert!(source.contains("return fw_apply_selected_iota(\"iota\""));
+        for implementation in 37..=39 {
+            assert!(source.contains(&format!("static int fw_impl_{implementation}(")));
+            assert!(source.contains(&format!("fw_impl_{implementation}(const FWV *args")));
+        }
+        assert_eq!(
+            source.matches("return fw_apply_selected_length(").count(),
+            3
+        );
         assert!(!source.contains("fw_apply_scalar"));
         assert!(!source.contains("primitive=="));
+    }
+
+    #[test]
+    fn length_uses_container_dispatch_checked_conversion_and_constant_work() {
+        let source = emit("length[(true false)]\nlength[(1 2 3)]\nlength[(1.0 2.0 3.0 4.0)]\n");
+        assert!(source.contains("fw_apply_selected_length(\"length\",args,out,line,column,1U)"));
+        assert!(source.contains("if(!fw_charge_work(work,name,line,column))return 0;"));
+        let overflow = source.find("(uint64_t)args[0].len>UINT64_C(9223372036854775807)");
+        let conversion = source.find("fw_set_int(out,(int64_t)args[0].len)");
+        assert!(matches!((overflow, conversion), (Some(check), Some(cast)) if check < cast));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
     }
 
     #[test]
@@ -1797,6 +1847,8 @@ mod ir_tests {
             ("parameters[x Int]\ninc[x]\n", &["9223372036854775807"]),
             ("div[(8 9 10) (2 0 5)]\n", &[]),
             ("div[-9223372036854775808 -1]\n", &[]),
+            ("length[(true false true)]\n", &[]),
+            ("parameters[n Int]\nlength iota n\n", &["3"]),
             ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
         ];
         for (source, arguments) in corpus {
@@ -1813,6 +1865,20 @@ mod ir_tests {
         };
         let source = "parameters[n Int]\n1\niota[n]\n";
         assert_public_generated_matches_direct(source, &["3"], resource_configuration);
+
+        let length_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(3),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "parameters[n Int]\nlength iota n\n",
+            &["3"],
+            length_work_configuration,
+        );
     }
 
     #[cfg(not(windows))]
@@ -1904,7 +1970,8 @@ mod ir_tests {
              not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
-             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n";
+             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
+             length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n";
         let configuration = EvaluationConfiguration::default();
         assert_public_generated_matches_direct(source, &[], configuration);
     }

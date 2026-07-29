@@ -1,9 +1,9 @@
 use faraweave::{
-    DomainErrorReason, EvaluationConfiguration, FwirDecodeLimits, FwirEncodeOptions,
-    ResourceErrorReason, Value, compile_source_to_fwir, compile_source_to_fwir_with_name,
-    compile_source_to_verified_program, decode_fwir, emit_c_from_verified_program, encode_fwir,
-    evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
-    inspect_fwir,
+    DomainErrorReason, EvaluationConfiguration, Feature, FwirDecodeLimits, FwirEncodeOptions,
+    LiftMode, NodeKind, ResourceErrorReason, Value, compile_source_to_fwir,
+    compile_source_to_fwir_with_name, compile_source_to_verified_program, decode_fwir,
+    emit_c_from_verified_program, encode_fwir, evaluate_verified_program_with_arguments,
+    evaluate_verified_program_with_observer, inspect_fwir,
 };
 use std::sync::Mutex;
 
@@ -182,6 +182,88 @@ fn div_identity_domain_and_c_emission_survive_fwir_roundtrip() {
         emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
     assert!(emitted.source.contains("static int fw_kernel_35("));
     assert!(emitted.source.contains("fw_selected_division_by_zero"));
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn length_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  length[(true false)]\n\
+                  length[(1 2 3)]\n\
+                  length[Double()]\n\
+                  length iota n\n";
+    let program =
+        compile_source_to_verified_program(source, "length.faraweave").expect("compile length");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 21,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (37, 37, 3, LiftMode::ContainerScalar),
+            (38, 38, 3, LiftMode::ContainerScalar),
+            (39, 39, 3, LiftMode::ContainerScalar),
+            (38, 38, 3, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode length");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified length");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode length"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct length");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded length");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["2", "3", "0", "4"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    for implementation in 37..=39 {
+        assert!(
+            emitted
+                .source
+                .contains(&format!("static int fw_impl_{implementation}("))
+        );
+    }
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_length(")
+            .count(),
+        3
+    );
     assert!(!emitted.source.contains("strcmp(name"));
 }
 

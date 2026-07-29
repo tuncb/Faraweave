@@ -19,9 +19,24 @@ struct ObservedResourceEvent {
 }
 
 static RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static LENGTH_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_length_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = LENGTH_RESOURCE_EVENTS.lock() {
         events.push(ObservedResourceEvent {
             kind: event.kind,
             producer: event.producer.to_owned(),
@@ -488,6 +503,90 @@ fn div_admission_precedes_domain_and_failure_cleanup_is_exact() {
     );
     assert_eq!(resource(&allocation).allocation_ordinal, Some(2));
     assert!(allocation.domain.is_none());
+}
+
+#[test]
+fn length_charges_constant_work_borrows_input_and_has_no_result_allocation() {
+    LENGTH_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let result = faraweave::evaluate_expression_with_observer(
+        "length[(1 2 3)]",
+        EvaluationConfiguration::default(),
+        observe_length_resource_event,
+    )
+    .expect("vector length");
+    assert_eq!(result.value, Value::Int(3));
+    assert_eq!(
+        result.usage,
+        faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 24,
+            work_units: 1,
+            allocation_attempts: 1,
+        }
+    );
+    let events = LENGTH_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[0].bytes, Some(24));
+    assert_eq!(events[0].ordinal, Some(0));
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].producer, "length");
+    assert_eq!(events[1].bytes, None);
+    assert_eq!(events[1].work, 1);
+    assert_eq!(events[1].ordinal, None);
+    assert_eq!(events[1].usage.live_evaluation_bytes, 24);
+    assert_eq!(events[1].usage.work_units, 1);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 0);
+    assert_eq!(events[2].usage.work_units, 1);
+
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "length[(1 2 3)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("length performs no second allocation");
+    assert_eq!(no_result_allocation.value, Value::Int(3));
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let input_refusal = evaluate_expression_with_configuration(
+        "length[(1 2 3)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("input allocation refusal");
+    assert_eq!(input_refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(
+        resource(&input_refusal).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(input_refusal.usage.expect("refusal usage").work_units, 0);
+
+    let work_refusal = evaluate_expression_with_configuration(
+        "length[(1 2 3)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(24),
+            max_work_units: Some(0),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("constant work refusal");
+    assert_eq!(work_refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&work_refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&work_refusal).refused_charge, Some(1));
+    let usage = work_refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
 }
 
 #[test]
