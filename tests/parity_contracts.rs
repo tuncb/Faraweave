@@ -504,6 +504,139 @@ fn sum_double_is_left_to_right_strict_and_preserves_special_value_bits() {
 }
 
 #[test]
+fn filter_is_stable_typed_and_exact_for_every_allowed_predicate() {
+    for (source, expected) in [
+        ("filter[@not Bool()]", "()"),
+        ("filter[@not (true)]", "()"),
+        ("filter[@not (false)]", "(false)"),
+        ("filter[@not (true false false true)]", "(false false)"),
+        ("filter[@odd Int()]", "()"),
+        ("filter[@odd (2)]", "()"),
+        ("filter[@odd (1)]", "(1)"),
+        ("filter[@odd (1 2 3 4 5)]", "(1 3 5)"),
+        ("filter[@even (-3 -2 -1 0 1 2 3)]", "(-2 0 2)"),
+        (
+            "filter[@is_positive (-9223372036854775808 -1 0 1 9223372036854775807)]",
+            "(1 9223372036854775807)",
+        ),
+        (
+            "filter[@is_negative (-9223372036854775808 -1 0 1 9223372036854775807)]",
+            "(-9223372036854775808 -1)",
+        ),
+        (
+            "filter[@is_positive (-inf -2.0 -0.0 0.0 3.0 inf nan)]",
+            "(3.0 inf)",
+        ),
+        (
+            "filter[@is_negative (-inf -2.0 -0.0 0.0 3.0 inf nan)]",
+            "(-inf -2.0)",
+        ),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    let result = evaluate_expression("filter[@is_negative (-inf -1.5 -0.0 0.0 1.5 inf nan)]")
+        .expect("exact double filter");
+    let Value::DoubleVector(values) = result.value else {
+        panic!("filter did not return Double vector");
+    };
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [f64::NEG_INFINITY.to_bits(), (-1.5_f64).to_bits(),]
+    );
+
+    for (count, expected) in [(0, Vec::new()), (1, vec![1]), (5, vec![1, 3, 5])] {
+        let dynamic = faraweave::evaluate_source_with_arguments(
+            "parameters[n Int]\nfilter[@odd iota[n]]\n",
+            &[Value::Int(count)],
+            EvaluationConfiguration::default(),
+        )
+        .expect("dynamic filter");
+        assert_eq!(
+            dynamic.values,
+            [Value::IntVector(expected)],
+            "count {count}"
+        );
+    }
+}
+
+#[test]
+fn filter_rejects_invalid_references_and_non_vectors_at_static_spans() {
+    for (source, kind, primitive, message) in [
+        (
+            "filter[@missing (1 2)]",
+            ErrorKind::UnknownPrimitive,
+            "missing",
+            "@missing is not a registered built-in operation",
+        ),
+        (
+            "filter[@equals (1 2)]",
+            ErrorKind::ArityError,
+            "equals",
+            "@equals referenced operation has incompatible arity",
+        ),
+        (
+            "filter[@inc (1 2)]",
+            ErrorKind::TypeError,
+            "inc",
+            "@inc referenced operation has no compatible signature",
+        ),
+        (
+            "filter[@filter (1 2)]",
+            ErrorKind::TypeError,
+            "filter",
+            "@filter referenced operation has unsupported structural behavior",
+        ),
+        (
+            "filter[@odd (1.0 2.0)]",
+            ErrorKind::TypeError,
+            "odd",
+            "@odd referenced operation has no compatible signature",
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some(primitive), "{source}");
+        assert_eq!(error.message, message, "{source}");
+        assert_eq!(error.location.line, 1, "{source}");
+        assert_eq!(error.location.column, 9, "{source}");
+        let span = error.span.expect("operation reference name span");
+        assert_eq!(span.begin.column, 9, "{source}");
+    }
+
+    for (source, expected_column, actual) in [
+        ("filter[@odd 1]", 13, Type::Scalar(ScalarType::Int)),
+        (
+            "filter[@not [true false]]",
+            13,
+            Type::Tuple(vec![
+                Type::Scalar(ScalarType::Bool),
+                Type::Scalar(ScalarType::Bool),
+            ]),
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("filter"), "{source}");
+        assert_eq!(error.argument_position, Some(2), "{source}");
+        assert_eq!(error.location.column, expected_column, "{source}");
+        assert_eq!(error.actual_types, [actual], "{source}");
+    }
+
+    let value_reference =
+        evaluate_expression("filter[1 (1 2)]").expect_err("predicate must use reference syntax");
+    assert_eq!(value_reference.kind, ErrorKind::TypeError);
+    assert_eq!(value_reference.location.column, 8);
+    assert_eq!(
+        value_reference.message,
+        "filter argument 1 must be a built-in operation reference"
+    );
+}
+
+#[test]
 fn foldl_accepts_bool_int_double_empty_dynamic_and_non_associative_reducers() {
     for (source, expected) in [
         ("foldl[@and true Bool()]", "true"),

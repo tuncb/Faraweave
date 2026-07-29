@@ -1153,6 +1153,28 @@ fn operation_reference_mutations() -> Vec<MutationCase> {
     .collect()
 }
 
+#[test]
+fn filter_fwir_rejects_non_predicate_reference_identity_after_physical_decode() {
+    let program =
+        compile_source_to_verified_program("filter[@odd (1 2 3)]\n", "hostile-filter.faraweave")
+            .expect("compile filter artifact");
+    let mut bytes =
+        encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode filter artifact");
+    let (_, references, _) = section(&bytes, 18);
+    put_u16(&mut bytes, references, 1);
+    put_u16(&mut bytes, references + 2, 1);
+    put_u16(&mut bytes, references + 4, 1);
+    let error = decode_fwir(&bytes, &FwirDecodeLimits::default())
+        .expect_err("inc is not a declared total Int predicate");
+    assert!(matches!(
+        error.kind,
+        FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(ref malformed))
+            if malformed.invariant == Invariant::InvalidSemanticIdentity
+                && malformed.record == RecordKind::Node
+                && malformed.field == "operation_reference"
+    ));
+}
+
 fn targeted_mutations() -> Vec<MutationCase> {
     let complete = example_bytes("complete");
     let (_, features, _) = section(&complete, 2);

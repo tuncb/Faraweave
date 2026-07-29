@@ -1,8 +1,8 @@
 use crate::parser::{Expr, ExprKind, Program};
 use crate::resources::ResourceContext;
 use crate::semantic_registry::{
-    ApplicationPlan, ScalarKernel, StructuralBehavior, WorkAdmission,
-    application_plan_from_numeric, implementation_from_numeric, primitive_from_name,
+    AdmissionSequence, ApplicationPlan, ResultCardinality, ScalarKernel, StructuralBehavior,
+    WorkAdmission, application_plan_from_numeric, implementation_from_numeric, primitive_from_name,
 };
 use crate::strict_float::{self, Binary64Operation};
 use crate::{
@@ -346,7 +346,7 @@ pub(crate) fn apply_implementation(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_reducer_consumer_implementation(
+pub(crate) fn apply_reference_consumer_implementation(
     implementation_id: u16,
     application_plan_id: u16,
     reference: &crate::OperationReference,
@@ -362,6 +362,19 @@ pub(crate) fn apply_reducer_consumer_implementation(
     let application_plan = application_plan_from_numeric(application_plan_id)
         .map_err(|_| type_runtime_error("selected application plan", location))?;
     let producer = descriptor.primitive_name;
+    if descriptor.behavior == StructuralBehavior::VectorFilter {
+        return apply_vector_filter_consumer(
+            descriptor,
+            application_plan,
+            reference,
+            arguments,
+            lift,
+            result_type,
+            location,
+            reference_location,
+            resources,
+        );
+    }
     let valid_lift = match descriptor.behavior {
         StructuralBehavior::Foldl => lift == crate::LiftMode::ContainerScalar,
         StructuralBehavior::Scanl => lift == crate::LiftMode::ContainerVector,
@@ -488,6 +501,174 @@ pub(crate) fn apply_reducer_consumer_implementation(
         }
     }
     Ok((output, true))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_vector_filter_consumer(
+    descriptor: &crate::semantic_registry::SemanticDescriptor,
+    application_plan: ApplicationPlan,
+    reference: &crate::OperationReference,
+    arguments: &[SelectedApplicationArgument<'_>],
+    lift: crate::LiftMode,
+    result_type: ScalarType,
+    location: SourceLocation,
+    reference_location: SourceLocation,
+    resources: &mut ResourceContext,
+) -> Result<(Value, bool), Error> {
+    let producer = descriptor.primitive_name;
+    if descriptor.application_plan != application_plan
+        || application_plan.result_cardinality != ResultCardinality::SubsetOfOperand(1)
+        || application_plan.resources.work != WorkAdmission::OperandCardinality(1)
+        || application_plan.resources.sequence != AdmissionSequence::WorkThenResult
+        || lift != crate::LiftMode::ContainerVector
+        || descriptor.result != result_type
+    {
+        return Err(type_runtime_error(producer, location));
+    }
+    let [vector] = arguments else {
+        return Err(type_runtime_error(producer, location));
+    };
+    if vector.conversion != crate::Conversion::Identity {
+        return Err(type_runtime_error(producer, location));
+    }
+    let predicate = implementation_from_numeric(reference.implementation_id)
+        .map_err(|_| type_runtime_error("referenced operation", reference_location))?;
+    if predicate.primitive_id.numeric() != reference.primitive_id
+        || predicate.signature_id.numeric() != reference.signature_id
+        || !crate::semantic_registry::is_total_unary_predicate(predicate)
+        || predicate
+            .parameters
+            .first()
+            .is_none_or(|parameter| parameter.element_type != result_type)
+    {
+        return Err(type_runtime_error(
+            "referenced operation",
+            reference_location,
+        ));
+    }
+    let length = match (descriptor.kernel, vector.value) {
+        (ScalarKernel::FilterBool, Value::BoolVector(values)) => values.len(),
+        (ScalarKernel::FilterInt, Value::IntVector(values)) => values.len(),
+        (ScalarKernel::FilterDouble, Value::DoubleVector(values)) => values.len(),
+        _ => return Err(type_runtime_error(producer, location)),
+    };
+    let work = admitted_work(application_plan, 0, arguments, producer, location)?;
+    if work != length {
+        return Err(type_runtime_error(producer, location));
+    }
+    resources.charge_work(work, location, producer)?;
+    let mut kept = 0_usize;
+    for index in 0..length {
+        let element = vector_element(vector.value, index, producer, location)?;
+        let predicate_result = invoke_kernel(
+            predicate.kernel,
+            predicate.primitive_name,
+            &[element],
+            ScalarType::Bool,
+            reference_location,
+            Some(index),
+        )?;
+        match predicate_result {
+            Value::Bool(true) => {
+                kept = kept
+                    .checked_add(1)
+                    .ok_or_else(|| resources.size_overflow(Some(length), location, producer))?;
+            }
+            Value::Bool(false) => {}
+            _ => {
+                return Err(type_runtime_error(
+                    "referenced operation",
+                    reference_location,
+                ));
+            }
+        }
+    }
+    let admitted = resources.admit_vector(result_type, kept, location, producer)?;
+    let mut output = match allocate_filter_output(result_type, kept) {
+        Ok(output) => output,
+        Err(()) => {
+            resources.refund(admitted);
+            return Err(allocation_error(producer, location));
+        }
+    };
+    for index in 0..length {
+        let element = match vector_element(vector.value, index, producer, location) {
+            Ok(element) => element,
+            Err(error) => {
+                resources.release(&output);
+                return Err(error);
+            }
+        };
+        let predicate_result = match invoke_kernel(
+            predicate.kernel,
+            predicate.primitive_name,
+            std::slice::from_ref(&element),
+            ScalarType::Bool,
+            reference_location,
+            Some(index),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                resources.release(&output);
+                return Err(error);
+            }
+        };
+        match predicate_result {
+            Value::Bool(true) => {
+                if push_filter_output(&mut output, element).is_err() {
+                    resources.release(&output);
+                    return Err(type_runtime_error(producer, location));
+                }
+            }
+            Value::Bool(false) => {}
+            _ => {
+                resources.release(&output);
+                return Err(type_runtime_error(
+                    "referenced operation",
+                    reference_location,
+                ));
+            }
+        }
+    }
+    Ok((output, true))
+}
+
+fn allocate_filter_output(element_type: ScalarType, length: usize) -> Result<Value, ()> {
+    match element_type {
+        ScalarType::Bool => {
+            let mut values = Vec::new();
+            values.try_reserve_exact(length).map_err(|_| ())?;
+            Ok(Value::BoolVector(values))
+        }
+        ScalarType::Int => {
+            let mut values = Vec::new();
+            values.try_reserve_exact(length).map_err(|_| ())?;
+            Ok(Value::IntVector(values))
+        }
+        ScalarType::Double => {
+            let mut values = Vec::new();
+            values.try_reserve_exact(length).map_err(|_| ())?;
+            Ok(Value::DoubleVector(values))
+        }
+    }
+}
+
+fn push_filter_output(output: &mut Value, value: Value) -> Result<(), ()> {
+    match (output, value) {
+        (Value::BoolVector(values), Value::Bool(value)) => {
+            values.push(value);
+            Ok(())
+        }
+        (Value::IntVector(values), Value::Int(value)) => {
+            values.push(value);
+            Ok(())
+        }
+        (Value::DoubleVector(values), Value::Double(value)) => {
+            values.push(value);
+            Ok(())
+        }
+        _ => Err(()),
+    }
 }
 
 fn vector_element(
