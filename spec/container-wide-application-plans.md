@@ -127,6 +127,30 @@ failure point. Empty vectors perform the canonical zero-byte, zero-work
 request without an allocation ordinal, and tuple or scalar operands fail
 during static signature selection.
 
+## Numeric vector sum (`FWIR-PLAN-007`)
+
+Primitive ID `23=sum` has whole-vector Int and Double signatures and matching
+implementation IDs 43 and 44. Both select application-plan ID 5, whose
+`Scalar` result rule returns the input element type and whose
+`OperandCardinality(1)` rule admits exactly one work unit per input element
+before reduction begins.
+
+Int reduction starts at zero and performs checked addition in increasing
+element index. The first overflow returns structured `IntegerOverflow` with
+the zero-based failing index and the accumulator/current-element operands;
+later elements are not evaluated. Double reduction starts at positive zero
+and invokes the strict binary64 addition operation once per element in the
+same order, without reassociation, parallel reduction, or a host reduction
+routine, thereby preserving signed zero, canonical NaN, infinities,
+subnormals, and cancellation.
+
+The scalar result has no byte admission or allocation attempt. A successful
+or overflowing nonempty reduction retains all admitted work, a work refusal
+occurs before the first arithmetic operation, and existing input ownership
+releases after success or failure. Empty Int and Double vectors admit zero work
+and return respectively Int zero and positive Double zero; Bool, scalar, and
+tuple operands fail during static signature selection.
+
 ## Evidence (`FWIR-PLAN-004`)
 
 Registry unit tests cover stable plan lookup and changed operand/plan
@@ -146,3 +170,10 @@ Issue #41 maps `FWIR-PLAN-006` to
 `sort_covers_exhaustive_small_bools_integer_edges_and_total_double_order`,
 `sort_admits_owned_output_with_input_live_and_cleans_up_refused_output`, the
 randomized generated-C differential corpus, and the strict C11 journey.
+Issue #42 maps `FWIR-PLAN-007` to
+`vector_sum_records_scalar_container_plan_for_static_dynamic_and_empty_vectors`,
+`sum_container_plan_roundtrips_and_dispatches_by_verified_identity`,
+`sum_int_overflow_reports_the_first_reduction_step_and_operands`,
+`sum_double_is_left_to_right_strict_and_preserves_special_value_bits`,
+`sum_charges_full_work_before_reduction_and_allocates_no_result`, and the
+strict C11 success/failure journeys.

@@ -393,6 +393,118 @@ fn sort_accepts_empty_singleton_and_dynamic_vectors_and_rejects_nonvectors() {
 }
 
 #[test]
+fn sum_accepts_numeric_empty_nonempty_and_dynamic_vectors_and_rejects_other_values() {
+    for (source, expected) in [
+        ("sum[Int()]", "0"),
+        ("sum[Double()]", "0.0"),
+        ("sum[(1 2 3 -4)]", "2"),
+        ("sum[(1.5 -0.5 2.0)]", "3.0"),
+        ("sum iota 5", "15"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    let dynamic = faraweave::evaluate_source_with_arguments(
+        "parameters[n Int]\nsum iota n\n",
+        &[Value::Int(6)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("dynamic parameterized sum");
+    assert_eq!(dynamic.values, [Value::Int(21)]);
+
+    for (source, actual_type) in [
+        ("sum[1]", Type::Scalar(ScalarType::Int)),
+        ("sum[(true false)]", Type::Vector(ScalarType::Bool)),
+        (
+            "sum[[1 2]]",
+            Type::Tuple(vec![
+                Type::Scalar(ScalarType::Int),
+                Type::Scalar(ScalarType::Int),
+            ]),
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("sum"), "{source}");
+        assert_eq!(error.argument_position, Some(1), "{source}");
+        assert_eq!(
+            error.location,
+            SourceLocation {
+                offset: 5,
+                line: 1,
+                column: 5,
+            },
+            "{source}"
+        );
+        assert_eq!(
+            error.message,
+            "sum arguments do not match an accepted signature; first unsupported argument is 1",
+            "{source}"
+        );
+        assert_eq!(error.actual_types, [actual_type], "{source}");
+        assert!(error.expected_types.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn sum_int_overflow_reports_the_first_reduction_step_and_operands() {
+    for (source, expected_index, expected_operands) in [
+        (
+            "sum[(9223372036854775807 1 -1)]",
+            1,
+            vec![Value::Int(i64::MAX), Value::Int(1)],
+        ),
+        (
+            "sum[(-9223372036854775808 -1 1)]",
+            1,
+            vec![Value::Int(i64::MIN), Value::Int(-1)],
+        ),
+        (
+            "sum[(9223372036854775807 -1 1 1)]",
+            3,
+            vec![Value::Int(i64::MAX), Value::Int(1)],
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::DomainError, "{source}");
+        assert_eq!(
+            error.message,
+            format!("sum failed: integer_overflow at result index {expected_index}"),
+            "{source}"
+        );
+        assert_eq!(error.primitive.as_deref(), Some("sum"), "{source}");
+        let domain = error.domain.expect("structured sum overflow");
+        assert_eq!(domain.reason, DomainErrorReason::IntegerOverflow);
+        assert_eq!(domain.parameter_types, [ScalarType::Int, ScalarType::Int]);
+        assert_eq!(domain.result_type, ScalarType::Int);
+        assert_eq!(domain.operands, expected_operands);
+        assert_eq!(domain.element_index, Some(expected_index));
+    }
+}
+
+#[test]
+fn sum_double_is_left_to_right_strict_and_preserves_special_value_bits() {
+    for (source, expected_bits) in [
+        ("sum[Double()]", 0.0_f64.to_bits()),
+        ("sum[(-0.0)]", 0.0_f64.to_bits()),
+        ("sum[(1.0 -1.0)]", 0.0_f64.to_bits()),
+        ("sum[(1e16 -1e16 1.0)]", 1.0_f64.to_bits()),
+        ("sum[(1e16 1.0 -1e16)]", 0.0_f64.to_bits()),
+        ("sum[(5e-324 5e-324)]", 2),
+        ("sum[(inf 1.0)]", f64::INFINITY.to_bits()),
+        ("sum[(-inf -1.0)]", f64::NEG_INFINITY.to_bits()),
+        ("sum[(inf -inf)]", 0x7ff8_0000_0000_0000),
+        ("sum[(nan 1.0)]", 0x7ff8_0000_0000_0000),
+    ] {
+        let value = evaluate_expression(source).expect(source).value;
+        let Value::Double(value) = value else {
+            panic!("sum Double result changed type");
+        };
+        assert_eq!(value.to_bits(), expected_bits, "{source}");
+    }
+}
+
+#[test]
 fn issue54_predicates_ordering_and_nan_contracts() {
     assert_eq!(formatted("odd[-9223372036854775807]"), "true");
     assert_eq!(formatted("even[-9223372036854775808]"), "true");

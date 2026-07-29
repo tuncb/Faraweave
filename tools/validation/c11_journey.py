@@ -379,7 +379,7 @@ def main() -> None:
             (
                 ROOT / "tests/fixtures/parameterized-artifact-success.bennu",
                 ["3", "2.5", "true"],
-                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n5.5\nfalse\n",
+                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\n5.5\nfalse\n",
             ),
             (
                 ROOT / "tests/fixtures/parameterized-artifact-double.bennu",
@@ -567,6 +567,11 @@ int main(int argc, char **argv) {
                 "div-overflow",
                 "div[-9223372036854775808 -1]\n",
                 b"DomainError: div failed: integer_overflow\n",
+            ),
+            (
+                "sum-overflow",
+                "sum[(9223372036854775807 1 -1)]\n",
+                b"DomainError: sum failed: integer_overflow at result index 1\n",
             ),
         ]:
             fixture = work / f"{name}.bennu"
@@ -794,7 +799,7 @@ int main(int argc, char **argv) {
         )
         require(
             normalize_newlines(native_result.stdout)
-            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n5.5\nfalse\n",
+            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\n5.5\nfalse\n",
             "native build output",
         )
         artifact = work / "native-build.fwir"

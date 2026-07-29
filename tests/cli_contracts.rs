@@ -464,16 +464,16 @@ fn cli_repl_internal_reports_registry_without_evaluating_source() {
             .lines()
             .filter(|line| line.starts_with("primitive "))
             .count(),
-        22
+        23
     );
     assert_eq!(
         stdout
             .lines()
             .filter(|line| line.starts_with("  signature "))
             .count(),
-        42
+        44
     );
-    assert!(stdout.ends_with("kernel=sort_double_vector\n> 6\n> "));
+    assert!(stdout.ends_with("kernel=sum_double_vector\n> 6\n> "));
 }
 
 #[test]
@@ -485,7 +485,7 @@ fn cli_repl_history_records_internal_before_dispatch() {
     assert!(stdout.starts_with(
         "> Faraweave semantic registry (internal human-readable diagnostics; format is unstable)\n"
     ));
-    assert!(stdout.ends_with("kernel=sort_double_vector\n> 1\t.internal\n2\t.history\n> "));
+    assert!(stdout.ends_with("kernel=sum_double_vector\n> 1\t.internal\n2\t.history\n> "));
 }
 
 #[test]

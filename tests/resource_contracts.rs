@@ -21,6 +21,7 @@ struct ObservedResourceEvent {
 static RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static LENGTH_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static SORT_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static SUM_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
@@ -52,6 +53,20 @@ fn observe_length_resource_event(event: &faraweave::ResourceEvent<'_>) {
 
 fn observe_sort_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = SORT_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_sum_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = SUM_RESOURCE_EVENTS.lock() {
         events.push(ObservedResourceEvent {
             kind: event.kind,
             producer: event.producer.to_owned(),
@@ -720,6 +735,140 @@ fn sort_large_bounded_input_has_linear_semantic_work_and_exact_limit_seam() {
         }),
     )
     .expect_err("one work unit below sort schedule");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(4_096));
+    assert_eq!(resource(&refusal).refused_charge, Some(4_096));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 4_096);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn sum_charges_full_work_before_reduction_and_allocates_no_result() {
+    SUM_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let result = faraweave::evaluate_expression_with_observer(
+        "sum[(1 2 3)]",
+        EvaluationConfiguration::default(),
+        observe_sum_resource_event,
+    )
+    .expect("vector sum");
+    assert_eq!(result.value, Value::Int(6));
+    assert_eq!(
+        result.usage,
+        faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 24,
+            work_units: 3,
+            allocation_attempts: 1,
+        }
+    );
+    let events = SUM_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[0].bytes, Some(24));
+    assert_eq!(events[0].ordinal, Some(0));
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].producer, "sum");
+    assert_eq!(events[1].bytes, None);
+    assert_eq!(events[1].work, 3);
+    assert_eq!(events[1].ordinal, None);
+    assert_eq!(events[1].usage.live_evaluation_bytes, 24);
+    assert_eq!(events[1].usage.work_units, 3);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 0);
+    assert_eq!(events[2].usage.work_units, 3);
+
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "sum[(1 2 3)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("sum performs no result allocation");
+    assert_eq!(no_result_allocation.value, Value::Int(6));
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let empty = evaluate_expression_with_configuration(
+        "sum[Double()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty sum has no allocation ordinal");
+    assert_eq!(empty.value, Value::Double(0.0));
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+
+    let work_refusal = evaluate_expression_with_configuration(
+        "sum[(1 2 3)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(24),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("full sum work refusal");
+    assert_eq!(work_refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&work_refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&work_refusal).refused_charge, Some(3));
+    let usage = work_refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn sum_overflow_retains_admitted_work_and_large_dynamic_limits_are_exact() {
+    let overflow = evaluate_expression_with_configuration(
+        "sum[(9223372036854775807 1 -1)]",
+        EvaluationConfiguration::default(),
+    )
+    .expect_err("sum overflow");
+    assert_eq!(overflow.kind, ErrorKind::DomainError);
+    assert_eq!(
+        overflow.message,
+        "sum failed: integer_overflow at result index 1"
+    );
+    let usage = overflow.usage.expect("overflow cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 3);
+    assert_eq!(usage.allocation_attempts, 1);
+
+    let success = evaluate_expression_with_configuration(
+        "sum iota 4096",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32_768),
+            max_live_evaluation_bytes: Some(32_768),
+            max_work_units: Some(8_192),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect("bounded large sum");
+    assert_eq!(success.value, Value::Int(8_390_656));
+    assert_eq!(success.usage.live_evaluation_bytes, 0);
+    assert_eq!(success.usage.peak_live_evaluation_bytes, 32_768);
+    assert_eq!(success.usage.work_units, 8_192);
+    assert_eq!(success.usage.allocation_attempts, 1);
+
+    let refusal = evaluate_expression_with_configuration(
+        "sum iota 4096",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32_768),
+            max_live_evaluation_bytes: Some(32_768),
+            max_work_units: Some(8_191),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("one work unit below sum schedule");
     assert_eq!(refusal.kind, ErrorKind::ResourceError);
     assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
     assert_eq!(resource(&refusal).usage_before, Some(4_096));

@@ -67,6 +67,7 @@ pub(crate) enum StructuralBehavior {
     Iota,
     VectorLength,
     VectorSort,
+    VectorSum,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +94,8 @@ pub(crate) enum ScalarKernel {
     SortBoolVector,
     SortIntVector,
     SortDoubleVector,
+    SumIntVector,
+    SumDoubleVector,
     EqualsBool,
     EqualsInt,
     EqualsDouble,
@@ -199,10 +202,10 @@ impl InternalRegistryDiagnosticFailureInjection {
     }
 }
 
-const PRIMITIVE_COUNT: u16 = 22;
-const SIGNATURE_COUNT: u16 = 42;
-const IMPLEMENTATION_COUNT: u16 = 42;
-const APPLICATION_PLAN_COUNT: u16 = 4;
+const PRIMITIVE_COUNT: u16 = 23;
+const SIGNATURE_COUNT: u16 = 44;
+const IMPLEMENTATION_COUNT: u16 = 44;
+const APPLICATION_PLAN_COUNT: u16 = 5;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
     OperandDescriptor {
@@ -263,8 +266,21 @@ const SORT_PLAN: ApplicationPlan = ApplicationPlan {
     },
 };
 
-const APPLICATION_PLANS: &[ApplicationPlan] =
-    &[ELEMENTWISE_PLAN, IOTA_PLAN, LENGTH_PLAN, SORT_PLAN];
+const SUM_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(5),
+    result_cardinality: ResultCardinality::Scalar,
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::OperandCardinality(1),
+    },
+};
+
+const APPLICATION_PLANS: &[ApplicationPlan] = &[
+    ELEMENTWISE_PLAN,
+    IOTA_PLAN,
+    LENGTH_PLAN,
+    SORT_PLAN,
+    SUM_PLAN,
+];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -745,6 +761,28 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         SORT_PLAN,
         SortDoubleVector
     ),
+    descriptor!(
+        23,
+        "sum",
+        43,
+        43,
+        WHOLE_INT1,
+        Int,
+        VectorSum,
+        SUM_PLAN,
+        SumIntVector
+    ),
+    descriptor!(
+        23,
+        "sum",
+        44,
+        44,
+        WHOLE_DOUBLE1,
+        Double,
+        VectorSum,
+        SUM_PLAN,
+        SumDoubleVector
+    ),
 ];
 
 impl PrimitiveId {
@@ -1008,6 +1046,7 @@ const fn structural_behavior_name(value: StructuralBehavior) -> &'static str {
         StructuralBehavior::Iota => "iota",
         StructuralBehavior::VectorLength => "vector_length",
         StructuralBehavior::VectorSort => "vector_sort",
+        StructuralBehavior::VectorSum => "vector_sum",
     }
 }
 
@@ -1055,6 +1094,8 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::SortBoolVector => "sort_bool_vector",
         ScalarKernel::SortIntVector => "sort_int_vector",
         ScalarKernel::SortDoubleVector => "sort_double_vector",
+        ScalarKernel::SumIntVector => "sum_int_vector",
+        ScalarKernel::SumDoubleVector => "sum_double_vector",
     }
 }
 
@@ -1522,6 +1563,8 @@ mod tests {
             (22, "sort"),
             (22, "sort"),
             (22, "sort"),
+            (23, "sum"),
+            (23, "sum"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1541,6 +1584,7 @@ mod tests {
         assert_eq!(primitive_from_name("div"), primitive_from_numeric(20));
         assert_eq!(primitive_from_name("length"), primitive_from_numeric(21));
         assert_eq!(primitive_from_name("sort"), primitive_from_numeric(22));
+        assert_eq!(primitive_from_name("sum"), primitive_from_numeric(23));
         assert_eq!(
             signature_from_numeric(36).map(|descriptor| descriptor.primitive_name),
             Ok("div")
@@ -1566,6 +1610,14 @@ mod tests {
             Ok(ScalarKernel::SortDoubleVector)
         );
         assert_eq!(
+            signature_from_numeric(44).map(|descriptor| descriptor.primitive_name),
+            Ok("sum")
+        );
+        assert_eq!(
+            implementation_from_numeric(44).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::SumDoubleVector)
+        );
+        assert_eq!(
             implementation_from_numeric(34).map(|descriptor| descriptor.kernel),
             Ok(ScalarKernel::IotaInt)
         );
@@ -1573,6 +1625,7 @@ mod tests {
         assert_eq!(application_plan_from_numeric(2), Ok(IOTA_PLAN));
         assert_eq!(application_plan_from_numeric(3), Ok(LENGTH_PLAN));
         assert_eq!(application_plan_from_numeric(4), Ok(SORT_PLAN));
+        assert_eq!(application_plan_from_numeric(5), Ok(SUM_PLAN));
         assert!(
             SEMANTIC_REGISTRY
                 .iter()
@@ -1583,6 +1636,17 @@ mod tests {
                             .parameters
                             .iter()
                             .all(|operand| operand.consumption == OperandConsumption::Elementwise)
+                })
+        );
+        assert!(
+            SEMANTIC_REGISTRY
+                .iter()
+                .filter(|descriptor| descriptor.behavior == StructuralBehavior::VectorSum)
+                .all(|descriptor| {
+                    descriptor.application_plan == SUM_PLAN
+                        && descriptor.parameters.len() == 1
+                        && descriptor.result == descriptor.parameters[0].element_type
+                        && descriptor.parameters[0].consumption == OperandConsumption::WholeVector
                 })
         );
         assert!(
@@ -1616,15 +1680,15 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(43),
+            signature_from_numeric(45),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(43),
+            implementation_from_numeric(45),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
-            application_plan_from_numeric(5),
+            application_plan_from_numeric(6),
             Err(RegistryLookupError::ApplicationPlanId)
         );
     }
@@ -1662,7 +1726,7 @@ mod tests {
             Err(RegistryValidationError::DuplicatePrimitiveName)
         );
 
-        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 3];
+        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 2];
         assert_eq!(
             validate_registry(missing),
             Err(RegistryValidationError::MissingPrimitiveId)
@@ -1817,6 +1881,7 @@ mod tests {
                     IOTA_PLAN,
                     LENGTH_PLAN,
                     SORT_PLAN,
+                    SUM_PLAN,
                     IOTA_PLAN,
                 ],
             ),

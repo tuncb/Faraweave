@@ -360,6 +360,100 @@ fn sort_container_plan_roundtrips_and_dispatches_by_verified_identity() {
 }
 
 #[test]
+fn sum_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  sum[(1 2 3)]\n\
+                  sum[(1.5 -0.5 2.0)]\n\
+                  sum[Int()]\n\
+                  sum[Double()]\n\
+                  sum iota n\n";
+    let program = compile_source_to_verified_program(source, "sum.faraweave").expect("compile sum");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 23,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (43, 43, 5, LiftMode::ContainerScalar),
+            (44, 44, 5, LiftMode::ContainerScalar),
+            (43, 43, 5, LiftMode::ContainerScalar),
+            (44, 44, 5, LiftMode::ContainerScalar),
+            (43, 43, 5, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode sum");
+    let decoded = decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified sum");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode sum"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct sum");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded sum");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["6", "3.0", "0", "0.0", "10"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    for implementation in 43..=44 {
+        assert!(
+            emitted
+                .source
+                .contains(&format!("static int fw_impl_{implementation}("))
+        );
+    }
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_sum_int(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_sum_double(")
+            .count(),
+        1
+    );
+    assert!(
+        emitted
+            .source
+            .contains("total=fw_double_arithmetic(total,values[index],FW_DOUBLE_ADD)")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
 fn inspection_is_deterministic_and_carries_exact_binary64_bits() {
     let program = compile_source_to_verified_program("-0.0\nnan\n", "bits.faraweave")
         .expect("compile exact doubles");
