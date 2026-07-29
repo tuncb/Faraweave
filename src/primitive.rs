@@ -330,6 +330,9 @@ fn invoke_kernel(
         (ScalarKernel::CosDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_cos(*value)))
         }
+        (ScalarKernel::TanDouble, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_tan(*value)))
+        }
         (ScalarKernel::IotaInt, _) => None,
         _ => None,
     };

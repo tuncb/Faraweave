@@ -63,6 +63,7 @@ pub(crate) enum ScalarKernel {
     Log10Double,
     SinDouble,
     CosDouble,
+    TanDouble,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,8 +103,8 @@ enum RegistryValidationError {
     InconsistentImplementationIdentity,
 }
 
-const SIGNATURE_COUNT: u16 = 40;
-const IMPLEMENTATION_COUNT: u16 = 40;
+const SIGNATURE_COUNT: u16 = 41;
+const IMPLEMENTATION_COUNT: u16 = 41;
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -295,6 +296,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
     ),
     descriptor!(33, "sin", 39, 39, DOUBLE1, Double, Elementwise, SinDouble),
     descriptor!(34, "cos", 40, 40, DOUBLE1, Double, Elementwise, CosDouble),
+    descriptor!(35, "tan", 41, 41, DOUBLE1, Double, Elementwise, TanDouble),
 ];
 
 impl PrimitiveId {
@@ -526,6 +528,7 @@ mod tests {
             (32, "log10"),
             (33, "sin"),
             (34, "cos"),
+            (35, "tan"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -599,6 +602,14 @@ mod tests {
             Ok(ScalarKernel::CosDouble)
         );
         assert_eq!(
+            signature_from_numeric(41).map(|descriptor| descriptor.primitive_name),
+            Ok("tan")
+        );
+        assert_eq!(
+            implementation_from_numeric(41).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::TanDouble)
+        );
+        assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
         );
@@ -607,11 +618,11 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(41),
+            signature_from_numeric(42),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(41),
+            implementation_from_numeric(42),
             Err(RegistryLookupError::ImplementationId)
         );
     }
