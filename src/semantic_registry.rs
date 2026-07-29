@@ -62,6 +62,7 @@ pub(crate) enum ScalarKernel {
     LogDouble,
     Log10Double,
     SinDouble,
+    CosDouble,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,8 +102,8 @@ enum RegistryValidationError {
     InconsistentImplementationIdentity,
 }
 
-const SIGNATURE_COUNT: u16 = 39;
-const IMPLEMENTATION_COUNT: u16 = 39;
+const SIGNATURE_COUNT: u16 = 40;
+const IMPLEMENTATION_COUNT: u16 = 40;
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -293,6 +294,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         Log10Double
     ),
     descriptor!(33, "sin", 39, 39, DOUBLE1, Double, Elementwise, SinDouble),
+    descriptor!(34, "cos", 40, 40, DOUBLE1, Double, Elementwise, CosDouble),
 ];
 
 impl PrimitiveId {
@@ -523,6 +525,7 @@ mod tests {
             (31, "log"),
             (32, "log10"),
             (33, "sin"),
+            (34, "cos"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -588,6 +591,14 @@ mod tests {
             Ok(ScalarKernel::SinDouble)
         );
         assert_eq!(
+            signature_from_numeric(40).map(|descriptor| descriptor.primitive_name),
+            Ok("cos")
+        );
+        assert_eq!(
+            implementation_from_numeric(40).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::CosDouble)
+        );
+        assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
         );
@@ -596,11 +607,11 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(40),
+            signature_from_numeric(41),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(40),
+            implementation_from_numeric(41),
             Err(RegistryLookupError::ImplementationId)
         );
     }

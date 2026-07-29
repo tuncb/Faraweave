@@ -106,6 +106,30 @@ SIN_OUTPUT_LEAVES = (
     (0xBFEA_2C16_B010_E385, 8, 2.0**-48),
     (0x3F74_52FC_98B3_4E97, 8, 2.0**-48),
 )
+COS_OUTPUT = (
+    b"1.0\n1.0\n(nan nan nan)\n"
+    b"(0.5403023058681398 0.5000000000000001 6.123233995736766e-17 -1.0)\n"
+    b"(2.83276944882399e-16 -1.6081226496766366e-16 "
+    b"-1.8369701987210297e-16 1.0)\n"
+    b"1.0\n-0.5753861119575491\n-0.9999876894265599\n"
+)
+# The two zero-input leaves are exact. Every other numeric leaf uses
+# FWIR-MATH-003's eight-ULP-or-2^-48-absolute checked-reference envelope.
+COS_OUTPUT_LEAVES = (
+    (0x3FF0_0000_0000_0000, 0, 0.0),
+    (0x3FF0_0000_0000_0000, 0, 0.0),
+    (0x3FE1_4A28_0FB5_068C, 8, 2.0**-48),
+    (0x3FE0_0000_0000_0001, 8, 2.0**-48),
+    (0x3C91_A626_3314_5C07, 8, 2.0**-48),
+    (0xBFF0_0000_0000_0000, 8, 2.0**-48),
+    (0x3CB4_6989_8CC5_1702, 8, 2.0**-48),
+    (0xBCA7_2CEC_E675_D1FD, 8, 2.0**-48),
+    (0xBCAA_7939_4C9E_8A0A, 8, 2.0**-48),
+    (0x3FF0_0000_0000_0000, 8, 2.0**-48),
+    (0x3FF0_0000_0000_0000, 8, 2.0**-48),
+    (0xBFE2_6990_22AD_C4C1, 8, 2.0**-48),
+    (0xBFEF_FFE6_2ECF_AB75, 8, 2.0**-48),
+)
 NUMERIC_LEAF = re.compile(
     rb"(?<![A-Za-z0-9_.])[-+]?(?:[0-9]+\.[0-9]+|[0-9]+)"
     rb"(?:e[-+]?[0-9]+)?(?![A-Za-z0-9_.])"
@@ -451,6 +475,19 @@ def sin_output_mismatch(
     )
 
 
+def cos_output_mismatch(
+    actual: bytes,
+    reference_output: bytes = COS_OUTPUT,
+    leaf_specs: tuple[tuple[int, int, float], ...] = COS_OUTPUT_LEAVES,
+) -> str | None:
+    return backend_math_output_mismatch_with_absolute(
+        "cos",
+        actual,
+        reference_output,
+        leaf_specs,
+    )
+
+
 def require_sqrt_output(actual: bytes, label: str) -> None:
     mismatch = sqrt_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
@@ -473,6 +510,11 @@ def require_log10_output(actual: bytes, label: str) -> None:
 
 def require_sin_output(actual: bytes, label: str) -> None:
     mismatch = sin_output_mismatch(actual)
+    require(mismatch is None, f"{label}: {mismatch}")
+
+
+def require_cos_output(actual: bytes, label: str) -> None:
+    mismatch = cos_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
 
 
@@ -702,6 +744,59 @@ def validate_sin_output_comparator() -> None:
         )
 
 
+def validate_cos_output_comparator() -> None:
+    reference = b"1.0\n0.5\n-0.5\n"
+    leaves = (
+        (0x3FF0_0000_0000_0000, 0, 0.0),
+        (0x3FE0_0000_0000_0000, 8, 2.0**-48),
+        (0xBFE0_0000_0000_0000, 8, 2.0**-48),
+    )
+    require(
+        cos_output_mismatch(reference, reference, leaves) is None,
+        "cos comparator exact",
+    )
+    require(
+        cos_output_mismatch(
+            b"1.0\n0.5000000000000009\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "cos comparator +8 ULP",
+    )
+    require(
+        cos_output_mismatch(
+            b"1.0\n0.49999999999999956\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "cos comparator -8 ULP",
+    )
+    require(
+        cos_output_mismatch(
+            b"1.0\n0.5000000000000036\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "cos comparator absolute-error fallback",
+    )
+    for invalid, label in [
+        (b"1.0\n0.5000000000000037\n-0.5\n", "outside mixed envelope"),
+        (b"1.0000000000000002\n0.5\n-0.5\n", "zero-input exact result"),
+        (b"1.0\n-0.5\n-0.5\n", "finite sign"),
+        (b"1.0\n0.5\nnan\n", "special value"),
+        (b"1.0\n(0.5)\n-0.5\n", "structure"),
+        (b"1.00\n0.5\n-0.5\n", "canonical formatting"),
+        (b"1.0\n-0.5\n0.5\n", "root order"),
+    ]:
+        require(
+            cos_output_mismatch(invalid, reference, leaves) is not None,
+            f"cos comparator accepted invalid {label}",
+        )
+
+
 def validate_backend_native_math_policy(
     compiler: str,
     environment: dict[str, str],
@@ -867,6 +962,7 @@ def main() -> None:
     validate_log_output_comparator()
     validate_log10_output_comparator()
     validate_sin_output_comparator()
+    validate_cos_output_comparator()
     executable = Path(
         os.environ.get(
             "FARAWEAVE_EXE",
@@ -923,6 +1019,11 @@ def main() -> None:
                 ROOT / "tests/fixtures/backend-native-sin.bennu",
                 [],
                 SIN_OUTPUT,
+            ),
+            (
+                ROOT / "tests/fixtures/backend-native-cos.bennu",
+                [],
+                COS_OUTPUT,
             ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
@@ -996,6 +1097,9 @@ def main() -> None:
             elif fixture.name == "backend-native-sin.bennu":
                 require_sin_output(generated_output, "generated sin output")
                 require_sin_output(evaluator_output, "evaluator sin output")
+            elif fixture.name == "backend-native-cos.bennu":
+                require_cos_output(generated_output, "generated cos output")
+                require_cos_output(evaluator_output, "evaluator cos output")
             else:
                 require(
                     generated_output == normalize_newlines(expected),
@@ -1022,6 +1126,7 @@ def main() -> None:
                 "backend-native-log.bennu",
                 "backend-native-log10.bennu",
                 "backend-native-sin.bennu",
+                "backend-native-cos.bennu",
             }:
                 operation = fixture.stem.removeprefix("backend-native-")
                 hostile_source = work / f"{fixture.stem}-hostile.c"
@@ -1122,10 +1227,15 @@ int main(int argc, char **argv) {
                         hostile_output,
                         "log10 hostile generated-C output",
                     )
-                else:
+                elif operation == "sin":
                     require_sin_output(
                         hostile_output,
                         "sin hostile generated-C output",
+                    )
+                else:
+                    require_cos_output(
+                        hostile_output,
+                        "cos hostile generated-C output",
                     )
             if index == 0 and platform.system() == "Linux":
                 sanitized = work / "fixture-sanitized"

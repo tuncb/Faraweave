@@ -18,7 +18,7 @@ structural tuples. The public primitives are:
 | Integer predicates | `odd`, `even` |
 | Numeric predicates | `is_positive`, `is_negative` |
 | Numeric ordering | `less_than`, `greater_than` |
-| Backend-native numeric unary | `sqrt`, `exp`, `log` (natural logarithm), `log10`, `sin` |
+| Backend-native numeric unary | `sqrt`, `exp`, `log` (natural logarithm), `log10`, `sin`, `cos` |
 | Structural constructor | `iota` |
 
 Calls use adjacent brackets (`sub[10 2.5]`) or right-associative prefix syntax
@@ -41,14 +41,15 @@ partial result on overflow. Double results canonicalize NaNs; signed zero,
 infinities, gradual underflow, and IEEE unordered comparisons are preserved.
 Canonical output includes visible `.0` for integral Doubles.
 
-`sqrt`, `exp`, natural logarithm `log`, base-10 logarithm `log10`, and `sin`
-accept Double scalars and vectors, with the existing Int-to-Double promotion,
-and call the corresponding platform Rust or C math function directly. Their
-portable special values are exact; finite `sqrt` results use a checked-reference
-envelope of at most one ULP, finite `exp`, `log`, or `log10` results use at most
-four ULPs, and finite `sin` results use at most eight ULPs or absolute error
-2^-48. Large-argument range reduction is deliberately backend-native. Types,
-shapes, resources, diagnostics, and all nonnumeric observations remain exact.
+`sqrt`, `exp`, natural logarithm `log`, base-10 logarithm `log10`, `sin`, and
+`cos` accept Double scalars and vectors, with the existing Int-to-Double
+promotion, and call the corresponding platform Rust or C math function
+directly. Their portable special values are exact; finite `sqrt` results use a
+checked-reference envelope of at most one ULP, finite `exp`, `log`, or `log10`
+results use at most four ULPs, and finite `sin` or `cos` results use at most
+eight ULPs or absolute error 2^-48. Large-argument range reduction is
+deliberately backend-native. Types, shapes, resources, diagnostics, and all
+nonnumeric observations remain exact.
 The complete
 exception and reproducibility rules are the
 [backend-native math v1 policy](spec/backend-native-math-v1.md).
