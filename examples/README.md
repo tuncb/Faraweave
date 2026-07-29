@@ -27,5 +27,5 @@ order. The `--` separates program arguments from Faraweave's own options:
 cargo run -- run examples/parameters.faraweave -- 4 2.5 true
 ```
 
-Faraweave source does not have comment syntax, so explanations live here rather
-than inside the runnable files.
+In Faraweave source, `#` begins a line comment. The checked-in runnable files
+remain concise, with longer explanations here.
