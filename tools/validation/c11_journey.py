@@ -162,6 +162,13 @@ FLOOR_OUTPUT = (
     b"(4.503599627370496e15 4.503599627370497e15)\n"
     b"9.223372036854776e18\n1.7976931348623157e308\n"
 )
+CEIL_OUTPUT = (
+    b"0.0\n-0.0\n(inf -inf nan)\n"
+    b"(2.0 -1.0 1.0 -0.0)\n"
+    b"(1.0 -0.0 4.503599627370496e15 -4.503599627370495e15)\n"
+    b"(4.503599627370496e15 4.503599627370497e15)\n"
+    b"9.223372036854776e18\n1.7976931348623157e308\n"
+)
 NUMERIC_LEAF = re.compile(
     rb"(?<![A-Za-z0-9_.])[-+]?(?:[0-9]+\.[0-9]+|[0-9]+)"
     rb"(?:e[-+]?[0-9]+)?(?![A-Za-z0-9_.])"
@@ -1187,6 +1194,11 @@ def main() -> None:
                 [],
                 FLOOR_OUTPUT,
             ),
+            (
+                ROOT / "tests/fixtures/backend-native-ceil.bennu",
+                [],
+                CEIL_OUTPUT,
+            ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
             artifact = work / f"fixture-{index}.fwir"
@@ -1274,6 +1286,15 @@ def main() -> None:
                     evaluator_output == FLOOR_OUTPUT,
                     "evaluator floor output is not exact and canonical",
                 )
+            elif fixture.name == "backend-native-ceil.bennu":
+                require(
+                    generated_output == CEIL_OUTPUT,
+                    "generated ceil output is not exact and canonical",
+                )
+                require(
+                    evaluator_output == CEIL_OUTPUT,
+                    "evaluator ceil output is not exact and canonical",
+                )
             else:
                 require(
                     generated_output == normalize_newlines(expected),
@@ -1303,6 +1324,7 @@ def main() -> None:
                 "backend-native-cos.bennu",
                 "backend-native-tan.bennu",
                 "backend-native-floor.bennu",
+                "backend-native-ceil.bennu",
             }:
                 operation = fixture.stem.removeprefix("backend-native-")
                 hostile_source = work / f"{fixture.stem}-hostile.c"
@@ -1418,10 +1440,15 @@ int main(int argc, char **argv) {
                         hostile_output,
                         "tan hostile generated-C output",
                     )
-                else:
+                elif operation == "floor":
                     require(
                         hostile_output == FLOOR_OUTPUT,
                         "floor hostile generated-C output is not exact and canonical",
+                    )
+                else:
+                    require(
+                        hostile_output == CEIL_OUTPUT,
+                        "ceil hostile generated-C output is not exact and canonical",
                     )
             if index == 0 and platform.system() == "Linux":
                 sanitized = work / "fixture-sanitized"

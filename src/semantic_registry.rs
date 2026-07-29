@@ -65,6 +65,7 @@ pub(crate) enum ScalarKernel {
     CosDouble,
     TanDouble,
     FloorDouble,
+    CeilDouble,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,8 +105,8 @@ enum RegistryValidationError {
     InconsistentImplementationIdentity,
 }
 
-const SIGNATURE_COUNT: u16 = 42;
-const IMPLEMENTATION_COUNT: u16 = 42;
+const SIGNATURE_COUNT: u16 = 43;
+const IMPLEMENTATION_COUNT: u16 = 43;
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -308,6 +309,7 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         Elementwise,
         FloorDouble
     ),
+    descriptor!(37, "ceil", 43, 43, DOUBLE1, Double, Elementwise, CeilDouble),
 ];
 
 impl PrimitiveId {
@@ -541,6 +543,7 @@ mod tests {
             (34, "cos"),
             (35, "tan"),
             (36, "floor"),
+            (37, "ceil"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -630,6 +633,14 @@ mod tests {
             Ok(ScalarKernel::FloorDouble)
         );
         assert_eq!(
+            signature_from_numeric(43).map(|descriptor| descriptor.primitive_name),
+            Ok("ceil")
+        );
+        assert_eq!(
+            implementation_from_numeric(43).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::CeilDouble)
+        );
+        assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
         );
@@ -638,11 +649,11 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(43),
+            signature_from_numeric(44),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(43),
+            implementation_from_numeric(44),
             Err(RegistryLookupError::ImplementationId)
         );
     }
