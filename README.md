@@ -66,6 +66,11 @@ cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
 cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
+Within the REPL, `.internal` prints a read-only view of the production semantic
+registry for overload and lifting diagnosis. Its human-readable text is an
+internal troubleshooting aid, not a stable machine-readable format or
+compatibility contract.
+
 The REPL command `.history` prints the current process session's retained input
 with absolute entry numbers. Every nonempty submitted line is included exactly
 after LF or CRLF removal, including space/tab-only lines, failed expressions,

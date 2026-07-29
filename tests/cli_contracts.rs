@@ -438,6 +438,57 @@ fn cli_repl_cls_and_exit_commands_compose_without_evaluation() {
 }
 
 #[test]
+fn cli_repl_internal_reports_registry_without_evaluating_source() {
+    let mut child = Command::new(binary())
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn REPL");
+    let mut input = child.stdin.take().expect("REPL stdin");
+    input
+        .write_all(b".internal\r\ninc 5\r\n")
+        .expect("REPL internal transcript");
+    drop(input);
+
+    let result = child.wait_with_output().expect("REPL output");
+    assert!(result.status.success());
+    assert!(result.stderr.is_empty());
+    let stdout = String::from_utf8(result.stdout).expect("REPL stdout UTF-8");
+    assert!(stdout.starts_with(
+        "> Faraweave semantic registry (internal human-readable diagnostics; format is unstable)\n"
+    ));
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("primitive "))
+            .count(),
+        20
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("  signature "))
+            .count(),
+        36
+    );
+    assert!(stdout.ends_with("kernel=div_double\n> 6\n> "));
+}
+
+#[test]
+fn cli_repl_history_records_internal_before_dispatch() {
+    let result = repl_output(b".internal\n.history\n.exit\ninc 5\n");
+    assert!(result.status.success());
+    assert!(result.stderr.is_empty());
+    let stdout = String::from_utf8(result.stdout).expect("REPL stdout UTF-8");
+    assert!(stdout.starts_with(
+        "> Faraweave semantic registry (internal human-readable diagnostics; format is unstable)\n"
+    ));
+    assert!(stdout.ends_with("kernel=div_double\n> 1\t.internal\n2\t.history\n> "));
+}
+
+#[test]
 fn cli_repl_ignores_comment_only_lines() {
     let mut child = Command::new(binary())
         .arg("repl")

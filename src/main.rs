@@ -5,7 +5,7 @@ use faraweave::{
     NativeBuildRequest, VERSION, build_native, build_native_from_verified_program,
     compile_source_to_fwir_with_name, decode_fwir, emit_c_from_verified_program, emit_c_source,
     evaluate_expression, evaluate_runner_source, evaluate_verified_program_with_arguments,
-    format_value, inspect_fwir, publish_file_atomically,
+    format_value, inspect_fwir, publish_file_atomically, write_internal_registry_diagnostics,
 };
 use std::env;
 use std::ffi::OsString;
@@ -678,6 +678,13 @@ fn repl() -> Result<(), ()> {
         }
         if repl_command(line) == Some(ReplCommand::Exit) {
             return Ok(());
+        }
+        if line == ".internal" {
+            let mut stdout = io::stdout().lock();
+            write_internal_registry_diagnostics(&mut stdout).map_err(|error| {
+                eprintln!("error: {}", error.diagnostic());
+            })?;
+            continue;
         }
         if line.trim_matches([' ', '\t']) == ".history" {
             publish_history_stdout(&history)?;
