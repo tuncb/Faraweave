@@ -2,14 +2,16 @@ use crate::parser::parse;
 use crate::parser::{CallSyntax, Expr, ExprKind, Program, validate_parameter_declarations};
 use crate::primitive::resolve_names;
 use crate::semantic_registry::{
-    Conversion as RegistryConversion, SemanticDescriptor, StructuralBehavior, conversion,
-    descriptors, is_backend_native_math_primitive, primitive_from_name,
+    Conversion as RegistryConversion, OperandConsumption, ResultCardinality, SemanticDescriptor,
+    StructuralBehavior, conversion, descriptors, is_backend_native_math_primitive,
+    primitive_from_name,
 };
 use crate::typed_program::{
     BuildError, Cardinality, ConstantRecord, Edge, FanOutBranch, Feature, IndexRange, LiftMode,
-    Node, NodeIndex, NodeKind, Origin, OriginIndex, OriginPosition, OriginSpan, Ownership,
-    OwnershipMode, Parameter, RawProgramBuilder, ReleaseAfter, Root, RootIndex, ScalarConstant,
-    ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram, VerifyError,
+    Node, NodeIndex, NodeKind, OperationReference, Origin, OriginIndex, OriginPosition, OriginSpan,
+    Ownership, OwnershipMode, Parameter, RawProgramBuilder, ReleaseAfter, Root, RootIndex,
+    ScalarConstant, ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
+    VerifyError,
 };
 use crate::{Error, ErrorKind, ScalarType, SourceLocation, SourceSpan, Type, Value};
 use std::fmt::Write as _;
@@ -87,6 +89,8 @@ struct Lowerer {
     needs_tuples: bool,
     needs_spread: bool,
     needs_fan_out: bool,
+    needs_application_plans: bool,
+    needs_operation_references: bool,
     needs_backend_native_math: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
@@ -95,7 +99,7 @@ struct Lowerer {
 }
 
 #[derive(Default)]
-struct DiagnosticReservations {
+pub(crate) struct DiagnosticReservations {
     refuse_next: bool,
 }
 
@@ -159,6 +163,7 @@ pub(crate) fn compile_parsed_source_with_name(
     program: &Program,
 ) -> Result<VerifiedProgram, CompileError> {
     validate_parameter_declarations(program)?;
+    validate_operation_reference_positions(program)?;
     resolve_names(program)?;
     validate_program_arities(program)?;
     lower_program(source, diagnostic_name, program)
@@ -168,6 +173,76 @@ pub(crate) fn compile_parsed_source_with_name(
 enum StructuralValue {
     NonTuple,
     Tuple(usize),
+}
+
+fn validate_operation_reference_positions(program: &Program) -> Result<(), LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(program.roots.len()).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.extend(program.roots.iter().rev().map(|root| (root, false)));
+    while let Some((expression, accepted)) = pending.pop() {
+        match &expression.kind {
+            ExprKind::OperationReference { .. } if accepted => {}
+            ExprKind::OperationReference { name, name_span } => {
+                let mut error = Error::at_span(
+                    ErrorKind::SyntaxError,
+                    *name_span,
+                    "built-in operation reference is not accepted in this position",
+                );
+                error.primitive = Some(try_clone_string(name, crate::Arena::OperationReference)?);
+                return Err(LowerError::Source(error));
+            }
+            ExprKind::Call {
+                name, arguments, ..
+            } => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                for (index, argument) in arguments.iter().enumerate().rev() {
+                    pending.push((argument, operation_reference_position(name, index)));
+                }
+            }
+            ExprKind::Tuple(elements) => {
+                pending.try_reserve(elements.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(elements.iter().rev().map(|element| (element, false)));
+            }
+            ExprKind::Fanout { operand, branches } => {
+                let additional = branches.len().checked_add(1).ok_or(LowerError::Build(
+                    BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    },
+                ))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(branches.iter().rev().map(|branch| (branch, false)));
+                pending.push((operand, false));
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Vector(_, _)
+            | ExprKind::DeepTuple { .. }
+            | ExprKind::UnaryChain { .. }
+            | ExprKind::Parameter(_)
+            | ExprKind::UnresolvedName { .. }
+            | ExprKind::Placeholder => {}
+        }
+    }
+    Ok(())
+}
+
+fn operation_reference_position(consumer: &str, zero_based_argument: usize) -> bool {
+    matches!(consumer, "foldl" | "scanl") && zero_based_argument == 0
 }
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
@@ -236,6 +311,7 @@ fn validate_expr_arities(
         | ExprKind::Vector(_, _)
         | ExprKind::DeepTuple { .. }
         | ExprKind::Parameter(_)
+        | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => Ok(StructuralValue::NonTuple),
     }
 }
@@ -249,18 +325,28 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
             )?));
         }
     };
-    if descriptors(primitive).any(|descriptor| descriptor.parameters.len() == actual) {
+    let reference_arguments = usize::from(matches!(name, "foldl" | "scanl"));
+    if descriptors(primitive).any(|descriptor| {
+        descriptor.parameters.len().checked_add(reference_arguments) == Some(actual)
+    }) {
         return Ok(());
     }
     let mut accepted = Vec::new();
     for descriptor in descriptors(primitive) {
-        if !accepted.contains(&descriptor.parameters.len()) {
+        let arity = descriptor
+            .parameters
+            .len()
+            .checked_add(reference_arguments)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Node,
+            }))?;
+        if !accepted.contains(&arity) {
             accepted.try_reserve(1).map_err(|_| {
                 LowerError::Build(BuildError::AllocationUnavailable {
                     arena: crate::Arena::Node,
                 })
             })?;
-            accepted.push(descriptor.parameters.len());
+            accepted.push(arity);
         }
     }
     accepted.sort_unstable();
@@ -386,6 +472,8 @@ fn lower_program_with_builder_and_diagnostics(
         needs_tuples: false,
         needs_spread: false,
         needs_fan_out: false,
+        needs_application_plans: false,
+        needs_operation_references: false,
         needs_backend_native_math: false,
         placeholder: None,
         releases: Vec::new(),
@@ -480,6 +568,18 @@ fn lower_program_with_builder_and_diagnostics(
     }
     if lowerer.needs_fan_out {
         lowerer.builder.push_feature(Feature::FanOut.numeric())?;
+    }
+    if lowerer.needs_application_plans {
+        lowerer
+            .builder
+            .push_feature(Feature::ApplicationPlans.numeric())?;
+        lowerer.builder.set_semantic_minor(1);
+    }
+    if lowerer.needs_operation_references {
+        lowerer
+            .builder
+            .push_feature(Feature::OperationReferences.numeric())?;
+        lowerer.builder.set_semantic_minor(1);
     }
     if lowerer.needs_backend_native_math {
         lowerer.builder.set_semantic_minor(1);
@@ -621,6 +721,7 @@ impl Lowerer {
                         call_origin,
                         step.span.begin,
                         operands,
+                        None,
                     )?;
                 }
                 Ok(current)
@@ -979,6 +1080,9 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
+        if matches!(name, "foldl" | "scanl") {
+            return self.lower_reducer_consumer(name, arguments, name_span, origin, location);
+        }
         let primitive_origin = self.push_origin(name_span)?;
         let mut lowered = Vec::new();
         lowered.try_reserve(arguments.len()).map_err(|_| {
@@ -1010,7 +1114,65 @@ impl Lowerer {
         for argument in lowered {
             operands.push(CallOperand::Whole(argument));
         }
-        self.lower_selected_call(name, primitive_origin, origin, location, operands)
+        self.lower_selected_call(name, primitive_origin, origin, location, operands, None)
+    }
+
+    fn lower_reducer_consumer(
+        &mut self,
+        name: &str,
+        arguments: &[Expr],
+        name_span: SourceSpan,
+        origin: OriginIndex,
+        location: SourceLocation,
+    ) -> Result<Lowered, LowerError> {
+        let [reference_expression, initializer, vector] = arguments else {
+            let message = if name == "scanl" {
+                "scanl requires a reducer reference, initializer, and vector"
+            } else {
+                "foldl requires a reducer reference, initializer, and vector"
+            };
+            return Err(LowerError::Source(Error::new(
+                ErrorKind::ArityError,
+                location,
+                message,
+            )));
+        };
+        let ExprKind::OperationReference {
+            name: reducer_name,
+            name_span: reducer_name_span,
+        } = &reference_expression.kind
+        else {
+            let message = if name == "scanl" {
+                "scanl argument 1 must be a built-in operation reference"
+            } else {
+                "foldl argument 1 must be a built-in operation reference"
+            };
+            return Err(LowerError::Source(Error::at_span(
+                ErrorKind::TypeError,
+                reference_expression.span,
+                message,
+            )));
+        };
+        let primitive_origin = self.push_origin(name_span)?;
+        let reference_origin = self.push_origin(reference_expression.span)?;
+        let initializer = self.lower_expr(initializer)?;
+        let vector = self.lower_expr(vector)?;
+        let mut operands = Vec::new();
+        operands.try_reserve_exact(2).map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        operands.push(CallOperand::Whole(initializer));
+        operands.push(CallOperand::Whole(vector));
+        self.lower_selected_call(
+            name,
+            primitive_origin,
+            origin,
+            location,
+            operands,
+            Some((reducer_name, *reducer_name_span, reference_origin)),
+        )
     }
 
     fn lower_prefix_call(
@@ -1070,7 +1232,7 @@ impl Lowerer {
             });
         }
         let result =
-            self.lower_selected_call(name, primitive_origin, origin, location, operands)?;
+            self.lower_selected_call(name, primitive_origin, origin, location, operands, None)?;
         self.set_release(prepare, ReleaseAfter::Node(result.node))?;
         self.needs_spread = true;
         Ok(result)
@@ -1083,8 +1245,46 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
         operands: Vec<CallOperand>,
+        operation_reference: Option<(&str, SourceSpan, OriginIndex)>,
     ) -> Result<Lowered, LowerError> {
-        let descriptor = select_descriptor(name, &operands, location, &mut self.diagnostics)?;
+        let descriptor = if operation_reference.is_some() {
+            select_descriptor_with_argument_offset(
+                name,
+                &operands,
+                location,
+                1,
+                &mut self.diagnostics,
+            )?
+        } else {
+            select_descriptor(name, &operands, location, &mut self.diagnostics)?
+        };
+        let operation_reference =
+            if let Some((reference_name, reference_span, reference_origin)) = operation_reference {
+                let reference = resolve_operation_reference(
+                    reference_name,
+                    reference_span,
+                    reference_origin,
+                    OperationReferenceConstraint {
+                        parameter_types: &[Some(descriptor.result), Some(descriptor.result)],
+                        result_type: Some(descriptor.result),
+                    },
+                    &mut self.diagnostics,
+                )?;
+                self.needs_operation_references = true;
+                Some(self.builder.push_operation_reference(reference)?)
+            } else {
+                None
+            };
+        self.needs_application_plans |= descriptor
+            .parameters
+            .iter()
+            .any(|operand| operand.consumption == OperandConsumption::WholeVector)
+            || matches!(
+                descriptor.application_plan.result_cardinality,
+                ResultCardinality::Scalar
+                    | ResultCardinality::PreserveOperand(_)
+                    | ResultCardinality::OperandPlusOne(_)
+            );
         let edge_start = self.builder.finish_preview_edges()?;
         let mut static_anchor = None;
         let mut static_length = None;
@@ -1109,9 +1309,16 @@ impl Lowerer {
                     "selected operand is not scalar or vector",
                 ))
             })?;
-            let conversion = match conversion(actual, *accepted) {
+            let conversion = match conversion(actual, accepted.element_type) {
                 Some(RegistryConversion::Identity) => crate::Conversion::Identity,
                 Some(RegistryConversion::PromoteIntToDouble) => {
+                    if accepted.consumption == OperandConsumption::WholeVector {
+                        return Err(LowerError::Source(Error::new(
+                            ErrorKind::TypeError,
+                            SourceLocation::start(),
+                            "whole-vector operands do not permit implicit container conversion",
+                        )));
+                    }
                     crate::Conversion::PromoteIntToDouble
                 }
                 None => {
@@ -1122,7 +1329,18 @@ impl Lowerer {
                     )));
                 }
             };
-            if matches!(value_type, Type::Vector(_)) {
+            if accepted.consumption == OperandConsumption::WholeVector
+                && !matches!(value_type, Type::Vector(_))
+            {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    SourceLocation::start(),
+                    "selected whole-vector operand is not a vector",
+                )));
+            }
+            if accepted.consumption == OperandConsumption::Elementwise
+                && matches!(value_type, Type::Vector(_))
+            {
                 any_vector = true;
                 match operand_cardinality {
                     Some(Cardinality::StaticVector(length)) => {
@@ -1154,16 +1372,26 @@ impl Lowerer {
             })?;
         }
         if self.first_shape_error.is_none()
-            && let Some((anchor_index, expected)) =
-                operands
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, operand)| match operand.parts().3 {
+            && let Some((anchor_index, expected)) = operands
+                .iter()
+                .enumerate()
+                .zip(descriptor.parameters)
+                .find_map(|((index, operand), accepted)| {
+                    if accepted.consumption != OperandConsumption::Elementwise {
+                        return None;
+                    }
+                    match operand.parts().3 {
                         Some(Cardinality::StaticVector(length)) => Some((index, length)),
                         _ => None,
-                    })
+                    }
+                })
         {
-            for (index, operand) in operands.iter().enumerate() {
+            for (index, (operand, accepted)) in
+                operands.iter().zip(descriptor.parameters).enumerate()
+            {
+                if accepted.consumption != OperandConsumption::Elementwise {
+                    continue;
+                }
                 if index == anchor_index {
                     continue;
                 }
@@ -1213,8 +1441,12 @@ impl Lowerer {
             }
         }
         let shape_start = self.builder.finish_preview_shape_checks()?;
-        for (position, operand) in operands.iter().enumerate() {
-            if matches!(operand.parts().3, Some(Cardinality::DynamicVector)) {
+        for (position, (operand, accepted)) in
+            operands.iter().zip(descriptor.parameters).enumerate()
+        {
+            if accepted.consumption == OperandConsumption::Elementwise
+                && matches!(operand.parts().3, Some(Cardinality::DynamicVector))
+            {
                 self.builder.push_shape_check(
                     edge_start
                         .checked_add(u32::try_from(position).map_err(|_| {
@@ -1232,41 +1464,104 @@ impl Lowerer {
         }
         let shape_count = operands
             .iter()
-            .filter(|operand| matches!(operand.parts().3, Some(Cardinality::DynamicVector)))
+            .zip(descriptor.parameters)
+            .filter(|(operand, accepted)| {
+                accepted.consumption == OperandConsumption::Elementwise
+                    && matches!(operand.parts().3, Some(Cardinality::DynamicVector))
+            })
             .count();
-        let (record, value_type, cardinality, lift) =
-            if descriptor.behavior == StructuralBehavior::Iota {
-                (
-                    TypeRecord::Vector(descriptor.result),
-                    Type::Vector(descriptor.result),
-                    Some(Cardinality::DynamicVector),
-                    LiftMode::DynamicVector,
-                )
-            } else if any_vector {
-                (
-                    TypeRecord::Vector(descriptor.result),
-                    Type::Vector(descriptor.result),
-                    Some(if any_dynamic {
-                        Cardinality::DynamicVector
-                    } else {
-                        Cardinality::StaticVector(static_length.unwrap_or(0))
-                    }),
-                    LiftMode::Vector,
-                )
-            } else {
-                (
-                    TypeRecord::Scalar(descriptor.result),
-                    Type::Scalar(descriptor.result),
-                    Some(Cardinality::StaticScalar),
-                    LiftMode::Scalar,
-                )
+        let operand_cardinality = |position: u16| {
+            position
+                .checked_sub(1)
+                .and_then(|index| operands.get(usize::from(index)))
+                .and_then(|operand| operand.parts().3)
+        };
+        let (record, value_type, cardinality, lift) = if descriptor
+            .application_plan
+            .result_cardinality
+            == ResultCardinality::DynamicVector
+        {
+            (
+                TypeRecord::Vector(descriptor.result),
+                Type::Vector(descriptor.result),
+                Some(Cardinality::DynamicVector),
+                LiftMode::DynamicVector,
+            )
+        } else if descriptor.application_plan.result_cardinality == ResultCardinality::Elementwise
+            && any_vector
+        {
+            (
+                TypeRecord::Vector(descriptor.result),
+                Type::Vector(descriptor.result),
+                Some(if any_dynamic {
+                    Cardinality::DynamicVector
+                } else {
+                    Cardinality::StaticVector(static_length.unwrap_or(0))
+                }),
+                LiftMode::Vector,
+            )
+        } else if descriptor.application_plan.result_cardinality == ResultCardinality::Elementwise {
+            (
+                TypeRecord::Scalar(descriptor.result),
+                Type::Scalar(descriptor.result),
+                Some(Cardinality::StaticScalar),
+                LiftMode::Scalar,
+            )
+        } else if descriptor.application_plan.result_cardinality == ResultCardinality::Scalar {
+            (
+                TypeRecord::Scalar(descriptor.result),
+                Type::Scalar(descriptor.result),
+                Some(Cardinality::StaticScalar),
+                LiftMode::ContainerScalar,
+            )
+        } else {
+            let position = match descriptor.application_plan.result_cardinality {
+                ResultCardinality::PreserveOperand(position)
+                | ResultCardinality::OperandPlusOne(position) => position,
+                _ => {
+                    return Err(LowerError::Source(Error::new(
+                        ErrorKind::TypeError,
+                        SourceLocation::start(),
+                        "selected application plan has invalid result cardinality",
+                    )));
+                }
             };
+            let result_cardinality = match operand_cardinality(position) {
+                Some(Cardinality::StaticVector(length))
+                    if descriptor.application_plan.result_cardinality
+                        == ResultCardinality::OperandPlusOne(position) =>
+                {
+                    Some(Cardinality::StaticVector(length.checked_add(1).ok_or(
+                        LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::Node,
+                        }),
+                    )?))
+                }
+                Some(cardinality @ Cardinality::StaticVector(_))
+                | Some(cardinality @ Cardinality::DynamicVector) => Some(cardinality),
+                _ => {
+                    return Err(LowerError::Source(Error::new(
+                        ErrorKind::TypeError,
+                        SourceLocation::start(),
+                        "selected application plan requires a vector cardinality operand",
+                    )));
+                }
+            };
+            (
+                TypeRecord::Vector(descriptor.result),
+                Type::Vector(descriptor.result),
+                result_cardinality,
+                LiftMode::ContainerVector,
+            )
+        };
         let result_type = self.builder.push_type(record)?;
         let node = self.builder.push_node(Node {
             kind: NodeKind::SelectedApply {
                 primitive_id: descriptor.primitive_id.numeric(),
                 signature_id: descriptor.signature_id.numeric(),
                 implementation_id: descriptor.implementation_id.numeric(),
+                application_plan_id: descriptor.application_plan.id.numeric(),
+                operation_reference,
                 primitive_origin,
                 lift,
                 result_element_type: descriptor.result,
@@ -1569,6 +1864,16 @@ fn select_descriptor(
     location: SourceLocation,
     diagnostics: &mut DiagnosticReservations,
 ) -> Result<&'static SemanticDescriptor, LowerError> {
+    select_descriptor_with_argument_offset(name, operands, location, 0, diagnostics)
+}
+
+fn select_descriptor_with_argument_offset(
+    name: &str,
+    operands: &[CallOperand],
+    location: SourceLocation,
+    argument_offset: usize,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<&'static SemanticDescriptor, LowerError> {
     let primitive = match primitive_from_name(name) {
         Ok(primitive) => primitive,
         Err(_) => {
@@ -1593,10 +1898,15 @@ fn select_descriptor(
             .first()
             .is_some_and(|operand| !matches!(operand.parts().2, Type::Scalar(_)))
     {
-        let message = unsupported_signature_message(name, 1, diagnostics)?;
+        let source_position = 1_usize.saturating_add(argument_offset);
+        let message = if argument_offset == 0 {
+            unsupported_signature_message(name, 1, diagnostics)?
+        } else {
+            unsupported_signature_message(name, source_position, diagnostics)?
+        };
         let mut error = Error::new(ErrorKind::TypeError, operands[0].parts().6, message);
         error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
-        error.argument_position = Some(1);
+        error.argument_position = Some(source_position);
         error
             .actual_types
             .try_reserve(operands.len())
@@ -1615,10 +1925,20 @@ fn select_descriptor(
         .filter_map(|descriptor| {
             let mut cost = 0;
             for (operand, accepted) in operands.iter().zip(descriptor.parameters) {
+                if accepted.consumption == OperandConsumption::WholeVector
+                    && !matches!(operand.parts().2, Type::Vector(_))
+                {
+                    return None;
+                }
                 let actual = scalar_element(operand.parts().2)?;
-                match conversion(actual, *accepted)? {
+                match conversion(actual, accepted.element_type)? {
                     RegistryConversion::Identity => {}
-                    RegistryConversion::PromoteIntToDouble => cost += 1,
+                    RegistryConversion::PromoteIntToDouble
+                        if accepted.consumption == OperandConsumption::Elementwise =>
+                    {
+                        cost += 1;
+                    }
+                    RegistryConversion::PromoteIntToDouble => return None,
                 }
             }
             Some((cost, descriptor))
@@ -1634,22 +1954,29 @@ fn select_descriptor(
                     .iter()
                     .zip(operands)
                     .take_while(|(accepted, operand)| {
-                        scalar_element(operand.parts().2)
-                            .is_some_and(|actual| conversion(actual, **accepted).is_some())
+                        (accepted.consumption == OperandConsumption::Elementwise
+                            || matches!(operand.parts().2, Type::Vector(_)))
+                            && scalar_element(operand.parts().2).is_some_and(|actual| {
+                                conversion(actual, accepted.element_type).is_some_and(|selected| {
+                                    selected == RegistryConversion::Identity
+                                        || accepted.consumption == OperandConsumption::Elementwise
+                                })
+                            })
                     })
                     .count()
             })
             .max()
             .unwrap_or(0);
         let first_unsupported = (matched_prefix + 1).min(operands.len());
-        let message = unsupported_signature_message(name, first_unsupported, diagnostics)?;
+        let source_position = first_unsupported.saturating_add(argument_offset);
+        let message = unsupported_signature_message(name, source_position, diagnostics)?;
         let mut error = Error::new(
             ErrorKind::TypeError,
             operands[first_unsupported - 1].parts().6,
             message,
         );
         error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
-        error.argument_position = Some(first_unsupported);
+        error.argument_position = Some(source_position);
         error
             .actual_types
             .try_reserve(operands.len())
@@ -1664,6 +1991,160 @@ fn select_descriptor(
         return Err(LowerError::Source(error));
     };
     Ok(selected)
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct OperationReferenceConstraint<'a> {
+    pub parameter_types: &'a [Option<ScalarType>],
+    pub result_type: Option<ScalarType>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_operation_reference(
+    name: &str,
+    name_span: SourceSpan,
+    origin: OriginIndex,
+    constraint: OperationReferenceConstraint<'_>,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<OperationReference, CompileError> {
+    let primitive = match primitive_from_name(name) {
+        Ok(primitive) => primitive,
+        Err(_) => {
+            return Err(LowerError::Source(operation_reference_diagnostic(
+                name,
+                name_span,
+                "is not a registered built-in operation",
+                ErrorKind::UnknownPrimitive,
+                diagnostics,
+            )?));
+        }
+    };
+    let mut has_matching_arity = false;
+    let mut has_elementwise = false;
+    let mut minimum_cost = None;
+    let mut selected = None;
+    let mut ambiguous = false;
+    for descriptor in descriptors(primitive)
+        .filter(|descriptor| descriptor.parameters.len() == constraint.parameter_types.len())
+    {
+        has_matching_arity = true;
+        if descriptor.behavior != StructuralBehavior::Elementwise {
+            continue;
+        }
+        has_elementwise = true;
+        if constraint
+            .result_type
+            .is_some_and(|result| descriptor.result != result)
+        {
+            continue;
+        }
+        let mut cost = 0_u32;
+        let mut compatible = true;
+        for (actual, accepted) in constraint
+            .parameter_types
+            .iter()
+            .copied()
+            .zip(descriptor.parameters.iter().copied())
+        {
+            let Some(actual) = actual else {
+                continue;
+            };
+            match conversion(actual, accepted.element_type) {
+                Some(RegistryConversion::Identity) => {}
+                Some(RegistryConversion::PromoteIntToDouble) => cost += 1,
+                None => {
+                    compatible = false;
+                    break;
+                }
+            }
+        }
+        if !compatible {
+            continue;
+        }
+        match minimum_cost {
+            None => {
+                minimum_cost = Some(cost);
+                selected = Some(descriptor);
+                ambiguous = false;
+            }
+            Some(current) if cost < current => {
+                minimum_cost = Some(cost);
+                selected = Some(descriptor);
+                ambiguous = false;
+            }
+            Some(current) if cost == current => ambiguous = true,
+            Some(_) => {}
+        }
+    }
+    if !has_matching_arity {
+        return Err(LowerError::Source(operation_reference_diagnostic(
+            name,
+            name_span,
+            "referenced operation has incompatible arity",
+            ErrorKind::ArityError,
+            diagnostics,
+        )?));
+    }
+    if !has_elementwise {
+        return Err(LowerError::Source(operation_reference_diagnostic(
+            name,
+            name_span,
+            "referenced operation has unsupported structural behavior",
+            ErrorKind::TypeError,
+            diagnostics,
+        )?));
+    }
+    if ambiguous {
+        return Err(LowerError::Source(operation_reference_diagnostic(
+            name,
+            name_span,
+            "referenced operation overload is ambiguous",
+            ErrorKind::TypeError,
+            diagnostics,
+        )?));
+    }
+    let Some(descriptor) = selected else {
+        return Err(LowerError::Source(operation_reference_diagnostic(
+            name,
+            name_span,
+            "referenced operation has no compatible signature",
+            ErrorKind::TypeError,
+            diagnostics,
+        )?));
+    };
+    Ok(OperationReference {
+        primitive_id: descriptor.primitive_id.numeric(),
+        signature_id: descriptor.signature_id.numeric(),
+        implementation_id: descriptor.implementation_id.numeric(),
+        origin,
+    })
+}
+
+fn operation_reference_diagnostic(
+    name: &str,
+    name_span: SourceSpan,
+    reason: &str,
+    kind: ErrorKind,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<Error, LowerError> {
+    let capacity = name
+        .len()
+        .checked_add(reason.len())
+        .and_then(|length| length.checked_add(8))
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::OperationReference,
+        }))?;
+    let mut message = String::new();
+    diagnostics.try_reserve(&mut message, capacity, crate::Arena::OperationReference)?;
+    write!(&mut message, "@{name} {reason}").map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::OperationReference,
+        })
+    })?;
+    let mut error = Error::at_span(kind, name_span, message);
+    error.primitive = Some(try_clone_string(name, crate::Arena::OperationReference)?);
+    Ok(error)
 }
 
 fn scalar_element(value_type: &Type) -> Option<ScalarType> {
@@ -1749,6 +2230,7 @@ fn placeholder_span(expression: &Expr) -> Option<SourceSpan> {
         | ExprKind::DeepTuple { .. }
         | ExprKind::UnaryChain { .. }
         | ExprKind::Parameter(_)
+        | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => None,
     }
 }
@@ -1854,8 +2336,182 @@ mod tests {
     }
 
     #[test]
+    fn operation_references_are_rejected_outside_registered_consumer_positions() {
+        for (source, offset) in [
+            ("@add\n", 2),
+            ("@add# trailing comment\n", 2),
+            ("add[@add 1]\n", 6),
+        ] {
+            let error = must_source_error(source);
+            assert_eq!(error.kind, ErrorKind::SyntaxError, "{source}");
+            assert_eq!(error.location.offset, offset, "{source}");
+            assert_eq!(
+                error.message,
+                "built-in operation reference is not accepted in this position"
+            );
+            assert_eq!(error.primitive.as_deref(), Some("add"));
+        }
+
+        let mut deep = String::new();
+        deep.try_reserve_exact(24_576).expect("test source reserve");
+        for _ in 0..4_096 {
+            deep.push_str("1\n");
+        }
+        deep.push_str("@add\n");
+        let error = must_source_error(&deep);
+        assert_eq!(error.kind, ErrorKind::SyntaxError);
+        assert_eq!(error.location.line, 4_097);
+    }
+
+    #[test]
+    fn constrained_operation_reference_resolution_is_stable_and_closed() {
+        let span = SourceSpan {
+            begin: SourceLocation {
+                offset: 2,
+                line: 1,
+                column: 2,
+            },
+            end: SourceLocation {
+                offset: 5,
+                line: 1,
+                column: 5,
+            },
+        };
+        let mut diagnostics = DiagnosticReservations::default();
+        let selected = resolve_operation_reference(
+            "add",
+            span,
+            OriginIndex(7),
+            OperationReferenceConstraint {
+                parameter_types: &[Some(ScalarType::Int), Some(ScalarType::Int)],
+                result_type: Some(ScalarType::Int),
+            },
+            &mut diagnostics,
+        )
+        .expect("constrained reference");
+        assert_eq!(
+            selected,
+            OperationReference {
+                primitive_id: 5,
+                signature_id: 9,
+                implementation_id: 9,
+                origin: OriginIndex(7),
+            }
+        );
+
+        let promoted = resolve_operation_reference(
+            "add",
+            span,
+            OriginIndex(8),
+            OperationReferenceConstraint {
+                parameter_types: &[Some(ScalarType::Int), Some(ScalarType::Double)],
+                result_type: Some(ScalarType::Double),
+            },
+            &mut diagnostics,
+        )
+        .expect("promoted reference");
+        assert_eq!(
+            (
+                promoted.primitive_id,
+                promoted.signature_id,
+                promoted.implementation_id,
+            ),
+            (5, 10, 10)
+        );
+
+        for (name, parameters, result, message) in [
+            (
+                "add",
+                &[None, None][..],
+                None,
+                "@add referenced operation overload is ambiguous",
+            ),
+            (
+                "iota",
+                &[Some(ScalarType::Int)][..],
+                Some(ScalarType::Int),
+                "@iota referenced operation has unsupported structural behavior",
+            ),
+            (
+                "not",
+                &[Some(ScalarType::Bool), Some(ScalarType::Bool)][..],
+                Some(ScalarType::Bool),
+                "@not referenced operation has incompatible arity",
+            ),
+            (
+                "add",
+                &[Some(ScalarType::Bool), Some(ScalarType::Bool)][..],
+                Some(ScalarType::Bool),
+                "@add referenced operation has no compatible signature",
+            ),
+        ] {
+            let error = resolve_operation_reference(
+                name,
+                span,
+                OriginIndex(0),
+                OperationReferenceConstraint {
+                    parameter_types: parameters,
+                    result_type: result,
+                },
+                &mut diagnostics,
+            )
+            .expect_err(name);
+            let CompileError::Source(error) = error else {
+                panic!("expected source error for {name}");
+            };
+            assert_eq!(error.message, message);
+        }
+        let unknown = resolve_operation_reference(
+            "missing",
+            span,
+            OriginIndex(0),
+            OperationReferenceConstraint {
+                parameter_types: &[],
+                result_type: None,
+            },
+            &mut diagnostics,
+        )
+        .expect_err("unknown reference");
+        assert!(matches!(
+            unknown,
+            CompileError::Source(Error {
+                kind: ErrorKind::UnknownPrimitive,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn operation_reference_diagnostic_allocation_refusal_is_explicit() {
+        let span = SourceSpan {
+            begin: SourceLocation::start(),
+            end: SourceLocation {
+                offset: 4,
+                line: 1,
+                column: 4,
+            },
+        };
+        let result = resolve_operation_reference(
+            "add",
+            span,
+            OriginIndex(0),
+            OperationReferenceConstraint {
+                parameter_types: &[None, None],
+                result_type: None,
+            },
+            &mut DiagnosticReservations { refuse_next: true },
+        );
+        assert!(matches!(
+            result,
+            Err(CompileError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::OperationReference,
+            }))
+        ));
+    }
+
+    #[test]
     fn selected_calls_record_stable_ids_conversions_cardinality_and_origins() {
-        let program = must_compile("add[1 2.0]\ninc[(1 2)]\niota[3]\n");
+        let program = must_compile("add[1 2.0]\ndiv[7 2.0]\ninc[(1 2)]\niota[3]\n");
         let raw = program.as_raw();
         let applies: Vec<_> = raw
             .nodes
@@ -1879,19 +2535,566 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(applies.len(), 3);
+        assert_eq!(applies.len(), 4);
         assert_eq!((applies[0].1, applies[0].2, applies[0].3), (5, 10, 10));
         assert_eq!(
             raw.edges[0].conversion,
             crate::Conversion::PromoteIntToDouble
         );
         assert_eq!(raw.edges[1].conversion, crate::Conversion::Identity);
-        assert_eq!(applies[1].4, LiftMode::Vector);
-        assert_eq!(applies[1].0.cardinality, Some(Cardinality::StaticVector(2)));
-        assert_eq!(applies[1].5.static_anchor, Some(0));
-        assert_eq!(applies[2].4, LiftMode::DynamicVector);
-        assert_eq!(applies[2].0.cardinality, Some(Cardinality::DynamicVector));
+        assert_eq!((applies[1].1, applies[1].2, applies[1].3), (20, 36, 36));
+        assert_eq!(
+            raw.edges[2].conversion,
+            crate::Conversion::PromoteIntToDouble
+        );
+        assert_eq!(raw.edges[3].conversion, crate::Conversion::Identity);
+        assert_eq!(applies[2].4, LiftMode::Vector);
+        assert_eq!(applies[2].0.cardinality, Some(Cardinality::StaticVector(2)));
+        assert_eq!(applies[2].5.static_anchor, Some(0));
+        assert_eq!(applies[3].4, LiftMode::DynamicVector);
+        assert_eq!(applies[3].0.cardinality, Some(Cardinality::DynamicVector));
         assert_ne!(raw.edges[0].origin, raw.nodes[2].origin);
+    }
+
+    #[test]
+    fn vector_length_records_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program = must_compile("length[(true false)]\nlength iota 3\nlength[Double()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 21,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3))
+                .collect::<Vec<_>>(),
+            [(37, 37, 3), (38, 38, 3), (39, 39, 3)]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.0.cardinality == Some(Cardinality::StaticScalar)
+                && apply.4 == LiftMode::ContainerScalar
+                && apply.5
+                    == ShapePlan {
+                        static_anchor: None,
+                        dynamic_checks: IndexRange::default(),
+                    }
+        }));
+        let cardinalities: Vec<_> = applies
+            .iter()
+            .map(|apply| {
+                raw.edges
+                    .get(apply.0.edges.start as usize)
+                    .and_then(|edge| edge.cardinality)
+            })
+            .collect();
+        assert_eq!(
+            cardinalities,
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_sort_records_preserved_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program = must_compile("sort[(true false)]\nsort iota 3\nsort[Double()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 22,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3))
+                .collect::<Vec<_>>(),
+            [(40, 40, 4), (41, 41, 4), (42, 42, 4)]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.4 == LiftMode::ContainerVector
+                && apply.5
+                    == ShapePlan {
+                        static_anchor: None,
+                        dynamic_checks: IndexRange::default(),
+                    }
+        }));
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| apply.0.cardinality)
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+        assert!(applies.iter().all(|apply| {
+            raw.edges
+                .get(apply.0.edges.start as usize)
+                .is_some_and(|edge| edge.cardinality == apply.0.cardinality)
+        }));
+    }
+
+    #[test]
+    fn vector_sum_records_scalar_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program = must_compile("sum[(1 2)]\nsum iota 3\nsum[Double()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 23,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3))
+                .collect::<Vec<_>>(),
+            [(43, 43, 5), (43, 43, 5), (44, 44, 5)]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.0.cardinality == Some(Cardinality::StaticScalar)
+                && apply.4 == LiftMode::ContainerScalar
+                && apply.5
+                    == ShapePlan {
+                        static_anchor: None,
+                        dynamic_checks: IndexRange::default(),
+                    }
+        }));
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    raw.edges
+                        .get(apply.0.edges.start as usize)
+                        .and_then(|edge| edge.cardinality)
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_of_records_scalar_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program =
+            must_compile("all_of[(true false)]\nall_of equals[iota 3 iota 3]\nall_of[Bool()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 24,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert!(
+            applies
+                .iter()
+                .all(|apply| (apply.1, apply.2, apply.3) == (45, 45, 6))
+        );
+        assert!(
+            applies.iter().all(|apply| {
+                apply.0.cardinality == Some(Cardinality::StaticScalar)
+                    && apply.4 == LiftMode::ContainerScalar
+                    && apply.5.static_anchor.is_none()
+                    && apply.5.dynamic_checks.count == 0
+            }),
+            "{applies:?}"
+        );
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    raw.edges
+                        .get(apply.0.edges.start as usize)
+                        .and_then(|edge| edge.cardinality)
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn any_of_records_scalar_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program =
+            must_compile("any_of[(false true)]\nany_of equals[iota 3 iota 3]\nany_of[Bool()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 25,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert!(
+            applies
+                .iter()
+                .all(|apply| (apply.1, apply.2, apply.3) == (46, 46, 7))
+        );
+        assert!(
+            applies.iter().all(|apply| {
+                apply.0.cardinality == Some(Cardinality::StaticScalar)
+                    && apply.4 == LiftMode::ContainerScalar
+                    && apply.5.static_anchor.is_none()
+                    && apply.5.dynamic_checks.count == 0
+            }),
+            "{applies:?}"
+        );
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    raw.edges
+                        .get(apply.0.edges.start as usize)
+                        .and_then(|edge| edge.cardinality)
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn none_of_records_scalar_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program =
+            must_compile("none_of[(false true)]\nnone_of equals[iota 3 iota 3]\nnone_of[Bool()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 26,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert!(
+            applies
+                .iter()
+                .all(|apply| (apply.1, apply.2, apply.3) == (47, 47, 8))
+        );
+        assert!(
+            applies.iter().all(|apply| {
+                apply.0.cardinality == Some(Cardinality::StaticScalar)
+                    && apply.4 == LiftMode::ContainerScalar
+                    && apply.5.static_anchor.is_none()
+                    && apply.5.dynamic_checks.count == 0
+            }),
+            "{applies:?}"
+        );
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    raw.edges
+                        .get(apply.0.edges.start as usize)
+                        .and_then(|edge| edge.cardinality)
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn foldl_records_reducer_identity_initializer_conversion_and_vector_work_plan() {
+        let program = must_compile(
+            "parameters[n Int]\n\
+             foldl[@sub 20 (3 4 5)]\n\
+             foldl[@add 0 iota[n]]\n\
+             foldl[@add 1 Double()]\n",
+        );
+        let raw = program.as_raw();
+        assert_eq!(
+            raw.features,
+            vec![
+                Feature::StableSemanticIds.numeric(),
+                Feature::ApplicationPlans.numeric(),
+                Feature::OperationReferences.numeric(),
+            ]
+        );
+        assert_eq!(raw.operation_references.len(), 3);
+        assert_eq!(
+            raw.operation_references
+                .iter()
+                .map(|reference| (
+                    reference.primitive_id,
+                    reference.signature_id,
+                    reference.implementation_id,
+                ))
+                .collect::<Vec<_>>(),
+            [(6, 11, 11), (5, 9, 9), (5, 10, 10)]
+        );
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 27,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3, apply.4))
+                .collect::<Vec<_>>(),
+            [
+                (49, 49, 9, Some(crate::OperationReferenceIndex(0))),
+                (49, 49, 9, Some(crate::OperationReferenceIndex(1))),
+                (50, 50, 9, Some(crate::OperationReferenceIndex(2))),
+            ]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.0.cardinality == Some(Cardinality::StaticScalar)
+                && apply.5 == LiftMode::ContainerScalar
+        }));
+        let final_edges =
+            &raw.edges[applies[2].0.edges.start as usize..applies[2].0.edges.start as usize + 2];
+        assert_eq!(
+            final_edges[0].conversion,
+            crate::Conversion::PromoteIntToDouble
+        );
+        assert_eq!(final_edges[1].conversion, crate::Conversion::Identity);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    raw.edges
+                        .get(apply.0.edges.start as usize + 1)
+                        .and_then(|edge| edge.cardinality)
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(3)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn scanl_records_reducer_identity_initializer_conversion_and_plus_one_plan() {
+        let program = must_compile(
+            "parameters[n Int]\n\
+             scanl[@sub 20 (3 4 5)]\n\
+             scanl[@add 0 iota[n]]\n\
+             scanl[@add 1 Double()]\n",
+        );
+        let raw = program.as_raw();
+        assert_eq!(
+            raw.operation_references
+                .iter()
+                .map(|reference| (
+                    reference.primitive_id,
+                    reference.signature_id,
+                    reference.implementation_id,
+                ))
+                .collect::<Vec<_>>(),
+            [(6, 11, 11), (5, 9, 9), (5, 10, 10)]
+        );
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 28,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3, apply.4))
+                .collect::<Vec<_>>(),
+            [
+                (52, 52, 10, Some(crate::OperationReferenceIndex(0))),
+                (52, 52, 10, Some(crate::OperationReferenceIndex(1))),
+                (53, 53, 10, Some(crate::OperationReferenceIndex(2))),
+            ]
+        );
+        assert!(
+            applies
+                .iter()
+                .all(|apply| apply.5 == LiftMode::ContainerVector)
+        );
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| apply.0.cardinality)
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(4)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(1)),
+            ]
+        );
+        let final_edges =
+            &raw.edges[applies[2].0.edges.start as usize..applies[2].0.edges.start as usize + 2];
+        assert_eq!(
+            final_edges[0].conversion,
+            crate::Conversion::PromoteIntToDouble
+        );
+        assert_eq!(final_edges[1].conversion, crate::Conversion::Identity);
     }
 
     #[test]
@@ -2294,10 +3497,18 @@ mod tests {
              (1 2)\n\
              [1 x]\n\
              inc[1]\n\
+             length[(1 2)]\n\
+             sort[(2 1)]\n\
+             sum[(1 2)]\n\
+             all_of[(true false)]\n\
+             any_of[(true false)]\n\
+             none_of[(true false)]\n\
+             foldl[@sub 10 (1 2)]\n\
+             scanl[@sub 10 (1 2)]\n\
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 16_420_725_918_700_611_398);
+        assert_eq!(debug_digest(&matrix), 2_540_857_452_231_284_986);
 
         let depth = 256;
         let mut deep = String::new();
@@ -2311,7 +3522,7 @@ mod tests {
         }
         assert_eq!(
             debug_digest(&must_compile(&deep)),
-            17_055_416_865_788_300_019
+            13_509_599_112_709_267_319
         );
 
         let mut unary = String::new();
@@ -2322,7 +3533,7 @@ mod tests {
         unary.push('1');
         assert_eq!(
             debug_digest(&must_compile(&unary)),
-            16_033_402_538_388_638_440
+            9_029_834_920_760_033_112
         );
     }
 
