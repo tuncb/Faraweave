@@ -538,6 +538,64 @@ fn cli_run_is_extension_agnostic_and_transactional() {
 }
 
 #[test]
+fn cli_connected_completion_success_and_failure_are_transactional() {
+    let directory = unique("connected-completion");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let success = directory.join("success.faraweave");
+    fs::write(
+        &success,
+        "add[10] 20\nadd[] [10 20]\nadd[10] (20 30)\nadd[10] mul[2] 20\n",
+    )
+    .expect("success source");
+    let output = Command::new(binary())
+        .arg("run")
+        .arg(&success)
+        .output()
+        .expect("run connected success");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"30\n30\n(30 40)\n50\n");
+    assert!(output.stderr.is_empty());
+    let artifact = directory.join("success.fwir");
+    let compile = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&success)
+        .arg("-o")
+        .arg(&artifact)
+        .output()
+        .expect("compile connected artifact");
+    assert!(compile.status.success());
+    assert!(compile.stdout.is_empty());
+    assert!(compile.stderr.is_empty());
+    let loaded = Command::new(binary())
+        .arg("run-ir")
+        .arg(&artifact)
+        .output()
+        .expect("run connected artifact");
+    assert!(loaded.status.success());
+    assert_eq!(loaded.stdout, output.stdout);
+    assert!(loaded.stderr.is_empty());
+
+    let failure = directory.join("failure.faraweave");
+    fs::write(&failure, "1\nadd[] 1\n").expect("failure source");
+    let output = Command::new(binary())
+        .arg("run")
+        .arg(&failure)
+        .output()
+        .expect("run connected failure");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr.ends_with(
+            b":2:7: ArityError: add connected completion failed: missing_completion \
+              (template_arity=0, supplied_width=1)\n"
+        ),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
 fn cli_parameters_and_diagnostics_contract() {
     let directory = unique("parameters");
     fs::create_dir_all(&directory).expect("mkdir");

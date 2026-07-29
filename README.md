@@ -43,6 +43,15 @@ fanout[iota[3] {inc[_]} {add[_ 10]}]
 
 This produces `[(2 3 4) (11 12 13)]`.
 
+An incomplete adjacent call can be completed by one connected operand:
+`add[10] 20` is `30`, `add[] [10 20]` is `30`, and
+`add[10] mul[2] 20` associates right-to-left and is `50`. A non-tuple operand,
+including a vector, supplies one argument; only an immediate authored tuple
+supplies its elements. Completion must be exact, evaluates template
+expressions before the operand, and creates no partial function—`add[10]`
+remains an arity error. Inside bracket and tuple sibling lists whitespace keeps
+its existing separator meaning, so `inc[add[1] 2]` is not connected syntax.
+
 Elementwise calls broadcast scalars over vectors and require equal vector
 lengths. Singleton vectors stay vectors. Exact overloads win; the only
 conversion is `Int` to `Double`. Integer arithmetic is checked and publishes no
@@ -292,7 +301,8 @@ manifest through GitHub OIDC, and publishes as its final mutation.
 ## Deliberate differences from Anka and Rust adaptations
 
 Anka is inspiration, not a compatibility target. Faraweave keeps explicit
-bracket calls, checked Int64 arithmetic, fixed one-level tuple spreading,
+bracket calls, exact placeholder-free connected completion, checked Int64
+arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit
 currying, functions, effects, reductions other than `sum`, `all_of`, `any_of`,
