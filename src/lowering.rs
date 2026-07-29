@@ -242,7 +242,7 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
 }
 
 fn operation_reference_position(consumer: &str, zero_based_argument: usize) -> bool {
-    matches!(consumer, "foldl" | "scanl") && zero_based_argument == 0
+    matches!(consumer, "foldl" | "scanl" | "filter") && zero_based_argument == 0
 }
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
@@ -325,7 +325,7 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
             )?));
         }
     };
-    let reference_arguments = usize::from(matches!(name, "foldl" | "scanl"));
+    let reference_arguments = usize::from(matches!(name, "foldl" | "scanl" | "filter"));
     if descriptors(primitive).any(|descriptor| {
         descriptor.parameters.len().checked_add(reference_arguments) == Some(actual)
     }) {
@@ -1083,6 +1083,9 @@ impl Lowerer {
         if matches!(name, "foldl" | "scanl") {
             return self.lower_reducer_consumer(name, arguments, name_span, origin, location);
         }
+        if name == "filter" {
+            return self.lower_filter_consumer(arguments, name_span, origin, location);
+        }
         let primitive_origin = self.push_origin(name_span)?;
         let mut lowered = Vec::new();
         lowered.try_reserve(arguments.len()).map_err(|_| {
@@ -1175,6 +1178,51 @@ impl Lowerer {
         )
     }
 
+    fn lower_filter_consumer(
+        &mut self,
+        arguments: &[Expr],
+        name_span: SourceSpan,
+        origin: OriginIndex,
+        location: SourceLocation,
+    ) -> Result<Lowered, LowerError> {
+        let [reference_expression, vector] = arguments else {
+            return Err(LowerError::Source(Error::new(
+                ErrorKind::ArityError,
+                location,
+                "filter requires a predicate reference and vector",
+            )));
+        };
+        let ExprKind::OperationReference {
+            name: predicate_name,
+            name_span: predicate_name_span,
+        } = &reference_expression.kind
+        else {
+            return Err(LowerError::Source(Error::at_span(
+                ErrorKind::TypeError,
+                reference_expression.span,
+                "filter argument 1 must be a built-in operation reference",
+            )));
+        };
+        let primitive_origin = self.push_origin(name_span)?;
+        let reference_origin = self.push_origin(reference_expression.span)?;
+        let vector = self.lower_expr(vector)?;
+        let mut operands = Vec::new();
+        operands.try_reserve_exact(1).map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        operands.push(CallOperand::Whole(vector));
+        self.lower_selected_call(
+            "filter",
+            primitive_origin,
+            origin,
+            location,
+            operands,
+            Some((predicate_name, *predicate_name_span, reference_origin)),
+        )
+    }
+
     fn lower_prefix_call(
         &mut self,
         name: &str,
@@ -1260,13 +1308,36 @@ impl Lowerer {
         };
         let operation_reference =
             if let Some((reference_name, reference_span, reference_origin)) = operation_reference {
+                let (parameter_types, result_type, exact_parameters, require_total_unary) =
+                    if descriptor.behavior == StructuralBehavior::VectorFilter {
+                        (
+                            [Some(descriptor.result), None],
+                            Some(ScalarType::Bool),
+                            true,
+                            true,
+                        )
+                    } else {
+                        (
+                            [Some(descriptor.result), Some(descriptor.result)],
+                            Some(descriptor.result),
+                            false,
+                            false,
+                        )
+                    };
+                let parameter_types = if descriptor.behavior == StructuralBehavior::VectorFilter {
+                    &parameter_types[..1]
+                } else {
+                    &parameter_types[..]
+                };
                 let reference = resolve_operation_reference(
                     reference_name,
                     reference_span,
                     reference_origin,
                     OperationReferenceConstraint {
-                        parameter_types: &[Some(descriptor.result), Some(descriptor.result)],
-                        result_type: Some(descriptor.result),
+                        parameter_types,
+                        result_type,
+                        exact_parameters,
+                        require_total_unary,
                     },
                     &mut self.diagnostics,
                 )?;
@@ -1284,6 +1355,7 @@ impl Lowerer {
                 ResultCardinality::Scalar
                     | ResultCardinality::PreserveOperand(_)
                     | ResultCardinality::OperandPlusOne(_)
+                    | ResultCardinality::SubsetOfOperand(_)
             );
         let edge_start = self.builder.finish_preview_edges()?;
         let mut static_anchor = None;
@@ -1517,7 +1589,8 @@ impl Lowerer {
         } else {
             let position = match descriptor.application_plan.result_cardinality {
                 ResultCardinality::PreserveOperand(position)
-                | ResultCardinality::OperandPlusOne(position) => position,
+                | ResultCardinality::OperandPlusOne(position)
+                | ResultCardinality::SubsetOfOperand(position) => position,
                 _ => {
                     return Err(LowerError::Source(Error::new(
                         ErrorKind::TypeError,
@@ -1527,6 +1600,12 @@ impl Lowerer {
                 }
             };
             let result_cardinality = match operand_cardinality(position) {
+                Some(Cardinality::StaticVector(_) | Cardinality::DynamicVector)
+                    if descriptor.application_plan.result_cardinality
+                        == ResultCardinality::SubsetOfOperand(position) =>
+                {
+                    Some(Cardinality::DynamicVector)
+                }
                 Some(Cardinality::StaticVector(length))
                     if descriptor.application_plan.result_cardinality
                         == ResultCardinality::OperandPlusOne(position) =>
@@ -1998,6 +2077,8 @@ fn select_descriptor_with_argument_offset(
 pub(crate) struct OperationReferenceConstraint<'a> {
     pub parameter_types: &'a [Option<ScalarType>],
     pub result_type: Option<ScalarType>,
+    pub exact_parameters: bool,
+    pub require_total_unary: bool,
 }
 
 #[allow(dead_code)]
@@ -2033,6 +2114,11 @@ pub(crate) fn resolve_operation_reference(
             continue;
         }
         has_elementwise = true;
+        if constraint.require_total_unary
+            && !crate::semantic_registry::is_total_unary_predicate(descriptor)
+        {
+            continue;
+        }
         if constraint
             .result_type
             .is_some_and(|result| descriptor.result != result)
@@ -2052,8 +2138,14 @@ pub(crate) fn resolve_operation_reference(
             };
             match conversion(actual, accepted.element_type) {
                 Some(RegistryConversion::Identity) => {}
-                Some(RegistryConversion::PromoteIntToDouble) => cost += 1,
+                Some(RegistryConversion::PromoteIntToDouble) if !constraint.exact_parameters => {
+                    cost += 1
+                }
                 None => {
+                    compatible = false;
+                    break;
+                }
+                Some(RegistryConversion::PromoteIntToDouble) => {
                     compatible = false;
                     break;
                 }
@@ -2385,6 +2477,8 @@ mod tests {
             OperationReferenceConstraint {
                 parameter_types: &[Some(ScalarType::Int), Some(ScalarType::Int)],
                 result_type: Some(ScalarType::Int),
+                exact_parameters: false,
+                require_total_unary: false,
             },
             &mut diagnostics,
         )
@@ -2406,6 +2500,8 @@ mod tests {
             OperationReferenceConstraint {
                 parameter_types: &[Some(ScalarType::Int), Some(ScalarType::Double)],
                 result_type: Some(ScalarType::Double),
+                exact_parameters: false,
+                require_total_unary: false,
             },
             &mut diagnostics,
         )
@@ -2452,6 +2548,8 @@ mod tests {
                 OperationReferenceConstraint {
                     parameter_types: parameters,
                     result_type: result,
+                    exact_parameters: false,
+                    require_total_unary: false,
                 },
                 &mut diagnostics,
             )
@@ -2468,6 +2566,8 @@ mod tests {
             OperationReferenceConstraint {
                 parameter_types: &[],
                 result_type: None,
+                exact_parameters: false,
+                require_total_unary: false,
             },
             &mut diagnostics,
         )
@@ -2498,6 +2598,8 @@ mod tests {
             OperationReferenceConstraint {
                 parameter_types: &[None, None],
                 result_type: None,
+                exact_parameters: false,
+                require_total_unary: false,
             },
             &mut DiagnosticReservations { refuse_next: true },
         );
@@ -2924,6 +3026,126 @@ mod tests {
                 Some(Cardinality::StaticVector(0)),
             ]
         );
+    }
+
+    #[test]
+    fn filter_records_predicate_identity_dynamic_subset_plan_and_owned_input() {
+        let program = must_compile(
+            "parameters[n Int]\n\
+             filter[@not Bool()]\n\
+             filter[@odd (1 2 3)]\n\
+             filter[@odd iota[n]]\n\
+             filter[@is_positive Double()]\n",
+        );
+        let raw = program.as_raw();
+        assert_eq!(
+            raw.features,
+            vec![
+                Feature::StableSemanticIds.numeric(),
+                Feature::ApplicationPlans.numeric(),
+                Feature::OperationReferences.numeric(),
+            ]
+        );
+        assert_eq!(
+            raw.operation_references
+                .iter()
+                .map(|reference| (
+                    reference.primitive_id,
+                    reference.signature_id,
+                    reference.implementation_id,
+                ))
+                .collect::<Vec<_>>(),
+            [(10, 21, 21), (13, 24, 24), (13, 24, 24), (15, 27, 27)]
+        );
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 39,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 4);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3, apply.4))
+                .collect::<Vec<_>>(),
+            [
+                (64, 64, 11, Some(crate::OperationReferenceIndex(0))),
+                (65, 65, 11, Some(crate::OperationReferenceIndex(1))),
+                (65, 65, 11, Some(crate::OperationReferenceIndex(2))),
+                (66, 66, 11, Some(crate::OperationReferenceIndex(3))),
+            ]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.0.cardinality == Some(Cardinality::DynamicVector)
+                && apply.5 == LiftMode::ContainerVector
+                && apply.6.static_anchor.is_none()
+                && apply.6.dynamic_checks.count == 0
+        }));
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    let edge = &raw.edges[apply.0.edges.start as usize];
+                    (edge.cardinality, edge.conversion, edge.ownership)
+                })
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some(Cardinality::StaticVector(0)),
+                    crate::Conversion::Identity,
+                    OwnershipMode::OwnedInput,
+                ),
+                (
+                    Some(Cardinality::StaticVector(3)),
+                    crate::Conversion::Identity,
+                    OwnershipMode::OwnedInput,
+                ),
+                (
+                    Some(Cardinality::DynamicVector),
+                    crate::Conversion::Identity,
+                    OwnershipMode::OwnedInput,
+                ),
+                (
+                    Some(Cardinality::StaticVector(0)),
+                    crate::Conversion::Identity,
+                    OwnershipMode::OwnedInput,
+                ),
+            ]
+        );
+        for apply in applies {
+            let input = raw.edges[apply.0.edges.start as usize].producer;
+            assert!(raw.ownership.iter().any(|ownership| {
+                ownership.owner == input
+                    && ownership.release_after
+                        == ReleaseAfter::Node(NodeIndex(
+                            raw.nodes
+                                .iter()
+                                .position(|candidate| std::ptr::eq(candidate, apply.0))
+                                .and_then(|index| u32::try_from(index).ok())
+                                .unwrap_or(u32::MAX),
+                        ))
+            }));
+        }
     }
 
     #[test]
@@ -3505,10 +3727,11 @@ mod tests {
              none_of[(true false)]\n\
              foldl[@sub 10 (1 2)]\n\
              scanl[@sub 10 (1 2)]\n\
+             filter[@odd (1 2)]\n\
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 2_540_857_452_231_284_986);
+        assert_eq!(debug_digest(&matrix), 12_977_681_809_875_020_142);
 
         let depth = 256;
         let mut deep = String::new();

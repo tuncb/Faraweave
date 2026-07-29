@@ -32,14 +32,20 @@ Result = Elementwise
        | DynamicVector
        | PreserveOperand(one-based position)
        | OperandPlusOne(one-based position)
+       | SubsetOfOperand(one-based position)
 
 Work   = Constant(n)
        | ResultCardinality
        | OperandCardinality(one-based position)
+
+Admission = Combined
+          | WorkThenResult
 ```
 
-`PreserveOperand` and `OperandPlusOne` may reference only a `WholeVector`
-operand. Checked overflow of `OperandPlusOne`, result byte sizing, prospective
+`PreserveOperand`, `OperandPlusOne`, and `SubsetOfOperand` may reference only a
+`WholeVector` operand. `SubsetOfOperand` always produces dynamic vector
+metadata and requires `WorkThenResult`; every other result rule uses
+`Combined`. Checked overflow of `OperandPlusOne`, result byte sizing, prospective
 live bytes, work, allocation ordinal, admission commit, physical allocation,
 kernel execution, and cleanup retain the failure order in `FWIR-SEM-014`.
 Work is admitted in full before implementation execution, so short-circuiting
@@ -73,8 +79,8 @@ physical format minor 1. With that feature, mandatory section
 `node:u32`, `application_plan_id:u16`, and `reserved:u16`. Every SelectedApply
 has exactly one nonzero plan record and the reserved field is zero.
 
-`NODE.a7` remains zero except for a `foldl` or `scanl` SelectedApply under
-feature 6, where it is the one-based index of the selected reducer's `OPRF`
+`NODE.a7` remains zero except for a `foldl`, `scanl`, or `filter` SelectedApply under
+feature 6, where it is the one-based index of the selected operation's `OPRF`
 record.
 Semantic/format 1.0 artifacts omit
 section 17, retain their exact canonical bytes, and keep their previous
@@ -245,6 +251,28 @@ The semantic initialized prefix is the seed plus completed accumulators;
 homogeneous scalar-vector slots own no child resources, so prefix cleanup is
 the single output-buffer release rather than per-element release events.
 
+## Stable unary-predicate vector filter (`FWIR-PLAN-013`)
+
+Primitive ID `39=filter` has Bool, Int, and Double whole-vector signatures with
+matching signature/implementation IDs 64, 65, and 66. It accepts one
+lowering-selected exact, total, pure `T -> Bool` `OPRF` predicate and one whole
+vector of `T`; application-plan ID 11 returns `SubsetOfOperand(1)`, admits
+`OperandCardinality(1)` work, and selects `WorkThenResult`.
+
+The interpreter admits all `n` work units before inspecting the input, invokes
+the predicate in increasing index order to discover `k`, then admits exactly
+`k` output elements with zero additional work while the input remains live.
+It allocates no Boolean mask, preserves order and element bits, and returns
+dynamic vector metadata even for a static or typed-empty input.
+
+Work stays committed if exact output admission or physical allocation fails.
+Zero-length work and output admissions emit their ordinary observer events
+without allocation ordinals; positive output refusal releases the input in
+reverse ownership order, and a natural physical allocation failure refunds
+only the output live-byte charge. Predicate selection, result type, subset
+plan, split sequence, ownership, and release points are reconstructed from the
+selected identities before interpreter execution.
+
 ## Evidence (`FWIR-PLAN-004`)
 
 Registry unit tests cover stable plan lookup and changed operand/plan
@@ -296,3 +324,9 @@ Issue #47 maps `FWIR-PLAN-012` to
 `scanl_reports_the_leftmost_reducer_fault_and_initialized_prefix`,
 `scanl_admits_n_plus_one_output_before_population_with_input_live`,
 `scanl_fault_releases_output_before_input_and_retains_full_work`.
+Issue #86 maps `FWIR-PLAN-013` to
+`filter_records_predicate_identity_dynamic_subset_plan_and_owned_input`,
+`filter_roundtrips_predicate_links_dynamic_subset_metadata_and_direct_dispatch`,
+`filter_is_stable_typed_and_exact_for_every_allowed_predicate`,
+`filter_splits_work_and_exact_result_admission_with_input_live`, and
+`filter_refusals_preserve_phase_order_committed_work_and_cleanup`.

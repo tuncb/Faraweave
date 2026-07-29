@@ -61,7 +61,8 @@ def main() -> None:
             "add[count 1]\n"
             "mul[scale 2.0]\n"
             "not[enabled]\n"
-            "scanl[@add 0 (1 2 3)]\n",
+            "scanl[@add 0 (1 2 3)]\n"
+            "filter[@odd iota[count]]\n",
             encoding="utf-8",
             newline="\n",
         )
@@ -69,7 +70,7 @@ def main() -> None:
         source_result = run("run", str(success_source), "--", *arguments)
         require_success(source_result, "source interpreter journey")
         require(
-            source_result.stdout == b"5\n5.0\nfalse\n(0 1 3 6)\n",
+            source_result.stdout == b"5\n5.0\nfalse\n(0 1 3 6)\n(1 3)\n",
             f"source interpreter output mismatch: {source_result.stdout!r}",
         )
 

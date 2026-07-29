@@ -22,6 +22,7 @@ structural tuples. The public primitives are:
 | Structural constructor | `iota` |
 | Container query | `length` |
 | Container transform | `sort` |
+| Stable subset transform | `filter` |
 | Numeric reduction | `sum` |
 | Boolean reduction | `all_of` |
 | Boolean reduction | `any_of` |
@@ -94,6 +95,15 @@ every accumulator, starting with the converted initializer. Its result length
 is the checked input length plus one, so an empty vector returns a one-element
 vector; output bytes and complete input-length work are admitted together
 before the seed is written or any reducer step runs.
+
+`filter[@odd vector]` accepts a closed registered exact `T -> Bool` predicate
+reference and a whole homogeneous Bool, Int, or Double vector of `T`. The
+initial total, pure predicate set is `not` for Bool, `odd`, `even`,
+`is_positive`, and `is_negative` for Int, and `is_positive` and `is_negative`
+for Double; no whole-vector conversion, closure, or runtime name lookup is
+performed. The result is always dynamically sized, newly owned, stable, and
+bit-preserving; all input-length work is admitted before inspection, followed
+by a separate exact output admission after the kept length is known.
 
 `sqrt`, `exp`, natural logarithm `log`, base-10 logarithm `log10`, `sin`,
 `cos`, `tan`, `floor`, `ceil`, and `trunc` accept Double scalars and vectors, with the existing
@@ -286,9 +296,10 @@ bracket calls, checked Int64 arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit
 currying, functions, effects, reductions other than `sum`, `all_of`, `any_of`,
-`none_of`, explicit-initializer `foldl`, and seed-inclusive `scanl`,
+`none_of`, explicit-initializer `foldl`, seed-inclusive `scanl`, and stable
+unary-predicate `filter`,
 multidimensional arrays, or container-wide operations other than `length`,
-`sort`, `sum`, `all_of`, `any_of`, `none_of`, `foldl`, and `scanl`.
+`sort`, `sum`, `all_of`, `any_of`, `none_of`, `foldl`, `scanl`, and `filter`.
 
 Rust enums and vectors replace C++ tagged/plain records at the public boundary.
 Ordinary syntax remains visibly separated by parse, resolution, analysis, and
