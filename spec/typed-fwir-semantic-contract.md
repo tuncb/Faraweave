@@ -303,6 +303,14 @@ the borrowed input; an unrepresentable cardinality is structured
 `SizeOverflow`. Empty and dynamically sized vectors use the same plan, while
 scalar and tuple operands are rejected during static signature selection.
 
+`sort` receives one whole Bool, Int, or Double vector and returns a newly owned
+vector with the same element type and cardinality. Its output bytes and exactly
+one work unit per input element are admitted together while the immutable
+input remains live; the copied output then sorts in place without another
+semantic allocation. Bool and Int ascend ordinarily, while Double uses the
+complete `f64::total_cmp` bit order, including `-0.0 < 0.0` and deterministic
+NaN placement.
+
 These exact units, combined result requests, and commit points are part of
 `FWIR-SEM-008`, not backend cost estimates. Together with `FWIR-SEM-005` and
 `FWIR-SEM-014`, they prevent an interpreter, generated runtime, or other
@@ -707,7 +715,7 @@ maps every wire field and invariant in
 | `FWIR-SEM-005` | `rust:tests/parity_contracts.rs::canonical_binary64_format_boundaries`<br>`rust:tests/resource_contracts.rs::typed_api_rejects_noncanonical_nan_without_normalizing_it`<br>`rust:tests/resource_contracts.rs::resource_observer_reports_commit_refusal_and_cleanup_order` |
 | `FWIR-SEM-006` | `rust:src/parser.rs::parses_literals_calls_tuples_parameters_and_fanout`<br>`rust:tests/parity_contracts.rs::deep_unary_programs_use_iterative_parse_analysis_and_evaluation` |
 | `FWIR-SEM-007` | `rust:src/semantic_registry.rs::production_registry_is_complete_and_numeric_lookups_are_checked`<br>`rust:src/c_emitter.rs::every_selected_id_emits_direct_dispatch_without_type_redispatch` |
-| `FWIR-SEM-008` | `rust:tests/parity_contracts.rs::checked_arithmetic_has_no_partial_result`<br>`rust:tests/parity_contracts.rs::div_integer_faults_and_strict_binary64_are_exact`<br>`rust:tests/parity_contracts.rs::length_accepts_all_vector_types_empty_and_dynamic_cardinalities`<br>`rust:tests/resource_contracts.rs::vector_tuple_and_work_limits_cover_zero_exact_and_one_past`<br>`rust:tests/resource_contracts.rs::div_admission_precedes_domain_and_failure_cleanup_is_exact`<br>`rust:tests/resource_contracts.rs::length_charges_constant_work_borrows_input_and_has_no_result_allocation`<br>`rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_rust_reference_vectors_meet_policy`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_special_values_and_rounding_are_exact`<br>`command:strict-c11-journey` |
+| `FWIR-SEM-008` | `rust:tests/parity_contracts.rs::checked_arithmetic_has_no_partial_result`<br>`rust:tests/parity_contracts.rs::div_integer_faults_and_strict_binary64_are_exact`<br>`rust:tests/parity_contracts.rs::length_accepts_all_vector_types_empty_and_dynamic_cardinalities`<br>`rust:tests/parity_contracts.rs::sort_covers_exhaustive_small_bools_integer_edges_and_total_double_order`<br>`rust:tests/resource_contracts.rs::vector_tuple_and_work_limits_cover_zero_exact_and_one_past`<br>`rust:tests/resource_contracts.rs::div_admission_precedes_domain_and_failure_cleanup_is_exact`<br>`rust:tests/resource_contracts.rs::length_charges_constant_work_borrows_input_and_has_no_result_allocation`<br>`rust:tests/resource_contracts.rs::sort_admits_owned_output_with_input_live_and_cleans_up_refused_output`<br>`rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_rust_reference_vectors_meet_policy`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_special_values_and_rounding_are_exact`<br>`command:strict-c11-journey` |
 | `FWIR-SEM-009` | `rust:tests/parity_contracts.rs::tup_structural_format_spread_and_direct_preservation`<br>`rust:src/evaluator.rs::lifting_and_tuples_are_canonical` |
 | `FWIR-SEM-010` | `rust:tests/resource_contracts.rs::tuple_allocation_ordinals_exclude_empty_tables_and_cleanup_failures`<br>`rust:tests/resource_contracts.rs::live_limit_observes_children_before_outer_tuple_admission`<br>`rust:tests/parity_contracts.rs::deep_structural_values_and_types_format_and_drop_iteratively` |
 | `FWIR-SEM-011` | `rust:tests/parity_contracts.rs::fan_stable_id_matrix`<br>`rust:src/lowering.rs::fan_out_prefix_placeholder_borrows_prepare_and_preserves_elements`<br>`rust:src/c_emitter.rs::public_generated_c_matches_direct_ir_for_success_and_failure_corpus` |

@@ -154,6 +154,37 @@ pub(crate) fn apply_implementation(
     }
 
     if matches!(
+        descriptor.kernel,
+        ScalarKernel::SortBoolVector | ScalarKernel::SortIntVector | ScalarKernel::SortDoubleVector
+    ) {
+        let [argument] = arguments else {
+            return Err(type_runtime_error(producer, location));
+        };
+        if lift != crate::LiftMode::ContainerVector
+            || result_type != descriptor.result
+            || argument.conversion != crate::Conversion::Identity
+        {
+            return Err(type_runtime_error(producer, location));
+        }
+        let work = admitted_work(
+            application_plan,
+            argument.value.len(),
+            arguments,
+            producer,
+            location,
+        )?;
+        return apply_vector_sort(
+            descriptor.kernel,
+            argument.value,
+            work,
+            location,
+            producer,
+            resources,
+        )
+        .map(|value| (value, true));
+    }
+
+    if matches!(
         lift,
         crate::LiftMode::ContainerScalar | crate::LiftMode::ContainerVector
     ) {
@@ -449,6 +480,9 @@ fn invoke_kernel(
             | ScalarKernel::LengthBoolVector
             | ScalarKernel::LengthIntVector
             | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::SortBoolVector
+            | ScalarKernel::SortIntVector
+            | ScalarKernel::SortDoubleVector
             | ScalarKernel::IotaInt,
             _,
         ) => None,
@@ -477,6 +511,65 @@ fn apply_vector_length(
     i64::try_from(length)
         .map(Value::Int)
         .map_err(|_| resources.size_overflow(Some(length), location, producer))
+}
+
+fn apply_vector_sort(
+    kernel: ScalarKernel,
+    input: &Value,
+    work: usize,
+    location: SourceLocation,
+    producer: &str,
+    resources: &mut ResourceContext,
+) -> Result<Value, Error> {
+    let (element_type, length) = match (kernel, input) {
+        (ScalarKernel::SortBoolVector, Value::BoolVector(values)) => {
+            (ScalarType::Bool, values.len())
+        }
+        (ScalarKernel::SortIntVector, Value::IntVector(values)) => (ScalarType::Int, values.len()),
+        (ScalarKernel::SortDoubleVector, Value::DoubleVector(values)) => {
+            (ScalarType::Double, values.len())
+        }
+        _ => return Err(type_runtime_error(producer, location)),
+    };
+    let admitted =
+        resources.admit_vector_with_work(element_type, length, work, location, producer)?;
+    let result = match (kernel, input) {
+        (ScalarKernel::SortBoolVector, Value::BoolVector(input)) => {
+            let mut output = Vec::new();
+            if output.try_reserve_exact(length).is_err() {
+                resources.refund(admitted);
+                return Err(allocation_error(producer, location));
+            }
+            output.extend_from_slice(input);
+            output.sort_unstable();
+            Value::BoolVector(output)
+        }
+        (ScalarKernel::SortIntVector, Value::IntVector(input)) => {
+            let mut output = Vec::new();
+            if output.try_reserve_exact(length).is_err() {
+                resources.refund(admitted);
+                return Err(allocation_error(producer, location));
+            }
+            output.extend_from_slice(input);
+            output.sort_unstable();
+            Value::IntVector(output)
+        }
+        (ScalarKernel::SortDoubleVector, Value::DoubleVector(input)) => {
+            let mut output = Vec::new();
+            if output.try_reserve_exact(length).is_err() {
+                resources.refund(admitted);
+                return Err(allocation_error(producer, location));
+            }
+            output.extend_from_slice(input);
+            output.sort_unstable_by(f64::total_cmp);
+            Value::DoubleVector(output)
+        }
+        _ => {
+            resources.refund(admitted);
+            return Err(type_runtime_error(producer, location));
+        }
+    };
+    Ok(result)
 }
 
 fn integer_domain_error(

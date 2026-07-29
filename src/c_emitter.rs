@@ -220,6 +220,27 @@ impl<'a> IrCGenerator<'a> {
                 .map_err(|_| emission_error())?;
                 continue;
             }
+            if matches!(
+                descriptor.kernel,
+                ScalarKernel::SortBoolVector
+                    | ScalarKernel::SortIntVector
+                    | ScalarKernel::SortDoubleVector
+            ) {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::PreserveOperand(1)
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(1)
+                {
+                    return Err(emission_error());
+                }
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_sort({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
             self.emit_selected_kernel(implementation, descriptor.kernel)?;
             writeln!(
                 self.definitions,
@@ -320,6 +341,9 @@ impl<'a> IrCGenerator<'a> {
             ScalarKernel::LengthBoolVector
             | ScalarKernel::LengthIntVector
             | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::SortBoolVector
+            | ScalarKernel::SortIntVector
+            | ScalarKernel::SortDoubleVector
             | ScalarKernel::IotaInt => return Err(emission_error()),
         };
         writeln!(
@@ -622,7 +646,7 @@ impl<'a> IrCGenerator<'a> {
                 LiftMode::Vector => 1,
                 LiftMode::DynamicVector => 2,
                 LiftMode::ContainerScalar => 3,
-                LiftMode::ContainerVector => return Err(emission_error()),
+                LiftMode::ContainerVector => 4,
             }
         )
         .map_err(|_| emission_error())?;
@@ -1192,6 +1216,62 @@ static int fw_apply_selected_length(const char *name,const FWV *args,FWV *out,
     return fw_fail_resource(name,"size_overflow",line,column);
   fw_set_int(out,(int64_t)args[0].len);return 1;
 }
+static int fw_sort_less(const FWV *vector,size_t left,size_t right) {
+  if(vector->type==0){
+    const unsigned char *values=(const unsigned char *)vector->data;
+    return values[left]<values[right];
+  }
+  if(vector->type==1){
+    const int64_t *values=(const int64_t *)vector->data;
+    return values[left]<values[right];
+  }
+  {
+    const double *values=(const double *)vector->data;
+    return fw_double_order_key(values[left])<fw_double_order_key(values[right]);
+  }
+}
+static void fw_sort_swap(FWV *vector,size_t left,size_t right) {
+  if(vector->type==0){
+    unsigned char *values=(unsigned char *)vector->data;
+    unsigned char temporary=values[left];values[left]=values[right];values[right]=temporary;
+  }else if(vector->type==1){
+    int64_t *values=(int64_t *)vector->data;
+    int64_t temporary=values[left];values[left]=values[right];values[right]=temporary;
+  }else{
+    double *values=(double *)vector->data;
+    uint64_t temporary,replacement;
+    (void)memcpy(&temporary,&values[left],sizeof(temporary));
+    (void)memcpy(&replacement,&values[right],sizeof(replacement));
+    (void)memcpy(&values[left],&replacement,sizeof(replacement));
+    (void)memcpy(&values[right],&temporary,sizeof(temporary));
+  }
+}
+static void fw_sort_sift_down(FWV *vector,size_t root,size_t end) {
+  while(root<=end/2U){
+    size_t child=root*2U+1U;
+    if(child>end)return;
+    if(child<end&&fw_sort_less(vector,child,child+1U))++child;
+    if(!fw_sort_less(vector,root,child))return;
+    fw_sort_swap(vector,root,child);root=child;
+  }
+}
+static void fw_sort_in_place(FWV *vector) {
+  size_t start,end;
+  if(vector->len<2U)return;
+  for(start=vector->len/2U;start>0U;){
+    --start;fw_sort_sift_down(vector,start,vector->len-1U);
+  }
+  for(end=vector->len-1U;end>0U;--end){
+    fw_sort_swap(vector,0U,end);fw_sort_sift_down(vector,0U,end-1U);
+  }
+}
+static int fw_apply_selected_sort(const char *name,const FWV *args,FWV *out,
+                                  size_t line,size_t column) {
+  size_t length=args[0].len;
+  if(!fw_make_vector(out,args[0].type,length,length,name,line,column))return 0;
+  if(length!=0U)(void)memcpy(out->data,args[0].data,out->charge);
+  fw_sort_in_place(out);return 1;
+}
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
 static int fw_append(FWBuffer *buffer,const char *text) {
   size_t n=strlen(text),needed; char *grown;
@@ -1361,6 +1441,7 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   (void)fw_apply_selected;
   (void)fw_apply_selected_iota;
   (void)fw_apply_selected_length;
+  (void)fw_apply_selected_sort;
   (void)fw_selected_integer_overflow;
   (void)fw_selected_division_by_zero;
   (void)fw_as_double;
@@ -1589,7 +1670,8 @@ mod ir_tests {
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
-             length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n",
+             length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
+             sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n",
         );
         for implementation in (1..=36).filter(|implementation| *implementation != 34) {
             assert!(
@@ -1611,6 +1693,11 @@ mod ir_tests {
             source.matches("return fw_apply_selected_length(").count(),
             3
         );
+        for implementation in 40..=42 {
+            assert!(source.contains(&format!("static int fw_impl_{implementation}(")));
+            assert!(source.contains(&format!("fw_impl_{implementation}(const FWV *args")));
+        }
+        assert_eq!(source.matches("return fw_apply_selected_sort(").count(), 3);
         assert!(!source.contains("fw_apply_scalar"));
         assert!(!source.contains("primitive=="));
     }
@@ -1623,6 +1710,18 @@ mod ir_tests {
         let overflow = source.find("(uint64_t)args[0].len>UINT64_C(9223372036854775807)");
         let conversion = source.find("fw_set_int(out,(int64_t)args[0].len)");
         assert!(matches!((overflow, conversion), (Some(check), Some(cast)) if check < cast));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn sort_uses_owned_container_dispatch_total_double_order_and_linear_work() {
+        let source = emit("sort[(true false)]\nsort[(3 1 2)]\nsort[(nan 0.0 -0.0 -inf inf)]\n");
+        assert!(source.contains("return fw_apply_selected_sort(\"sort\",args,out,line,column)"));
+        assert!(source.contains("fw_make_vector(out,args[0].type,length,length,name,line,column)"));
+        assert!(source.contains("fw_double_order_key(values[left])"));
+        assert!(source.contains("memcpy(out->data,args[0].data,out->charge)"));
+        assert!(source.contains("fw_sort_sift_down"));
+        assert!(!source.contains("qsort("));
         assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
     }
 
@@ -1849,6 +1948,10 @@ mod ir_tests {
             ("div[-9223372036854775808 -1]\n", &[]),
             ("length[(true false true)]\n", &[]),
             ("parameters[n Int]\nlength iota n\n", &["3"]),
+            ("sort[(true false true false)]\n", &[]),
+            ("sort[(3 -1 3 0)]\n", &[]),
+            ("sort[(nan inf -0.0 0.0 -inf)]\n", &[]),
+            ("parameters[n Int]\nsort iota n\n", &["3"]),
             ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
         ];
         for (source, arguments) in corpus {
@@ -1879,6 +1982,93 @@ mod ir_tests {
             &["3"],
             length_work_configuration,
         );
+
+        let sort_live_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_live_evaluation_bytes: Some(47),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct("sort[(3 1 2)]\n", &[], sort_live_configuration);
+
+        let sort_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "sort[(3 1 2)]\n",
+            &[],
+            sort_allocation_configuration,
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn randomized_sort_corpus_matches_direct_ir_by_exact_output_bits() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let double_values = [
+            "nan",
+            "inf",
+            "-inf",
+            "-0.0",
+            "0.0",
+            "-3.5",
+            "2.25",
+            "5e-324",
+            "-1.7976931348623157e308",
+        ];
+        let mut source = String::new();
+        for case in 0..72 {
+            let length = (next() % 18) as usize;
+            match case % 3 {
+                0 if length == 0 => source.push_str("sort[Bool()]\n"),
+                0 => {
+                    source.push_str("sort[(");
+                    for index in 0..length {
+                        if index != 0 {
+                            source.push(' ');
+                        }
+                        source.push_str(if next() & 1 == 0 { "false" } else { "true" });
+                    }
+                    source.push_str(")]\n");
+                }
+                1 if length == 0 => source.push_str("sort[Int()]\n"),
+                1 => {
+                    source.push_str("sort[(");
+                    for index in 0..length {
+                        if index != 0 {
+                            source.push(' ');
+                        }
+                        let value = i64::try_from(next() % 401).unwrap_or(0) - 200;
+                        write!(source, "{value}").expect("write randomized Int source");
+                    }
+                    source.push_str(")]\n");
+                }
+                _ if length == 0 => source.push_str("sort[Double()]\n"),
+                _ => {
+                    source.push_str("sort[(");
+                    for index in 0..length {
+                        if index != 0 {
+                            source.push(' ');
+                        }
+                        let value = (next() as usize) % double_values.len();
+                        source.push_str(double_values[value]);
+                    }
+                    source.push_str(")]\n");
+                }
+            }
+        }
+        assert_public_generated_matches_direct(&source, &[], EvaluationConfiguration::default());
     }
 
     #[cfg(not(windows))]
@@ -1971,7 +2161,8 @@ mod ir_tests {
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
-             length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n";
+             length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
+             sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n";
         let configuration = EvaluationConfiguration::default();
         assert_public_generated_matches_direct(source, &[], configuration);
     }

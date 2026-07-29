@@ -270,6 +270,129 @@ fn length_rejects_scalar_and_tuple_inputs_with_exact_static_diagnostics() {
 }
 
 #[test]
+fn sort_covers_exhaustive_small_bools_integer_edges_and_total_double_order() {
+    for length in 0..=6 {
+        for mask in 0..(1_usize << length) {
+            let source = if length == 0 {
+                "sort[Bool()]".to_owned()
+            } else {
+                let values = (0..length)
+                    .map(|index| {
+                        if mask & (1_usize << index) == 0 {
+                            "false"
+                        } else {
+                            "true"
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("sort[({values})]")
+            };
+            let mut expected = vec![false; length - mask.count_ones() as usize];
+            expected.extend(std::iter::repeat_n(true, mask.count_ones() as usize));
+            assert_eq!(
+                evaluate_expression(&source).expect(&source).value,
+                Value::BoolVector(expected),
+                "{source}"
+            );
+        }
+    }
+
+    for (source, expected) in [
+        (
+            "sort[(9223372036854775807 0 -9223372036854775808 7 -3)]",
+            vec![i64::MIN, -3, 0, 7, i64::MAX],
+        ),
+        ("sort[(3 3 2 1 1)]", vec![1, 1, 2, 3, 3]),
+        ("sort[(1 2 3 4)]", vec![1, 2, 3, 4]),
+        ("sort[(4 3 2 1)]", vec![1, 2, 3, 4]),
+    ] {
+        assert_eq!(
+            evaluate_expression(source).expect(source).value,
+            Value::IntVector(expected),
+            "{source}"
+        );
+    }
+
+    let doubles =
+        evaluate_expression("sort[(nan inf -0.0 1.0 -inf 0.0 -1.0 nan)]").expect("double sort");
+    let Value::DoubleVector(doubles) = doubles.value else {
+        panic!("double sort result changed type");
+    };
+    assert_eq!(
+        doubles
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [
+            f64::NEG_INFINITY.to_bits(),
+            (-1.0_f64).to_bits(),
+            (-0.0_f64).to_bits(),
+            0.0_f64.to_bits(),
+            1.0_f64.to_bits(),
+            f64::INFINITY.to_bits(),
+            0x7ff8_0000_0000_0000,
+            0x7ff8_0000_0000_0000,
+        ]
+    );
+}
+
+#[test]
+fn sort_accepts_empty_singleton_and_dynamic_vectors_and_rejects_nonvectors() {
+    for (source, expected) in [
+        ("sort[Bool()]", "()"),
+        ("sort[Int()]", "()"),
+        ("sort[Double()]", "()"),
+        ("sort[(true)]", "(true)"),
+        ("sort[(-7)]", "(-7)"),
+        ("sort[(-0.0)]", "(-0.0)"),
+        ("sort iota 5", "(1 2 3 4 5)"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    let dynamic = faraweave::evaluate_source_with_arguments(
+        "parameters[n Int]\nsort iota n\n",
+        &[Value::Int(6)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("dynamic parameterized sort");
+    assert_eq!(dynamic.values, [Value::IntVector(vec![1, 2, 3, 4, 5, 6])]);
+
+    for (source, actual_type) in [
+        ("sort[1]", Type::Scalar(ScalarType::Int)),
+        (
+            "sort[[1 2]]",
+            Type::Tuple(vec![
+                Type::Scalar(ScalarType::Int),
+                Type::Scalar(ScalarType::Int),
+            ]),
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("sort"), "{source}");
+        assert_eq!(error.argument_position, Some(1), "{source}");
+        assert_eq!(
+            error.location,
+            SourceLocation {
+                offset: 6,
+                line: 1,
+                column: 6,
+            },
+            "{source}"
+        );
+        assert_eq!(
+            error.message,
+            "sort arguments do not match an accepted signature; first unsupported argument is 1",
+            "{source}"
+        );
+        assert_eq!(error.actual_types, [actual_type], "{source}");
+        assert!(error.expected_types.is_empty(), "{source}");
+    }
+}
+
+#[test]
 fn issue54_predicates_ordering_and_nan_contracts() {
     assert_eq!(formatted("odd[-9223372036854775807]"), "true");
     assert_eq!(formatted("even[-9223372036854775808]"), "true");

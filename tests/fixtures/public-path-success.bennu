@@ -151,3 +151,13 @@ length[Bool()]
 length[Int()]
 length[Double()]
 length iota 4
+sort[(true false true false)]
+sort[(9223372036854775807 0 -9223372036854775808 7 -3)]
+sort[(nan inf -0.0 1.0 -inf 0.0 -1.0 nan)]
+sort[Bool()]
+sort[Int()]
+sort[Double()]
+sort[(true)]
+sort[(-7)]
+sort[(-0.0)]
+sort iota 4

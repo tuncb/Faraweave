@@ -268,6 +268,98 @@ fn length_container_plan_roundtrips_and_dispatches_by_verified_identity() {
 }
 
 #[test]
+fn sort_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  sort[(true false true)]\n\
+                  sort[(3 1 2)]\n\
+                  sort[(inf -0.0 0.0 -inf)]\n\
+                  sort iota n\n";
+    let program =
+        compile_source_to_verified_program(source, "sort.faraweave").expect("compile sort");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 22,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (40, 40, 4, LiftMode::ContainerVector),
+            (41, 41, 4, LiftMode::ContainerVector),
+            (42, 42, 4, LiftMode::ContainerVector),
+            (41, 41, 4, LiftMode::ContainerVector),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode sort");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified sort");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode sort"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct sort");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded sort");
+    assert_eq!(loaded, direct);
+    assert_eq!(
+        direct.formatted,
+        [
+            "(false true true)",
+            "(1 2 3)",
+            "(-inf -0.0 0.0 inf)",
+            "(1 2 3 4)",
+        ]
+    );
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    for implementation in 40..=42 {
+        assert!(
+            emitted
+                .source
+                .contains(&format!("static int fw_impl_{implementation}("))
+        );
+    }
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_sort(")
+            .count(),
+        3
+    );
+    assert!(emitted.source.contains("fw_double_order_key(values[left])"));
+    assert!(!emitted.source.contains("qsort("));
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
 fn inspection_is_deterministic_and_carries_exact_binary64_bits() {
     let program = compile_source_to_verified_program("-0.0\nnan\n", "bits.faraweave")
         .expect("compile exact doubles");

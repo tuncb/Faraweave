@@ -20,6 +20,7 @@ structural tuples. The public primitives are:
 | Numeric ordering | `less_than`, `greater_than` |
 | Structural constructor | `iota` |
 | Container query | `length` |
+| Container transform | `sort` |
 
 Calls use adjacent brackets (`sub[10 2.5]`) or right-associative prefix syntax
 (`inc iota 3`). Vectors use parentheses: `(1 2 3)`, `(false true)`,
@@ -47,6 +48,11 @@ Doubles.
 empty or dynamically sized vector, and returns its element count as an Int. It
 borrows the existing vector without copying it and charges one semantic work
 unit independently of the vector length.
+
+`sort` accepts those same vector types and returns a newly owned ascending
+vector without mutating its input. Bool and Int use their ordinary order;
+Double uses a total bit-defined order with `-0.0` before `0.0` and canonical
+NaN after positive infinity, while semantic work is exactly the input length.
 
 The accepted [architecture](doc/architecture.md) and
 [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md) define
@@ -233,7 +239,7 @@ bracket calls, checked Int64 arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit
 currying, functions, effects, reductions, multidimensional arrays, or
-container-wide operations other than `length`.
+container-wide operations other than `length` and `sort`.
 
 Rust enums and vectors replace C++ tagged/plain records at the public boundary.
 Ordinary syntax remains visibly separated by parse, resolution, analysis, and

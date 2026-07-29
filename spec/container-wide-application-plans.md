@@ -101,6 +101,32 @@ unrepresentable cardinality returns structured `SizeOverflow`, and the input is
 released according to its existing ownership edge after success or failure.
 Tuple and scalar operands fail during static signature selection.
 
+## Deterministic vector sort (`FWIR-PLAN-006`)
+
+Primitive ID `22=sort` has whole-vector Bool, Int, and Double signatures and
+matching implementation IDs 40, 41, and 42. All three select application-plan
+ID 4: `PreserveOperand(1)` produces a newly owned vector of the input
+cardinality and element type, while `OperandCardinality(1)` admits exactly
+`n` work units for input length `n`, independent of host algorithm or
+comparison count.
+
+Bool order is `false < true`, Int order is ascending, and Double order is the
+total order defined by Rust `f64::total_cmp`. Equivalently, binary64 bits map
+to an unsigned key by complementing every negative encoding and setting the
+sign bit of every nonnegative encoding; keys compare ascending, so negative
+NaNs precede negative infinity, `-0.0 < 0.0`, and positive NaNs follow positive
+infinity. Current verified values admit only the canonical positive quiet NaN,
+but backends implement the complete key rule and preserve every copied element
+bit.
+
+The output vector byte charge and all `n` work units are admitted together
+before storage allocation or copying, while the immutable input remains live.
+Allocation refusal therefore releases only the completed input; after output
+storage succeeds, copying and in-place sorting add no semantic allocation or
+failure point. Empty vectors perform the canonical zero-byte, zero-work
+request without an allocation ordinal, and tuple or scalar operands fail
+during static signature selection.
+
 ## Evidence (`FWIR-PLAN-004`)
 
 Registry unit tests cover stable plan lookup and changed operand/plan
@@ -114,3 +140,9 @@ Issue #40 additionally maps `FWIR-PLAN-005` to
 `length_container_plan_roundtrips_and_dispatches_by_verified_identity`,
 `length_charges_constant_work_borrows_input_and_has_no_result_allocation`, and
 the strict C11 journey.
+Issue #41 maps `FWIR-PLAN-006` to
+`vector_sort_records_preserved_container_plan_for_static_dynamic_and_empty_vectors`,
+`sort_container_plan_roundtrips_and_dispatches_by_verified_identity`,
+`sort_covers_exhaustive_small_bools_integer_edges_and_total_double_order`,
+`sort_admits_owned_output_with_input_live_and_cleans_up_refused_output`, the
+randomized generated-C differential corpus, and the strict C11 journey.

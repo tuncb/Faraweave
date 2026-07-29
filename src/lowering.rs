@@ -2497,6 +2497,68 @@ mod tests {
     }
 
     #[test]
+    fn vector_sort_records_preserved_container_plan_for_static_dynamic_and_empty_vectors() {
+        let program = must_compile("sort[(true false)]\nsort iota 3\nsort[Double()]\n");
+        let raw = program.as_raw();
+        assert!(raw.features.contains(&Feature::ApplicationPlans.numeric()));
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 22,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3))
+                .collect::<Vec<_>>(),
+            [(40, 40, 4), (41, 41, 4), (42, 42, 4)]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.4 == LiftMode::ContainerVector
+                && apply.5
+                    == ShapePlan {
+                        static_anchor: None,
+                        dynamic_checks: IndexRange::default(),
+                    }
+        }));
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| apply.0.cardinality)
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(2)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+        assert!(applies.iter().all(|apply| {
+            raw.edges
+                .get(apply.0.edges.start as usize)
+                .is_some_and(|edge| edge.cardinality == apply.0.cardinality)
+        }));
+    }
+
+    #[test]
     fn prefix_spread_preserves_immediate_element_metadata() {
         let program = must_compile("add [1 (2 3)]\n");
         let raw = program.as_raw();
@@ -2897,10 +2959,11 @@ mod tests {
              [1 x]\n\
              inc[1]\n\
              length[(1 2)]\n\
+             sort[(2 1)]\n\
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 86_564_038_970_609_890);
+        assert_eq!(debug_digest(&matrix), 15_103_709_951_452_322_487);
 
         let depth = 256;
         let mut deep = String::new();
