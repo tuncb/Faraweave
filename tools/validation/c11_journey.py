@@ -31,6 +31,24 @@ SQRT_OUTPUT_LEAVES = (
     (0x4010_0000_0000_0000, 1),
     (0x1E60_0000_0000_0000, 1),
 )
+EXP_OUTPUT = (
+    b"1.0\n1.0\n(0.0 inf nan)\n"
+    b"(2.718281828459045 0.36787944117144233 7.38905609893065)\n"
+    b"1e-323\n0.0\n1.7976931348622732e308\ninf\n"
+)
+# Exact exp special leaves use a zero envelope. Every other finite leaf uses
+# FWIR-MATH-003's four-ULP checked-reference envelope.
+EXP_OUTPUT_LEAVES = (
+    (0x3FF0_0000_0000_0000, 0),
+    (0x3FF0_0000_0000_0000, 0),
+    (0x0000_0000_0000_0000, 0),
+    (0x4005_BF0A_8B14_5769, 4),
+    (0x3FD7_8B56_362C_EF38, 4),
+    (0x401D_8E64_B8D4_DDAE, 4),
+    (0x0000_0000_0000_0002, 4),
+    (0x0000_0000_0000_0000, 0),
+    (0x7FEF_FFFF_FFFF_FF2A, 4),
+)
 NUMERIC_LEAF = re.compile(
     rb"(?<![A-Za-z0-9_.])[-+]?(?:[0-9]+\.[0-9]+|[0-9]+)"
     rb"(?:e[-+]?[0-9]+)?(?![A-Za-z0-9_.])"
@@ -227,29 +245,30 @@ def numeric_leaf_view(output: bytes) -> tuple[bytes, list[bytes]]:
     cursor = 0
     for match in NUMERIC_LEAF.finditer(output):
         skeleton.extend(output[cursor : match.start()])
-        skeleton.extend(b"<sqrt-leaf>")
+        skeleton.extend(b"<backend-math-leaf>")
         leaves.append(match.group())
         cursor = match.end()
     skeleton.extend(output[cursor:])
     return bytes(skeleton), leaves
 
 
-def sqrt_output_mismatch(
+def backend_math_output_mismatch(
+    operation: str,
     actual: bytes,
-    reference_output: bytes = SQRT_OUTPUT,
-    leaf_specs: tuple[tuple[int, int], ...] = SQRT_OUTPUT_LEAVES,
+    reference_output: bytes,
+    leaf_specs: tuple[tuple[int, int], ...],
 ) -> str | None:
     reference_skeleton, reference_leaves = numeric_leaf_view(reference_output)
     actual_skeleton, actual_leaves = numeric_leaf_view(actual)
     if actual_skeleton != reference_skeleton:
         return (
-            "sqrt structural/special output changed: "
+            f"{operation} structural/special output changed: "
             f"actual={actual!r} reference={reference_output!r}"
         )
     if len(reference_leaves) != len(leaf_specs):
-        return "sqrt checked-reference leaf map is stale"
+        return f"{operation} checked-reference leaf map is stale"
     if len(actual_leaves) != len(reference_leaves):
-        return "sqrt numeric leaf count changed"
+        return f"{operation} numeric leaf count changed"
 
     for index, (actual_text, reference_text, leaf) in enumerate(
         zip(actual_leaves, reference_leaves, leaf_specs)
@@ -261,30 +280,70 @@ def sqrt_output_mismatch(
                 float(reference_text.decode("ascii"))
             )
         except (UnicodeDecodeError, ValueError, OverflowError):
-            return f"sqrt numeric leaf {index} is not canonical ASCII binary64"
+            return (
+                f"{operation} numeric leaf {index} "
+                "is not canonical ASCII binary64"
+            )
         if formatted_reference_bits != reference_bits:
-            return f"sqrt checked-reference leaf {index} no longer matches its bits"
+            return (
+                f"{operation} checked-reference leaf {index} "
+                "no longer matches its bits"
+            )
 
         actual_value = binary64(actual_bits)
         if actual_value != actual_value or abs(actual_value) == float("inf"):
-            return f"sqrt numeric leaf {index} is not finite"
+            return f"{operation} numeric leaf {index} is not finite"
         if (actual_bits >> 63) != (reference_bits >> 63):
-            return f"sqrt numeric leaf {index} changed sign"
+            return f"{operation} numeric leaf {index} changed sign"
         ulps = abs(
             binary64_order_key(actual_bits) - binary64_order_key(reference_bits)
         )
         if ulps > max_ulps:
             return (
-                f"sqrt numeric leaf {index} exceeds {max_ulps} ULP: "
+                f"{operation} numeric leaf {index} exceeds {max_ulps} ULP: "
                 f"actual={actual_bits:016x} reference={reference_bits:016x}"
             )
         if actual_bits == reference_bits and actual_text != reference_text:
-            return f"sqrt numeric leaf {index} changed canonical formatting"
+            return (
+                f"{operation} numeric leaf {index} "
+                "changed canonical formatting"
+            )
     return None
+
+
+def sqrt_output_mismatch(
+    actual: bytes,
+    reference_output: bytes = SQRT_OUTPUT,
+    leaf_specs: tuple[tuple[int, int], ...] = SQRT_OUTPUT_LEAVES,
+) -> str | None:
+    return backend_math_output_mismatch(
+        "sqrt",
+        actual,
+        reference_output,
+        leaf_specs,
+    )
+
+
+def exp_output_mismatch(
+    actual: bytes,
+    reference_output: bytes = EXP_OUTPUT,
+    leaf_specs: tuple[tuple[int, int], ...] = EXP_OUTPUT_LEAVES,
+) -> str | None:
+    return backend_math_output_mismatch(
+        "exp",
+        actual,
+        reference_output,
+        leaf_specs,
+    )
 
 
 def require_sqrt_output(actual: bytes, label: str) -> None:
     mismatch = sqrt_output_mismatch(actual)
+    require(mismatch is None, f"{label}: {mismatch}")
+
+
+def require_exp_output(actual: bytes, label: str) -> None:
+    mismatch = exp_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
 
 
@@ -329,6 +388,49 @@ def validate_sqrt_output_comparator() -> None:
         require(
             sqrt_output_mismatch(invalid, reference, leaves) is not None,
             f"sqrt comparator accepted invalid {label}",
+        )
+
+
+def validate_exp_output_comparator() -> None:
+    reference = b"1.0\n0.0\n(2.0 inf nan)\n"
+    leaves = (
+        (0x3FF0_0000_0000_0000, 4),
+        (0x0000_0000_0000_0000, 0),
+        (0x4000_0000_0000_0000, 4),
+    )
+    require(
+        exp_output_mismatch(reference, reference, leaves) is None,
+        "exp comparator exact",
+    )
+    require(
+        exp_output_mismatch(
+            b"1.0000000000000009\n0.0\n(2.0 inf nan)\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "exp comparator +4 ULP",
+    )
+    require(
+        exp_output_mismatch(
+            b"0.9999999999999996\n0.0\n(2.0 inf nan)\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "exp comparator -4 ULP",
+    )
+    for invalid, label in [
+        (b"1.000000000000001\n0.0\n(2.0 inf nan)\n", "five ULPs"),
+        (b"1.0\n-0.0\n(2.0 inf nan)\n", "signed zero"),
+        (b"1.0\n0.0\n[2.0 inf nan]\n", "structure"),
+        (b"1.0\n0.0\n(2.0 nan nan)\n", "special value"),
+        (b"1\n0.0\n(2.0 inf nan)\n", "canonical formatting"),
+        (b"2.0\n0.0\n(1.0 inf nan)\n", "root order"),
+    ]:
+        require(
+            exp_output_mismatch(invalid, reference, leaves) is not None,
+            f"exp comparator accepted invalid {label}",
         )
 
 
@@ -493,6 +595,7 @@ int main(void) {
 
 def main() -> None:
     validate_sqrt_output_comparator()
+    validate_exp_output_comparator()
     executable = Path(
         os.environ.get(
             "FARAWEAVE_EXE",
@@ -529,6 +632,11 @@ def main() -> None:
                 ROOT / "tests/fixtures/backend-native-sqrt.bennu",
                 [],
                 SQRT_OUTPUT,
+            ),
+            (
+                ROOT / "tests/fixtures/backend-native-exp.bennu",
+                [],
+                EXP_OUTPUT,
             ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
@@ -590,6 +698,9 @@ def main() -> None:
             if fixture.name == "backend-native-sqrt.bennu":
                 require_sqrt_output(generated_output, "generated sqrt output")
                 require_sqrt_output(evaluator_output, "evaluator sqrt output")
+            elif fixture.name == "backend-native-exp.bennu":
+                require_exp_output(generated_output, "generated exp output")
+                require_exp_output(evaluator_output, "evaluator exp output")
             else:
                 require(
                     generated_output == normalize_newlines(expected),
@@ -610,14 +721,18 @@ def main() -> None:
                 and not generated.stderr,
                 fixture.name,
             )
-            if fixture.name == "backend-native-sqrt.bennu":
-                hostile_source = work / "backend-native-sqrt-hostile.c"
-                hostile_native = work / f"backend-native-sqrt-hostile{suffix}"
+            if fixture.name in {
+                "backend-native-sqrt.bennu",
+                "backend-native-exp.bennu",
+            }:
+                operation = fixture.stem.removeprefix("backend-native-")
+                hostile_source = work / f"{fixture.stem}-hostile.c"
+                hostile_native = work / f"{fixture.stem}-hostile{suffix}"
                 generated_source = emitted.read_text(encoding="utf-8")
                 generated_main = "int main(int argc, char **argv) {"
                 require(
                     generated_main in generated_source,
-                    "sqrt generated main declaration",
+                    f"{operation} generated main declaration",
                 )
                 hostile_source.write_text(
                     generated_source.replace(
@@ -683,16 +798,22 @@ int main(int argc, char **argv) {
                 hostile_output = normalize_newlines(hostile_result.stdout)
                 require(
                     not hostile_result.stderr,
-                    "sqrt hostile generated-C stderr",
+                    f"{operation} hostile generated-C stderr",
                 )
                 require(
                     hostile_output == generated_output,
-                    "sqrt hostile FP state changed generated-C output",
+                    f"{operation} hostile FP state changed generated-C output",
                 )
-                require_sqrt_output(
-                    hostile_output,
-                    "sqrt hostile generated-C output",
-                )
+                if operation == "sqrt":
+                    require_sqrt_output(
+                        hostile_output,
+                        "sqrt hostile generated-C output",
+                    )
+                else:
+                    require_exp_output(
+                        hostile_output,
+                        "exp hostile generated-C output",
+                    )
             if index == 0 and platform.system() == "Linux":
                 sanitized = work / "fixture-sanitized"
                 compile_c_sanitized(compiler, environment, emitted, sanitized)

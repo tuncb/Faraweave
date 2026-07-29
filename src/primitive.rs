@@ -315,6 +315,9 @@ fn invoke_kernel(
         (ScalarKernel::SqrtDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_sqrt(*value)))
         }
+        (ScalarKernel::ExpDouble, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_exp(*value)))
+        }
         (ScalarKernel::IotaInt, _) => None,
         _ => None,
     };
