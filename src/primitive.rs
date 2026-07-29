@@ -766,6 +766,9 @@ fn invoke_kernel(
         (ScalarKernel::LogDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_log(*value)))
         }
+        (ScalarKernel::Log10Double, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_log10(*value)))
+        }
         (
             ScalarKernel::DivInt
             | ScalarKernel::LengthBoolVector

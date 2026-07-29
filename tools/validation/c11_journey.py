@@ -66,6 +66,24 @@ LOG_OUTPUT_LEAVES = (
     (0xBCA0_0000_0000_0000, 4),
     (0x4086_2E42_FEFA_39EF, 4),
 )
+LOG10_OUTPUT = (
+    b"-inf\n-inf\n(nan nan inf nan)\n0.0\n"
+    b"(-1.0 0.3010299956639812 1.0 3.0 -323.3062153431158)\n"
+    b"0.9999999999999999\n1.0000000000000002\n308.25471555991675\n"
+)
+# log10(1) is exact positive zero. Every other numeric leaf uses
+# FWIR-MATH-003's four-ULP checked-reference envelope.
+LOG10_OUTPUT_LEAVES = (
+    (0x0000_0000_0000_0000, 0),
+    (0xBFF0_0000_0000_0000, 4),
+    (0x3FD3_4413_509F_79FF, 4),
+    (0x3FF0_0000_0000_0000, 4),
+    (0x4008_0000_0000_0000, 4),
+    (0xC074_34E6_420F_4374, 4),
+    (0x3FEF_FFFF_FFFF_FFFF, 4),
+    (0x3FF0_0000_0000_0001, 4),
+    (0x4073_4413_509F_79FF, 4),
+)
 NUMERIC_LEAF = re.compile(
     rb"(?<![A-Za-z0-9_.])[-+]?(?:[0-9]+\.[0-9]+|[0-9]+)"
     rb"(?:e[-+]?[0-9]+)?(?![A-Za-z0-9_.])"
@@ -390,6 +408,19 @@ def log_output_mismatch(
     )
 
 
+def log10_output_mismatch(
+    actual: bytes,
+    reference_output: bytes = LOG10_OUTPUT,
+    leaf_specs: tuple[tuple[int, int], ...] = LOG10_OUTPUT_LEAVES,
+) -> str | None:
+    return backend_math_output_mismatch(
+        "log10",
+        actual,
+        reference_output,
+        leaf_specs,
+    )
+
+
 def require_sqrt_output(actual: bytes, label: str) -> None:
     mismatch = sqrt_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
@@ -402,6 +433,11 @@ def require_exp_output(actual: bytes, label: str) -> None:
 
 def require_log_output(actual: bytes, label: str) -> None:
     mismatch = log_output_mismatch(actual)
+    require(mismatch is None, f"{label}: {mismatch}")
+
+
+def require_log10_output(actual: bytes, label: str) -> None:
+    mismatch = log10_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
 
 
@@ -537,6 +573,49 @@ def validate_log_output_comparator() -> None:
         require(
             log_output_mismatch(invalid, reference, leaves) is not None,
             f"log comparator accepted invalid {label}",
+        )
+
+
+def validate_log10_output_comparator() -> None:
+    reference = b"-inf\nnan\n0.0\n1.0\n"
+    leaves = (
+        (0x0000_0000_0000_0000, 0),
+        (0x3FF0_0000_0000_0000, 4),
+    )
+    require(
+        log10_output_mismatch(reference, reference, leaves) is None,
+        "log10 comparator exact",
+    )
+    require(
+        log10_output_mismatch(
+            b"-inf\nnan\n0.0\n1.0000000000000009\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "log10 comparator +4 ULP",
+    )
+    require(
+        log10_output_mismatch(
+            b"-inf\nnan\n0.0\n0.9999999999999996\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "log10 comparator -4 ULP",
+    )
+    for invalid, label in [
+        (b"-inf\nnan\n0.0\n1.000000000000001\n", "five ULPs"),
+        (b"-inf\nnan\n-0.0\n1.0\n", "signed zero"),
+        (b"inf\nnan\n0.0\n1.0\n", "infinity sign"),
+        (b"-inf\ninf\n0.0\n1.0\n", "domain special"),
+        (b"(-inf)\nnan\n0.0\n1.0\n", "structure"),
+        (b"-inf\nnan\n0\n1.0\n", "canonical formatting"),
+        (b"-inf\nnan\n1.0\n0.0\n", "root order"),
+    ]:
+        require(
+            log10_output_mismatch(invalid, reference, leaves) is not None,
+            f"log10 comparator accepted invalid {label}",
         )
 
 
@@ -703,6 +782,7 @@ def main() -> None:
     validate_sqrt_output_comparator()
     validate_exp_output_comparator()
     validate_log_output_comparator()
+    validate_log10_output_comparator()
     executable = Path(
         os.environ.get(
             "FARAWEAVE_EXE",
@@ -749,6 +829,11 @@ def main() -> None:
                 ROOT / "tests/fixtures/backend-native-log.bennu",
                 [],
                 LOG_OUTPUT,
+            ),
+            (
+                ROOT / "tests/fixtures/backend-native-log10.bennu",
+                [],
+                LOG10_OUTPUT,
             ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
@@ -816,6 +901,9 @@ def main() -> None:
             elif fixture.name == "backend-native-log.bennu":
                 require_log_output(generated_output, "generated log output")
                 require_log_output(evaluator_output, "evaluator log output")
+            elif fixture.name == "backend-native-log10.bennu":
+                require_log10_output(generated_output, "generated log10 output")
+                require_log10_output(evaluator_output, "evaluator log10 output")
             else:
                 require(
                     generated_output == normalize_newlines(expected),
@@ -840,6 +928,7 @@ def main() -> None:
                 "backend-native-sqrt.bennu",
                 "backend-native-exp.bennu",
                 "backend-native-log.bennu",
+                "backend-native-log10.bennu",
             }:
                 operation = fixture.stem.removeprefix("backend-native-")
                 hostile_source = work / f"{fixture.stem}-hostile.c"
@@ -971,10 +1060,15 @@ int main(int argc, char **argv) {
                         hostile_output,
                         "exp hostile generated-C output",
                     )
-                else:
+                elif operation == "log":
                     require_log_output(
                         hostile_output,
                         "log hostile generated-C output",
+                    )
+                else:
+                    require_log10_output(
+                        hostile_output,
+                        "log10 hostile generated-C output",
                     )
             if index == 0:
                 hostile_source = work / "fixture-hostile-fp.c"
