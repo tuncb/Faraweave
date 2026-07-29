@@ -63,9 +63,9 @@ fn sqrt_uses_reserved_ids_double_selection_lifting_and_feature_seven() {
     assert_eq!(
         selections,
         vec![
-            (29, 35, 35, LiftMode::Scalar, faraweave::ScalarType::Double),
-            (29, 35, 35, LiftMode::Scalar, faraweave::ScalarType::Double),
-            (29, 35, 35, LiftMode::Vector, faraweave::ScalarType::Double),
+            (29, 54, 54, LiftMode::Scalar, faraweave::ScalarType::Double),
+            (29, 54, 54, LiftMode::Scalar, faraweave::ScalarType::Double),
+            (29, 54, 54, LiftMode::Vector, faraweave::ScalarType::Double),
         ]
     );
     assert_eq!(raw.edges[0].conversion, Conversion::Identity);
@@ -207,6 +207,6 @@ fn sqrt_emitted_c_calls_math_h_sqrt_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=sqrt(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_sqrt(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_35("));
-    assert!(source.contains("static int fw_impl_35("));
+    assert!(source.contains("static int fw_kernel_54("));
+    assert!(source.contains("static int fw_impl_54("));
 }

@@ -131,29 +131,29 @@ fn log_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
         selections,
         vec![
             (
-                37,
-                37,
+                56,
+                56,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::Identity,
             ),
             (
-                37,
-                37,
+                56,
+                56,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                37,
-                37,
+                56,
+                56,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                37,
-                37,
+                56,
+                56,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
@@ -383,7 +383,7 @@ fn log_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     );
 
     let node = log_node(&bytes);
-    for (relative, replacement) in [(24, 30_u32), (28, 36), (32, 36)] {
+    for (relative, replacement) in [(24, 30_u32), (28, 55), (32, 55)] {
         let mut malformed = bytes.clone();
         malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
         let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
@@ -437,6 +437,6 @@ fn log_emitted_c_calls_math_h_log_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=log(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_log(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_37("));
-    assert!(source.contains("static int fw_impl_37("));
+    assert!(source.contains("static int fw_kernel_56("));
+    assert!(source.contains("static int fw_impl_56("));
 }

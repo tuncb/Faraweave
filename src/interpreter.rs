@@ -1,5 +1,8 @@
 use crate::evaluator::{EvaluationConfiguration, ProgramResult};
-use crate::primitive::{SelectedApplicationArgument, apply_implementation, implementation_name};
+use crate::primitive::{
+    SelectedApplicationArgument, apply_implementation, apply_reducer_consumer_implementation,
+    implementation_name,
+};
 use crate::resources::ResourceContext;
 use crate::{
     ArgumentErrorContext, ArgumentErrorReason, ConstantRecord, Edge, Error, ErrorKind, Feature,
@@ -156,6 +159,8 @@ impl<'a> Interpreter<'a> {
             NodeKind::PrefixSpreadPrepare => self.execute_spread_prepare(index, node, location),
             NodeKind::SelectedApply {
                 implementation_id,
+                application_plan_id,
+                operation_reference,
                 lift,
                 result_element_type,
                 shape,
@@ -164,6 +169,8 @@ impl<'a> Interpreter<'a> {
                 index,
                 node,
                 implementation_id,
+                application_plan_id,
+                operation_reference,
                 lift,
                 result_element_type,
                 shape,
@@ -233,6 +240,8 @@ impl<'a> Interpreter<'a> {
         index: usize,
         node: crate::Node,
         implementation_id: u16,
+        application_plan_id: u16,
+        operation_reference: Option<crate::OperationReferenceIndex>,
         lift: crate::LiftMode,
         result_type: ScalarType,
         shape: crate::ShapePlan,
@@ -250,14 +259,35 @@ impl<'a> Interpreter<'a> {
                 conversion: edge.conversion,
             });
         }
-        let applied = apply_implementation(
-            implementation_id,
-            &arguments,
-            lift,
-            result_type,
-            location,
-            &mut self.resources,
-        );
+        let applied = if let Some(reference_index) = operation_reference {
+            let reference = *self
+                .raw
+                .operation_references
+                .get(reference_index.0 as usize)
+                .ok_or_else(|| execution_invariant_error(location))?;
+            let reference_location = self.origin_location(reference.origin)?;
+            apply_reducer_consumer_implementation(
+                implementation_id,
+                application_plan_id,
+                &reference,
+                &arguments,
+                lift,
+                result_type,
+                location,
+                reference_location,
+                &mut self.resources,
+            )
+        } else {
+            apply_implementation(
+                implementation_id,
+                application_plan_id,
+                &arguments,
+                lift,
+                result_type,
+                location,
+                &mut self.resources,
+            )
+        };
         drop(arguments);
         let (value, accounted) = applied?;
         self.put_owned(index, value, accounted)?;
@@ -992,6 +1022,24 @@ mod tests {
             ("inc[1]\n", vec![]),
             ("add[1 2.5]\n", vec![]),
             ("add[(1 2 3) 10]\n", vec![]),
+            ("div[-7 3]\n", vec![]),
+            ("div[(8 9 10) (2 0 5)]\n", vec![]),
+            ("length[(true false true)]\n", vec![]),
+            ("length iota 4\n", vec![]),
+            ("sort[(3 1 2 1)]\n", vec![]),
+            ("sort[(0.0 -0.0 -inf inf)]\n", vec![]),
+            ("sum[(1 2 3)]\n", vec![]),
+            ("sum[(1.5 -0.5 2.0)]\n", vec![]),
+            ("all_of[Bool()]\n", vec![]),
+            ("all_of[(true false true)]\n", vec![]),
+            ("any_of[Bool()]\n", vec![]),
+            ("any_of[(false true false)]\n", vec![]),
+            ("none_of[Bool()]\n", vec![]),
+            ("none_of[(false true false)]\n", vec![]),
+            ("foldl[@sub 20 (3 4 5)]\n", vec![]),
+            ("foldl[@add 1 (2.5 3.5)]\n", vec![]),
+            ("scanl[@sub 20 (3 4 5)]\n", vec![]),
+            ("scanl[@add 1 (2.5 3.5)]\n", vec![]),
             ("add [1 2]\n", vec![]),
             ("[1 (2 3) true]\n", vec![]),
             ("fanout[iota[3] {inc[_]} {add[_ 10]}]\n", vec![]),
@@ -1030,6 +1078,25 @@ mod tests {
             "sub[2.0 1.0]\n",
             "mul[2 3]\n",
             "mul[2.0 3.0]\n",
+            "div[7 3]\n",
+            "div[7.0 3.0]\n",
+            "length[(true false)]\n",
+            "length[(1 2)]\n",
+            "length[(1.0 2.0)]\n",
+            "sort[(true false)]\n",
+            "sort[(2 1)]\n",
+            "sort[(2.0 1.0)]\n",
+            "sum[(1 2)]\n",
+            "sum[(1.0 2.0)]\n",
+            "all_of[(true false)]\n",
+            "any_of[(true false)]\n",
+            "none_of[(true false)]\n",
+            "foldl[@and true (true false)]\n",
+            "foldl[@sub 10 (1 2)]\n",
+            "foldl[@add 1 (2.0 3.0)]\n",
+            "scanl[@and true (true false)]\n",
+            "scanl[@sub 10 (1 2)]\n",
+            "scanl[@add 1 (2.0 3.0)]\n",
             "equals[true false]\n",
             "equals[1 2]\n",
             "equals[1.0 2.0]\n",
