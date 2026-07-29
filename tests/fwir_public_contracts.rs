@@ -1,9 +1,9 @@
 use faraweave::{
-    EvaluationConfiguration, FwirDecodeLimits, FwirEncodeOptions, ResourceErrorReason, Value,
-    compile_source_to_fwir, compile_source_to_fwir_with_name, compile_source_to_verified_program,
-    decode_fwir, emit_c_from_verified_program, encode_fwir,
-    evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
-    inspect_fwir,
+    DomainErrorReason, EvaluationConfiguration, Feature, FwirDecodeLimits, FwirEncodeOptions,
+    LiftMode, NodeKind, ResourceErrorReason, Value, compile_source_to_fwir,
+    compile_source_to_fwir_with_name, compile_source_to_verified_program, decode_fwir,
+    emit_c_from_verified_program, encode_fwir, evaluate_verified_program_with_arguments,
+    evaluate_verified_program_with_observer, inspect_fwir,
 };
 use std::sync::Mutex;
 
@@ -108,6 +108,20 @@ fn public_source_artifact_execution_c_and_resource_traces_are_differential() {
 }
 
 #[test]
+fn line_comments_preserve_source_length_and_lower_to_c() {
+    let source = "# prologue 🦀\r\ninc[# argument\n1]# eof";
+    let program =
+        compile_source_to_verified_program(source, "comments.faraweave").expect("compile comments");
+    assert_eq!(
+        program.as_raw().source_units[0].byte_length,
+        u32::try_from(source.len()).expect("fixture length")
+    );
+    let emitted =
+        emit_c_from_verified_program(&program, EvaluationConfiguration::default()).expect("emit C");
+    assert!(emitted.source.contains("Strict C11"));
+}
+
+#[test]
 fn public_compile_errors_and_argument_errors_preserve_phase_and_provenance() {
     let invalid =
         compile_source_to_fwir("inc[", &FwirEncodeOptions::default()).expect_err("invalid source");
@@ -131,6 +145,759 @@ fn public_compile_errors_and_argument_errors_preserve_phase_and_provenance() {
     )
     .expect_err("argument");
     assert_eq!(error.kind, faraweave::ErrorKind::ArgumentError);
+}
+
+#[test]
+fn div_identity_domain_and_c_emission_survive_fwir_roundtrip() {
+    let source = "div[(8 9 10) (2 0 5)]\n";
+    let program =
+        compile_source_to_verified_program(source, "division.faraweave").expect("compile div");
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode div");
+    let decoded = decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified div");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode div"),
+        encoded
+    );
+
+    let direct =
+        evaluate_verified_program_with_arguments(&program, &[], EvaluationConfiguration::default())
+            .expect_err("direct division domain");
+    let loaded =
+        evaluate_verified_program_with_arguments(&decoded, &[], EvaluationConfiguration::default())
+            .expect_err("decoded division domain");
+    assert_eq!(loaded, direct);
+    assert_eq!(
+        direct.domain.as_ref().map(|context| context.reason),
+        Some(DomainErrorReason::DivisionByZero)
+    );
+    assert_eq!(
+        direct
+            .domain
+            .as_ref()
+            .and_then(|context| context.element_index),
+        Some(1)
+    );
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_kernel_35("));
+    assert!(emitted.source.contains("fw_selected_division_by_zero"));
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn length_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  length[(true false)]\n\
+                  length[(1 2 3)]\n\
+                  length[Double()]\n\
+                  length iota n\n";
+    let program =
+        compile_source_to_verified_program(source, "length.faraweave").expect("compile length");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 21,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (37, 37, 3, LiftMode::ContainerScalar),
+            (38, 38, 3, LiftMode::ContainerScalar),
+            (39, 39, 3, LiftMode::ContainerScalar),
+            (38, 38, 3, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode length");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified length");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode length"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct length");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded length");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["2", "3", "0", "4"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    for implementation in 37..=39 {
+        assert!(
+            emitted
+                .source
+                .contains(&format!("static int fw_impl_{implementation}("))
+        );
+    }
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_length(")
+            .count(),
+        3
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn sort_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  sort[(true false true)]\n\
+                  sort[(3 1 2)]\n\
+                  sort[(inf -0.0 0.0 -inf)]\n\
+                  sort iota n\n";
+    let program =
+        compile_source_to_verified_program(source, "sort.faraweave").expect("compile sort");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 22,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (40, 40, 4, LiftMode::ContainerVector),
+            (41, 41, 4, LiftMode::ContainerVector),
+            (42, 42, 4, LiftMode::ContainerVector),
+            (41, 41, 4, LiftMode::ContainerVector),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode sort");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified sort");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode sort"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct sort");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded sort");
+    assert_eq!(loaded, direct);
+    assert_eq!(
+        direct.formatted,
+        [
+            "(false true true)",
+            "(1 2 3)",
+            "(-inf -0.0 0.0 inf)",
+            "(1 2 3 4)",
+        ]
+    );
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    for implementation in 40..=42 {
+        assert!(
+            emitted
+                .source
+                .contains(&format!("static int fw_impl_{implementation}("))
+        );
+    }
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_sort(")
+            .count(),
+        3
+    );
+    assert!(emitted.source.contains("fw_double_order_key(values[left])"));
+    assert!(!emitted.source.contains("qsort("));
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn sum_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  sum[(1 2 3)]\n\
+                  sum[(1.5 -0.5 2.0)]\n\
+                  sum[Int()]\n\
+                  sum[Double()]\n\
+                  sum iota n\n";
+    let program = compile_source_to_verified_program(source, "sum.faraweave").expect("compile sum");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 23,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (43, 43, 5, LiftMode::ContainerScalar),
+            (44, 44, 5, LiftMode::ContainerScalar),
+            (43, 43, 5, LiftMode::ContainerScalar),
+            (44, 44, 5, LiftMode::ContainerScalar),
+            (43, 43, 5, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode sum");
+    let decoded = decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified sum");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode sum"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct sum");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded sum");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["6", "3.0", "0", "0.0", "10"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    for implementation in 43..=44 {
+        assert!(
+            emitted
+                .source
+                .contains(&format!("static int fw_impl_{implementation}("))
+        );
+    }
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_sum_int(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_sum_double(")
+            .count(),
+        1
+    );
+    assert!(
+        emitted
+            .source
+            .contains("total=fw_double_arithmetic(total,values[index],FW_DOUBLE_ADD)")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn all_of_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  all_of[Bool()]\n\
+                  all_of[(true false true)]\n\
+                  all_of equals[iota n iota n]\n";
+    let program =
+        compile_source_to_verified_program(source, "all-of.faraweave").expect("compile all_of");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 24,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (45, 45, 6, LiftMode::ContainerScalar),
+            (45, 45, 6, LiftMode::ContainerScalar),
+            (45, 45, 6, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode all_of");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified all_of");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode all_of"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct all_of");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded all_of");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["true", "false", "true"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_45("));
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_all_of(")
+            .count(),
+        1
+    );
+    assert!(
+        emitted
+            .source
+            .contains("if(!fw_charge_work(args[0].len,name,line,column))return 0;")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn any_of_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  any_of[Bool()]\n\
+                  any_of[(false false false)]\n\
+                  any_of equals[iota n iota n]\n";
+    let program =
+        compile_source_to_verified_program(source, "any-of.faraweave").expect("compile any_of");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 25,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (46, 46, 7, LiftMode::ContainerScalar),
+            (46, 46, 7, LiftMode::ContainerScalar),
+            (46, 46, 7, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode any_of");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified any_of");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode any_of"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct any_of");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded any_of");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["false", "false", "true"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_46("));
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_any_of(")
+            .count(),
+        1
+    );
+    assert!(
+        emitted
+            .source
+            .contains("if(!fw_charge_work(args[0].len,name,line,column))return 0;")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn none_of_container_plan_roundtrips_and_dispatches_by_its_own_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  none_of[Bool()]\n\
+                  none_of[(false false false)]\n\
+                  none_of equals[iota n iota n]\n";
+    let program =
+        compile_source_to_verified_program(source, "none-of.faraweave").expect("compile none_of");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 26,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (47, 47, 8, LiftMode::ContainerScalar),
+            (47, 47, 8, LiftMode::ContainerScalar),
+            (47, 47, 8, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode none_of");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified none_of");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode none_of"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct none_of");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded none_of");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["true", "true", "false"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_47("));
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_none_of(")
+            .count(),
+        1
+    );
+    assert!(
+        emitted
+            .source
+            .contains("return fw_apply_selected_none_of(\"none_of\",args,out,line,column)")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities() {
+    let source = "parameters[n Int]\n\
+                  foldl[@sub 10 Int()]\n\
+                  foldl[@sub 20 (3 4 5)]\n\
+                  foldl[@add 0 iota[n]]\n\
+                  foldl[@add 1 Double()]\n";
+    let program =
+        compile_source_to_verified_program(source, "foldl.faraweave").expect("compile foldl");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::OperationReferences.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 27,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference,
+                lift,
+                ..
+            } => Some((
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference.map(|index| index.0),
+                lift,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (49, 49, 9, Some(0), LiftMode::ContainerScalar),
+            (49, 49, 9, Some(1), LiftMode::ContainerScalar),
+            (49, 49, 9, Some(2), LiftMode::ContainerScalar),
+            (50, 50, 9, Some(3), LiftMode::ContainerScalar),
+        ]
+    );
+    assert_eq!(
+        program
+            .as_raw()
+            .operation_references
+            .iter()
+            .map(|reference| (
+                reference.primitive_id,
+                reference.signature_id,
+                reference.implementation_id,
+            ))
+            .collect::<Vec<_>>(),
+        [(6, 11, 11), (6, 11, 11), (5, 9, 9), (5, 10, 10)]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode foldl");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified foldl");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode foldl"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct foldl");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded foldl");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["10", "8", "10", "1.0"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_49_opr_0("));
+    assert!(emitted.source.contains("static int fw_impl_49_opr_1("));
+    assert!(emitted.source.contains("static int fw_impl_50_opr_3("));
+    assert!(
+        emitted
+            .source
+            .contains("fw_apply_selected_foldl(fw_kernel_11")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
+fn scanl_roundtrips_reducer_links_plus_one_shape_and_direct_dispatch() {
+    let source = "parameters[n Int]\n\
+                  scanl[@sub 10 Int()]\n\
+                  scanl[@sub 20 (3 4 5)]\n\
+                  scanl[@add 0 iota[n]]\n\
+                  scanl[@add 1 Double()]\n";
+    let program =
+        compile_source_to_verified_program(source, "scanl.faraweave").expect("compile scanl");
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 28,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference,
+                lift,
+                ..
+            } => Some((
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference.map(|index| index.0),
+                lift,
+                node.cardinality,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (
+                52,
+                52,
+                10,
+                Some(0),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::StaticVector(1)),
+            ),
+            (
+                52,
+                52,
+                10,
+                Some(1),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::StaticVector(4)),
+            ),
+            (
+                52,
+                52,
+                10,
+                Some(2),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::DynamicVector),
+            ),
+            (
+                53,
+                53,
+                10,
+                Some(3),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::StaticVector(1)),
+            ),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode scanl");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified scanl");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode scanl"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct scanl");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded scanl");
+    assert_eq!(loaded, direct);
+    assert_eq!(
+        direct.formatted,
+        ["(10)", "(20 17 13 8)", "(0 1 3 6 10)", "(1.0)"]
+    );
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_52_opr_0("));
+    assert!(emitted.source.contains("static int fw_impl_53_opr_3("));
+    assert!(
+        emitted
+            .source
+            .contains("fw_apply_selected_scanl(fw_kernel_11")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]

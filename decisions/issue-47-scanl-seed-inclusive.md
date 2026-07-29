@@ -1,0 +1,3 @@
+# Issue #47 — seed-inclusive `scanl`
+
+Implementation is based on reviewed dependency commit `ad4025256122eafd2676d9d756faaa675bc0e60a`, which contains #40–#46 and must wait for those predecessors before final integration. Primitive 28 appends Bool, Int, and Double signature/implementation IDs 51–53 plus application-plan ID 10, while each scan reuses `NODE.a7` to link its lowering-selected closed `OPRF` reducer without runtime name lookup. The checked `n + 1` output and all `n` work units are admitted before population, and reducer failure releases the output allocation before reverse input cleanup without adding a dependency or unsafe code.

@@ -212,6 +212,8 @@ def validate_fwir_conformance() -> None:
         "shck.",
         "bran.",
         "node.",
+        "appl.",
+        "oprf.",
         "ownr.",
         "root.",
         "prod.",
