@@ -652,6 +652,125 @@ fn foldl_reports_the_leftmost_reducer_fault_with_step_operands_and_reference_ori
 }
 
 #[test]
+fn scanl_is_seed_inclusive_for_all_types_empty_dynamic_and_non_associative_inputs() {
+    for (source, expected) in [
+        ("scanl[@and true Bool()]", "(true)"),
+        (
+            "scanl[@and true (true false true)]",
+            "(true true false false)",
+        ),
+        (
+            "scanl[@or false (false true false)]",
+            "(false false true true)",
+        ),
+        ("scanl[@sub 20 Int()]", "(20)"),
+        ("scanl[@sub 20 (3)]", "(20 17)"),
+        ("scanl[@sub 20 (3 4 5)]", "(20 17 13 8)"),
+        ("scanl[@div 100 (2 5)]", "(100 50 10)"),
+        ("scanl[@sub 20.0 (3.0 4.0 5.0)]", "(20.0 17.0 13.0 8.0)"),
+        ("scanl[@add 1 (2.5 3.5)]", "(1.0 3.5 7.0)"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    for (source, arguments, expected) in [
+        (
+            "parameters[n Int]\nscanl[@sub 10 iota[n]]\n",
+            vec![Value::Int(4)],
+            Value::IntVector(vec![10, 9, 7, 4, 0]),
+        ),
+        (
+            "parameters[n Int]\nscanl[@and true equals[iota n iota n]]\n",
+            vec![Value::Int(3)],
+            Value::BoolVector(vec![true, true, true, true]),
+        ),
+        (
+            "parameters[n Int]\nscanl[@add 0 add[iota n 0.5]]\n",
+            vec![Value::Int(3)],
+            Value::DoubleVector(vec![0.0, 1.5, 4.0, 7.5]),
+        ),
+    ] {
+        let result = faraweave::evaluate_source_with_arguments(
+            source,
+            &arguments,
+            EvaluationConfiguration::default(),
+        )
+        .expect("dynamic parameterized scanl");
+        assert_eq!(result.values, [expected], "{source}");
+    }
+}
+
+#[test]
+fn scanl_rejects_invalid_references_and_container_promotion_statically() {
+    for (source, kind, primitive, message) in [
+        (
+            "scanl[@missing 0 (1 2)]",
+            ErrorKind::UnknownPrimitive,
+            "missing",
+            "@missing is not a registered built-in operation",
+        ),
+        (
+            "scanl[@not 0 (1 2)]",
+            ErrorKind::ArityError,
+            "not",
+            "@not referenced operation has incompatible arity",
+        ),
+        (
+            "scanl[@scanl 0 (1 2)]",
+            ErrorKind::TypeError,
+            "scanl",
+            "@scanl referenced operation has unsupported structural behavior",
+        ),
+        (
+            "scanl[@equals 0 (1 2)]",
+            ErrorKind::TypeError,
+            "equals",
+            "@equals referenced operation has no compatible signature",
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some(primitive), "{source}");
+        assert_eq!(error.message, message, "{source}");
+        assert_eq!(error.location.column, 8, "{source}");
+    }
+
+    let promotion = evaluate_expression("scanl[@add 0.0 (1 2)]")
+        .expect_err("whole-vector promotion is forbidden");
+    assert_eq!(promotion.kind, ErrorKind::TypeError);
+    assert_eq!(promotion.primitive.as_deref(), Some("scanl"));
+    assert_eq!(promotion.argument_position, Some(3));
+    assert_eq!(promotion.location.column, 16);
+}
+
+#[test]
+fn scanl_reports_the_leftmost_reducer_fault_and_initialized_prefix() {
+    for (source, reason, expected_index, expected_operands) in [
+        (
+            "scanl[@add 9223372036854775806 (1 1 -1)]",
+            DomainErrorReason::IntegerOverflow,
+            1,
+            vec![Value::Int(i64::MAX), Value::Int(1)],
+        ),
+        (
+            "scanl[@div 100 (2 0 5)]",
+            DomainErrorReason::DivisionByZero,
+            1,
+            vec![Value::Int(50), Value::Int(0)],
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::DomainError, "{source}");
+        assert_eq!(error.location.column, 7, "{source}");
+        let domain = error.domain.expect("structured scanl reducer fault");
+        assert_eq!(domain.reason, reason);
+        assert_eq!(domain.result_type, ScalarType::Int);
+        assert_eq!(domain.operands, expected_operands);
+        assert_eq!(domain.element_index, Some(expected_index));
+    }
+}
+
+#[test]
 fn all_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_false_position() {
     assert_eq!(formatted("all_of[Bool()]"), "true");
     assert_eq!(formatted("all_of[(true true true true)]"), "true");

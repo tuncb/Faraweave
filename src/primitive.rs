@@ -346,7 +346,7 @@ pub(crate) fn apply_implementation(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_foldl_implementation(
+pub(crate) fn apply_reducer_consumer_implementation(
     implementation_id: u16,
     application_plan_id: u16,
     reference: &crate::OperationReference,
@@ -361,18 +361,23 @@ pub(crate) fn apply_foldl_implementation(
         .map_err(|_| type_runtime_error("selected implementation", location))?;
     let application_plan = application_plan_from_numeric(application_plan_id)
         .map_err(|_| type_runtime_error("selected application plan", location))?;
-    if descriptor.behavior != StructuralBehavior::Foldl
-        || descriptor.application_plan != application_plan
-        || lift != crate::LiftMode::ContainerScalar
+    let producer = descriptor.primitive_name;
+    let valid_lift = match descriptor.behavior {
+        StructuralBehavior::Foldl => lift == crate::LiftMode::ContainerScalar,
+        StructuralBehavior::Scanl => lift == crate::LiftMode::ContainerVector,
+        _ => false,
+    };
+    if descriptor.application_plan != application_plan
+        || !valid_lift
         || descriptor.result != result_type
     {
-        return Err(type_runtime_error("foldl", location));
+        return Err(type_runtime_error(producer, location));
     }
     let [initializer, vector] = arguments else {
-        return Err(type_runtime_error("foldl", location));
+        return Err(type_runtime_error(producer, location));
     };
     if vector.conversion != crate::Conversion::Identity {
-        return Err(type_runtime_error("foldl", location));
+        return Err(type_runtime_error(producer, location));
     }
     let reducer = implementation_from_numeric(reference.implementation_id)
         .map_err(|_| type_runtime_error("referenced operation", reference_location))?;
@@ -408,38 +413,148 @@ pub(crate) fn apply_foldl_implementation(
         {
             Value::Double(strict_float::int_to_binary64(*value))
         }
-        _ => return Err(type_runtime_error("foldl", location)),
+        _ => return Err(type_runtime_error(producer, location)),
     };
     let length = match (descriptor.kernel, vector.value) {
         (ScalarKernel::FoldlBool, Value::BoolVector(values)) => values.len(),
         (ScalarKernel::FoldlInt, Value::IntVector(values)) => values.len(),
         (ScalarKernel::FoldlDouble, Value::DoubleVector(values)) => values.len(),
-        _ => return Err(type_runtime_error("foldl", location)),
+        (ScalarKernel::ScanlBool, Value::BoolVector(values)) => values.len(),
+        (ScalarKernel::ScanlInt, Value::IntVector(values)) => values.len(),
+        (ScalarKernel::ScanlDouble, Value::DoubleVector(values)) => values.len(),
+        _ => return Err(type_runtime_error(producer, location)),
     };
-    let work = admitted_work(application_plan, 1, arguments, "foldl", location)?;
+    let work = admitted_work(application_plan, 1, arguments, producer, location)?;
     if work != length {
-        return Err(type_runtime_error("foldl", location));
+        return Err(type_runtime_error(producer, location));
     }
-    resources.charge_work(work, location, "foldl")?;
-    for index in 0..length {
-        let element = match vector.value {
-            Value::BoolVector(values) => values.get(index).copied().map(Value::Bool),
-            Value::IntVector(values) => values.get(index).copied().map(Value::Int),
-            Value::DoubleVector(values) => values.get(index).copied().map(Value::Double),
-            _ => None,
+    if descriptor.behavior == StructuralBehavior::Foldl {
+        resources.charge_work(work, location, producer)?;
+        for index in 0..length {
+            let element = vector_element(vector.value, index, producer, location)?;
+            let operands = [accumulator, element];
+            accumulator = invoke_kernel(
+                reducer.kernel,
+                reducer.primitive_name,
+                &operands,
+                result_type,
+                reference_location,
+                Some(index),
+            )?;
         }
-        .ok_or_else(|| type_runtime_error("foldl", location))?;
+        return Ok((accumulator, false));
+    }
+
+    let output_length = scan_output_length(length, location, producer, resources)?;
+    let admitted =
+        resources.admit_vector_with_work(result_type, output_length, work, location, producer)?;
+    let mut output = match allocate_scan_output(result_type, output_length) {
+        Ok(output) => output,
+        Err(()) => {
+            resources.refund(admitted);
+            return Err(allocation_error(producer, location));
+        }
+    };
+    if write_scan_output(&mut output, 0, &accumulator).is_err() {
+        resources.release(&output);
+        return Err(type_runtime_error(producer, location));
+    }
+    for index in 0..length {
+        let element = match vector_element(vector.value, index, producer, location) {
+            Ok(element) => element,
+            Err(error) => {
+                resources.release(&output);
+                return Err(error);
+            }
+        };
         let operands = [accumulator, element];
-        accumulator = invoke_kernel(
+        accumulator = match invoke_kernel(
             reducer.kernel,
             reducer.primitive_name,
             &operands,
             result_type,
             reference_location,
             Some(index),
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                resources.release(&output);
+                return Err(error);
+            }
+        };
+        if write_scan_output(&mut output, index + 1, &accumulator).is_err() {
+            resources.release(&output);
+            return Err(type_runtime_error(producer, location));
+        }
     }
-    Ok((accumulator, false))
+    Ok((output, true))
+}
+
+fn vector_element(
+    vector: &Value,
+    index: usize,
+    producer: &str,
+    location: SourceLocation,
+) -> Result<Value, Error> {
+    match vector {
+        Value::BoolVector(values) => values.get(index).copied().map(Value::Bool),
+        Value::IntVector(values) => values.get(index).copied().map(Value::Int),
+        Value::DoubleVector(values) => values.get(index).copied().map(Value::Double),
+        _ => None,
+    }
+    .ok_or_else(|| type_runtime_error(producer, location))
+}
+
+fn scan_output_length(
+    input_length: usize,
+    location: SourceLocation,
+    producer: &str,
+    resources: &ResourceContext,
+) -> Result<usize, Error> {
+    input_length
+        .checked_add(1)
+        .ok_or_else(|| resources.size_overflow(Some(input_length), location, producer))
+}
+
+fn allocate_scan_output(element_type: ScalarType, length: usize) -> Result<Value, ()> {
+    match element_type {
+        ScalarType::Bool => {
+            let mut values = Vec::new();
+            values.try_reserve_exact(length).map_err(|_| ())?;
+            values.resize(length, false);
+            Ok(Value::BoolVector(values))
+        }
+        ScalarType::Int => {
+            let mut values = Vec::new();
+            values.try_reserve_exact(length).map_err(|_| ())?;
+            values.resize(length, 0);
+            Ok(Value::IntVector(values))
+        }
+        ScalarType::Double => {
+            let mut values = Vec::new();
+            values.try_reserve_exact(length).map_err(|_| ())?;
+            values.resize(length, 0.0);
+            Ok(Value::DoubleVector(values))
+        }
+    }
+}
+
+fn write_scan_output(output: &mut Value, index: usize, value: &Value) -> Result<(), ()> {
+    match (output, value) {
+        (Value::BoolVector(values), Value::Bool(value)) => values
+            .get_mut(index)
+            .map(|destination| *destination = *value)
+            .ok_or(()),
+        (Value::IntVector(values), Value::Int(value)) => values
+            .get_mut(index)
+            .map(|destination| *destination = *value)
+            .ok_or(()),
+        (Value::DoubleVector(values), Value::Double(value)) => values
+            .get_mut(index)
+            .map(|destination| *destination = *value)
+            .ok_or(()),
+        _ => Err(()),
+    }
 }
 
 #[allow(dead_code)]
@@ -658,6 +773,9 @@ fn invoke_kernel(
             | ScalarKernel::FoldlBool
             | ScalarKernel::FoldlInt
             | ScalarKernel::FoldlDouble
+            | ScalarKernel::ScanlBool
+            | ScalarKernel::ScanlInt
+            | ScalarKernel::ScanlDouble
             | ScalarKernel::IotaInt,
             _,
         ) => None,
@@ -1065,5 +1183,21 @@ mod tests {
             assert_eq!(resources.usage.work_units, 2);
             assert_eq!(resources.usage.allocation_attempts, 0);
         }
+    }
+
+    #[test]
+    fn scan_output_length_rejects_n_plus_one_overflow_before_admission() {
+        let resources = context(ResourceLimits {
+            max_work_units: Some(usize::MAX),
+            ..ResourceLimits::default()
+        });
+        let error = scan_output_length(usize::MAX, SourceLocation::start(), "scanl", &resources)
+            .expect_err("n + 1 overflow");
+        assert_eq!(error.kind, ErrorKind::ResourceError);
+        let context = error.resource.expect("structured size overflow");
+        assert_eq!(context.reason, crate::ResourceErrorReason::SizeOverflow);
+        assert_eq!(context.requested_elements, Some(usize::MAX));
+        assert_eq!(resources.usage.work_units, 0);
+        assert_eq!(resources.usage.allocation_attempts, 0);
     }
 }

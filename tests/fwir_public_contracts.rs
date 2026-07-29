@@ -793,6 +793,114 @@ fn foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities() {
 }
 
 #[test]
+fn scanl_roundtrips_reducer_links_plus_one_shape_and_direct_dispatch() {
+    let source = "parameters[n Int]\n\
+                  scanl[@sub 10 Int()]\n\
+                  scanl[@sub 20 (3 4 5)]\n\
+                  scanl[@add 0 iota[n]]\n\
+                  scanl[@add 1 Double()]\n";
+    let program =
+        compile_source_to_verified_program(source, "scanl.faraweave").expect("compile scanl");
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 28,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference,
+                lift,
+                ..
+            } => Some((
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference.map(|index| index.0),
+                lift,
+                node.cardinality,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (
+                52,
+                52,
+                10,
+                Some(0),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::StaticVector(1)),
+            ),
+            (
+                52,
+                52,
+                10,
+                Some(1),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::StaticVector(4)),
+            ),
+            (
+                52,
+                52,
+                10,
+                Some(2),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::DynamicVector),
+            ),
+            (
+                53,
+                53,
+                10,
+                Some(3),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::StaticVector(1)),
+            ),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode scanl");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified scanl");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode scanl"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct scanl");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded scanl");
+    assert_eq!(loaded, direct);
+    assert_eq!(
+        direct.formatted,
+        ["(10)", "(20 17 13 8)", "(0 1 3 6 10)", "(1.0)"]
+    );
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_52_opr_0("));
+    assert!(emitted.source.contains("static int fw_impl_53_opr_3("));
+    assert!(
+        emitted
+            .source
+            .contains("fw_apply_selected_scanl(fw_kernel_11")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
 fn inspection_is_deterministic_and_carries_exact_binary64_bits() {
     let program = compile_source_to_verified_program("-0.0\nnan\n", "bits.faraweave")
         .expect("compile exact doubles");

@@ -1962,7 +1962,7 @@ fn verify_apply(
         ));
     }
     match (descriptor.behavior, operation_reference) {
-        (StructuralBehavior::Foldl, Some(reference_index)) => {
+        (StructuralBehavior::Foldl | StructuralBehavior::Scanl, Some(reference_index)) => {
             let reference = program
                 .operation_references
                 .get(reference_index.0 as usize)
@@ -2001,7 +2001,7 @@ fn verify_apply(
                 ));
             }
         }
-        (StructuralBehavior::Foldl, None) | (_, Some(_)) => {
+        (StructuralBehavior::Foldl | StructuralBehavior::Scanl, None) | (_, Some(_)) => {
             return Err(malformed(
                 Invariant::InvalidRecord,
                 RecordKind::Node,
@@ -2203,14 +2203,7 @@ fn verify_apply(
             ResultCardinality::OperandPlusOne(position) => {
                 let cardinality = match operand_cardinality(position) {
                     Some(Cardinality::StaticVector(length)) => {
-                        Cardinality::StaticVector(length.checked_add(1).ok_or_else(|| {
-                            malformed(
-                                Invariant::RangeOverflow,
-                                RecordKind::Node,
-                                Some(node_index),
-                                "result_cardinality",
-                            )
-                        })?)
+                        Cardinality::StaticVector(checked_plus_one_cardinality(length, node_index)?)
                     }
                     Some(Cardinality::DynamicVector) => Cardinality::DynamicVector,
                     _ => {
@@ -2241,6 +2234,17 @@ fn verify_apply(
         ));
     }
     Ok(())
+}
+
+fn checked_plus_one_cardinality(length: u32, node_index: u32) -> Result<u32, VerifyError> {
+    length.checked_add(1).ok_or_else(|| {
+        malformed(
+            Invariant::RangeOverflow,
+            RecordKind::Node,
+            Some(node_index),
+            "result_cardinality",
+        )
+    })
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -3403,6 +3407,16 @@ mod tests {
         ) {
             Ok(program) => program.raw,
             Err(error) => panic!("foldl fixture did not lower: {error}"),
+        }
+    }
+
+    fn scanl_program() -> RawProgram {
+        match crate::lowering::compile_source_with_name(
+            "scanl[@sub 20 (3 4 5)]\n",
+            "scanl.faraweave",
+        ) {
+            Ok(program) => program.raw,
+            Err(error) => panic!("scanl fixture did not lower: {error}"),
         }
     }
 
@@ -5218,6 +5232,73 @@ mod tests {
         };
         *operation_reference = Some(OperationReferenceIndex(0));
         verify_error(unexpected_reference, Invariant::InvalidRecord);
+    }
+
+    #[test]
+    fn scanl_plan_reducer_reference_and_plus_one_cardinality_are_verified() {
+        assert!(scanl_program().verify().is_ok());
+        assert!(matches!(
+            checked_plus_one_cardinality(u32::MAX, 7),
+            Err(VerifyError::MalformedProgram(MalformedProgram {
+                invariant: Invariant::RangeOverflow,
+                record: RecordKind::Node,
+                index: Some(7),
+                field: "result_cardinality",
+            }))
+        ));
+
+        let mut missing_reference = scanl_program();
+        let Some(node) = missing_reference.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 28,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing scanl node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut operation_reference,
+            ..
+        } = node.kind
+        else {
+            panic!("scanl node kind changed");
+        };
+        *operation_reference = None;
+        verify_error(missing_reference, Invariant::InvalidRecord);
+
+        let mut incompatible_reducer = scanl_program();
+        incompatible_reducer.operation_references[0] = OperationReference {
+            primitive_id: 8,
+            signature_id: 16,
+            implementation_id: 16,
+            origin: incompatible_reducer.operation_references[0].origin,
+        };
+        verify_error(incompatible_reducer, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_plan = scanl_program();
+        let Some(node) = wrong_plan.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 28,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing scanl node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut application_plan_id,
+            ..
+        } = node.kind
+        else {
+            panic!("scanl node kind changed");
+        };
+        *application_plan_id = 9;
+        verify_error(wrong_plan, Invariant::InvalidSemanticIdentity);
     }
 
     #[test]

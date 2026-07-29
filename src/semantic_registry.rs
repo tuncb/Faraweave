@@ -71,6 +71,7 @@ pub(crate) enum StructuralBehavior {
     VectorAnyOf,
     VectorNoneOf,
     Foldl,
+    Scanl,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +106,9 @@ pub(crate) enum ScalarKernel {
     FoldlBool,
     FoldlInt,
     FoldlDouble,
+    ScanlBool,
+    ScanlInt,
+    ScanlDouble,
     EqualsBool,
     EqualsInt,
     EqualsDouble,
@@ -171,10 +175,10 @@ enum RegistryValidationError {
     InconsistentApplicationPlanIdentity,
 }
 
-const PRIMITIVE_COUNT: u16 = 27;
-const SIGNATURE_COUNT: u16 = 50;
-const IMPLEMENTATION_COUNT: u16 = 50;
-const APPLICATION_PLAN_COUNT: u16 = 9;
+const PRIMITIVE_COUNT: u16 = 28;
+const SIGNATURE_COUNT: u16 = 53;
+const IMPLEMENTATION_COUNT: u16 = 53;
+const APPLICATION_PLAN_COUNT: u16 = 10;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
     OperandDescriptor {
@@ -285,6 +289,14 @@ const FOLDL_PLAN: ApplicationPlan = ApplicationPlan {
     },
 };
 
+const SCANL_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(10),
+    result_cardinality: ResultCardinality::OperandPlusOne(2),
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::OperandCardinality(2),
+    },
+};
+
 const APPLICATION_PLANS: &[ApplicationPlan] = &[
     ELEMENTWISE_PLAN,
     IOTA_PLAN,
@@ -295,6 +307,7 @@ const APPLICATION_PLANS: &[ApplicationPlan] = &[
     ANY_OF_PLAN,
     NONE_OF_PLAN,
     FOLDL_PLAN,
+    SCANL_PLAN,
 ];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
@@ -848,6 +861,23 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         FOLDL_PLAN,
         FoldlDouble
     ),
+    descriptor!(
+        28, "scanl", 51, 51, FOLDL_BOOL, Bool, Scanl, SCANL_PLAN, ScanlBool
+    ),
+    descriptor!(
+        28, "scanl", 52, 52, FOLDL_INT, Int, Scanl, SCANL_PLAN, ScanlInt
+    ),
+    descriptor!(
+        28,
+        "scanl",
+        53,
+        53,
+        FOLDL_DOUBLE,
+        Double,
+        Scanl,
+        SCANL_PLAN,
+        ScanlDouble
+    ),
 ];
 
 impl PrimitiveId {
@@ -1188,6 +1218,9 @@ mod tests {
             (27, "foldl"),
             (27, "foldl"),
             (27, "foldl"),
+            (28, "scanl"),
+            (28, "scanl"),
+            (28, "scanl"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1212,6 +1245,7 @@ mod tests {
         assert_eq!(primitive_from_name("any_of"), primitive_from_numeric(25));
         assert_eq!(primitive_from_name("none_of"), primitive_from_numeric(26));
         assert_eq!(primitive_from_name("foldl"), primitive_from_numeric(27));
+        assert_eq!(primitive_from_name("scanl"), primitive_from_numeric(28));
         assert_eq!(
             signature_from_numeric(36).map(|descriptor| descriptor.primitive_name),
             Ok("div")
@@ -1277,6 +1311,14 @@ mod tests {
             Ok(ScalarKernel::FoldlDouble)
         );
         assert_eq!(
+            signature_from_numeric(53).map(|descriptor| descriptor.primitive_name),
+            Ok("scanl")
+        );
+        assert_eq!(
+            implementation_from_numeric(53).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::ScanlDouble)
+        );
+        assert_eq!(
             implementation_from_numeric(34).map(|descriptor| descriptor.kernel),
             Ok(ScalarKernel::IotaInt)
         );
@@ -1289,6 +1331,7 @@ mod tests {
         assert_eq!(application_plan_from_numeric(7), Ok(ANY_OF_PLAN));
         assert_eq!(application_plan_from_numeric(8), Ok(NONE_OF_PLAN));
         assert_eq!(application_plan_from_numeric(9), Ok(FOLDL_PLAN));
+        assert_eq!(application_plan_from_numeric(10), Ok(SCANL_PLAN));
         assert!(
             SEMANTIC_REGISTRY
                 .iter()
@@ -1299,6 +1342,19 @@ mod tests {
                             .parameters
                             .iter()
                             .all(|operand| operand.consumption == OperandConsumption::Elementwise)
+                })
+        );
+        assert!(
+            SEMANTIC_REGISTRY
+                .iter()
+                .filter(|descriptor| descriptor.behavior == StructuralBehavior::Scanl)
+                .all(|descriptor| {
+                    descriptor.application_plan == SCANL_PLAN
+                        && descriptor.parameters.len() == 2
+                        && descriptor.parameters[0].element_type == descriptor.result
+                        && descriptor.parameters[0].consumption == OperandConsumption::Elementwise
+                        && descriptor.parameters[1].element_type == descriptor.result
+                        && descriptor.parameters[1].consumption == OperandConsumption::WholeVector
                 })
         );
         assert!(
@@ -1386,15 +1442,15 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(51),
+            signature_from_numeric(54),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(51),
+            implementation_from_numeric(54),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
-            application_plan_from_numeric(10),
+            application_plan_from_numeric(11),
             Err(RegistryLookupError::ApplicationPlanId)
         );
     }
@@ -1592,6 +1648,7 @@ mod tests {
                     ANY_OF_PLAN,
                     NONE_OF_PLAN,
                     FOLDL_PLAN,
+                    SCANL_PLAN,
                     IOTA_PLAN,
                 ],
             ),

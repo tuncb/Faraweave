@@ -26,6 +26,8 @@ static ALL_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Ve
 static ANY_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static NONE_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static FOLDL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static SCANL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static SCANL_FAULT_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
@@ -127,6 +129,34 @@ fn observe_none_of_resource_event(event: &faraweave::ResourceEvent<'_>) {
 
 fn observe_foldl_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = FOLDL_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_scanl_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = SCANL_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_scanl_fault_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = SCANL_FAULT_RESOURCE_EVENTS.lock() {
         events.push(ObservedResourceEvent {
             kind: event.kind,
             producer: event.producer.to_owned(),
@@ -1290,6 +1320,138 @@ fn foldl_empty_allocation_and_work_refusal_precedence_are_exact() {
     assert_eq!(resource(&refusal).usage_before, Some(0));
     assert_eq!(resource(&refusal).refused_charge, Some(1));
     let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn scanl_admits_n_plus_one_output_before_population_with_input_live() {
+    SCANL_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let result = faraweave::evaluate_expression_with_observer(
+        "scanl[@sub 20 (3 4 5)]",
+        EvaluationConfiguration::default(),
+        observe_scanl_resource_event,
+    )
+    .expect("scanl reduction");
+    assert_eq!(result.value, Value::IntVector(vec![20, 17, 13, 8]));
+    assert_eq!(result.usage.live_evaluation_bytes, 32);
+    assert_eq!(result.usage.peak_live_evaluation_bytes, 56);
+    assert_eq!(result.usage.work_units, 3);
+    assert_eq!(result.usage.allocation_attempts, 2);
+    let events = SCANL_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[0].bytes, Some(24));
+    assert_eq!(events[0].ordinal, Some(0));
+    assert_eq!(events[1].producer, "scanl");
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].bytes, Some(32));
+    assert_eq!(events[1].work, 3);
+    assert_eq!(events[1].ordinal, Some(1));
+    assert_eq!(events[1].usage.live_evaluation_bytes, 56);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].bytes, Some(24));
+    assert_eq!(events[2].usage.live_evaluation_bytes, 32);
+
+    let empty = evaluate_expression_with_configuration(
+        "scanl[@add 7 Int()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty scan allocates only its one-element output");
+    assert_eq!(empty.value, Value::IntVector(vec![7]));
+    assert_eq!(empty.usage.live_evaluation_bytes, 8);
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 1);
+}
+
+#[test]
+fn scanl_fault_releases_output_before_input_and_retains_full_work() {
+    SCANL_FAULT_RESOURCE_EVENTS
+        .lock()
+        .expect("event lock")
+        .clear();
+    let fault = faraweave::evaluate_expression_with_observer(
+        "scanl[@div 10 (0 2)]",
+        EvaluationConfiguration::default(),
+        observe_scanl_fault_resource_event,
+    )
+    .expect_err("first reducer step faults after output allocation");
+    assert_eq!(fault.kind, ErrorKind::DomainError);
+    assert_eq!(
+        fault
+            .domain
+            .as_ref()
+            .and_then(|domain| domain.element_index),
+        Some(0)
+    );
+    let usage = fault.usage.expect("post-cleanup scanl usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.peak_live_evaluation_bytes, 40);
+    assert_eq!(usage.work_units, 2);
+    assert_eq!(usage.allocation_attempts, 2);
+    let events = SCANL_FAULT_RESOURCE_EVENTS
+        .lock()
+        .expect("event lock")
+        .clone();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[1].producer, "scanl");
+    assert_eq!(events[1].bytes, Some(24));
+    assert_eq!(events[1].work, 2);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].bytes, Some(24));
+    assert_eq!(events[2].usage.live_evaluation_bytes, 16);
+    assert_eq!(events[3].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[3].bytes, Some(16));
+    assert_eq!(events[3].usage.live_evaluation_bytes, 0);
+}
+
+#[test]
+fn scanl_output_allocation_and_work_refusals_precede_reducer_steps() {
+    let allocation = evaluate_expression_with_configuration(
+        "scanl[@div 10 (0 2)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("scan output allocation refusal");
+    assert_eq!(allocation.kind, ErrorKind::ResourceError);
+    assert_eq!(allocation.primitive.as_deref(), Some("scanl"));
+    assert_eq!(
+        resource(&allocation).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(resource(&allocation).requested_elements, Some(3));
+    assert_eq!(resource(&allocation).requested_bytes, Some(24));
+    let usage = allocation.usage.expect("post-cleanup allocation usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 2);
+
+    let work = evaluate_expression_with_configuration(
+        "scanl[@div 10 (0 2 3)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("full scan work refusal");
+    assert_eq!(work.kind, ErrorKind::ResourceError);
+    assert_eq!(work.primitive.as_deref(), Some("scanl"));
+    assert_eq!(resource(&work).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&work).usage_before, Some(0));
+    assert_eq!(resource(&work).refused_charge, Some(3));
+    let usage = work.usage.expect("post-cleanup work usage");
     assert_eq!(usage.live_evaluation_bytes, 0);
     assert_eq!(usage.work_units, 0);
     assert_eq!(usage.allocation_attempts, 1);

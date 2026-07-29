@@ -1,6 +1,6 @@
 use crate::evaluator::{EvaluationConfiguration, ProgramResult};
 use crate::primitive::{
-    SelectedApplicationArgument, apply_foldl_implementation, apply_implementation,
+    SelectedApplicationArgument, apply_implementation, apply_reducer_consumer_implementation,
     implementation_name,
 };
 use crate::resources::ResourceContext;
@@ -266,7 +266,7 @@ impl<'a> Interpreter<'a> {
                 .get(reference_index.0 as usize)
                 .ok_or_else(|| execution_invariant_error(location))?;
             let reference_location = self.origin_location(reference.origin)?;
-            apply_foldl_implementation(
+            apply_reducer_consumer_implementation(
                 implementation_id,
                 application_plan_id,
                 &reference,
@@ -1038,6 +1038,8 @@ mod tests {
             ("none_of[(false true false)]\n", vec![]),
             ("foldl[@sub 20 (3 4 5)]\n", vec![]),
             ("foldl[@add 1 (2.5 3.5)]\n", vec![]),
+            ("scanl[@sub 20 (3 4 5)]\n", vec![]),
+            ("scanl[@add 1 (2.5 3.5)]\n", vec![]),
             ("add [1 2]\n", vec![]),
             ("[1 (2 3) true]\n", vec![]),
             ("fanout[iota[3] {inc[_]} {add[_ 10]}]\n", vec![]),
@@ -1092,6 +1094,9 @@ mod tests {
             "foldl[@and true (true false)]\n",
             "foldl[@sub 10 (1 2)]\n",
             "foldl[@add 1 (2.0 3.0)]\n",
+            "scanl[@and true (true false)]\n",
+            "scanl[@sub 10 (1 2)]\n",
+            "scanl[@add 1 (2.0 3.0)]\n",
             "equals[true false]\n",
             "equals[1 2]\n",
             "equals[1.0 2.0]\n",

@@ -1409,12 +1409,16 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                     {
                         return Err(record_error(nodes, index, 24, "semantic_id"));
                     }
-                    let is_foldl = implementation_descriptor.is_ok_and(|descriptor| {
-                        descriptor.behavior == crate::semantic_registry::StructuralBehavior::Foldl
+                    let is_reducer_consumer = implementation_descriptor.is_ok_and(|descriptor| {
+                        matches!(
+                            descriptor.behavior,
+                            crate::semantic_registry::StructuralBehavior::Foldl
+                                | crate::semantic_registry::StructuralBehavior::Scanl
+                        )
                     });
                     let reference_count =
                         section(plan, 18).map_or(0, |references| references.record_count());
-                    if is_foldl {
+                    if is_reducer_consumer {
                         let reference = arguments[7];
                         if !explicit_operation_references
                             || reference == 0
@@ -2898,6 +2902,13 @@ mod tests {
         ))
     }
 
+    fn scanl_program() -> VerifiedProgram {
+        must(crate::lowering::compile_source_with_name(
+            "scanl[@sub 20 (3 4 5)]\n",
+            "scanl.faraweave",
+        ))
+    }
+
     fn planned_program_with_features(
         depth: u32,
         explicit_application_plans: bool,
@@ -3408,6 +3419,71 @@ mod tests {
 
         let mut wrong_plan = encoded.clone();
         put_u16_at(&mut wrong_plan, plans + 4, 8);
+        assert_noncanonical_record(&wrong_plan, "application_plan_id", plans + 4, 17, Some(0));
+
+        let mut incompatible_reference = encoded;
+        put_u16_at(&mut incompatible_reference, references, 8);
+        put_u16_at(&mut incompatible_reference, references + 2, 16);
+        put_u16_at(&mut incompatible_reference, references + 4, 16);
+        assert!(matches!(
+            decode_fwir(&incompatible_reference, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                    crate::MalformedProgram {
+                        invariant: crate::Invariant::InvalidSemanticIdentity,
+                        record: crate::RecordKind::Node,
+                        field: "operation_reference",
+                        ..
+                    }
+                )),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn scanl_plan_and_reducer_link_roundtrip_and_reject_malformed_records() {
+        let encoded = must(encode_fwir(&scanl_program(), &FwirEncodeOptions::default()));
+        let (_, plans, plans_length) = test_section(&encoded, 17);
+        assert_eq!(plans_length, 8);
+        assert_eq!(read_u16(&encoded, plans + 4, Some(17), Some(0)), Ok(10));
+        let (_, references, references_length) = test_section(&encoded, 18);
+        assert_eq!(references_length, 16);
+        let (_, nodes, nodes_length) = test_section(&encoded, 14);
+        let scanl_node = encoded[nodes..nodes + nodes_length]
+            .chunks_exact(56)
+            .position(|record| record[0] == 4 && test_u32(record, 24) == 28)
+            .map(|index| nodes + index * 56)
+            .unwrap_or(nodes);
+        assert_eq!(read_u32(&encoded, scanl_node + 52, Some(14), None), Ok(1));
+        let decoded = must(decode_fwir(&encoded, &FwirDecodeLimits::default()));
+        assert_eq!(
+            must(encode_fwir(&decoded, &FwirEncodeOptions::default())),
+            encoded
+        );
+
+        let mut missing_reference = encoded.clone();
+        put_u32_at(&mut missing_reference, scanl_node + 52, 0);
+        assert_noncanonical_record(
+            &missing_reference,
+            "operation_reference",
+            scanl_node + 52,
+            14,
+            Some(((scanl_node - nodes) / 56) as u32),
+        );
+
+        let mut out_of_bounds = encoded.clone();
+        put_u32_at(&mut out_of_bounds, scanl_node + 52, 2);
+        assert_noncanonical_record(
+            &out_of_bounds,
+            "operation_reference",
+            scanl_node + 52,
+            14,
+            Some(((scanl_node - nodes) / 56) as u32),
+        );
+
+        let mut wrong_plan = encoded.clone();
+        put_u16_at(&mut wrong_plan, plans + 4, 9);
         assert_noncanonical_record(&wrong_plan, "application_plan_id", plans + 4, 17, Some(0));
 
         let mut incompatible_reference = encoded;

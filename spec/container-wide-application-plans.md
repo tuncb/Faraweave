@@ -73,8 +73,9 @@ physical format minor 1. With that feature, mandatory section
 `node:u32`, `application_plan_id:u16`, and `reserved:u16`. Every SelectedApply
 has exactly one nonzero plan record and the reserved field is zero.
 
-`NODE.a7` remains zero except for a `foldl` SelectedApply under feature 6,
-where it is the one-based index of the selected reducer's `OPRF` record.
+`NODE.a7` remains zero except for a `foldl` or `scanl` SelectedApply under
+feature 6, where it is the one-based index of the selected reducer's `OPRF`
+record.
 Semantic/format 1.0 artifacts omit
 section 17, retain their exact canonical bytes, and keep their previous
 behavior. A 1.0 decoder path reconstructs plan ID 1 or 2
@@ -222,6 +223,28 @@ charged before step zero, the first reducer fault records its zero-based step
 and operands, and the scalar result creates no byte admission or allocation
 attempt.
 
+## Seed-inclusive left scan (`FWIR-PLAN-012`)
+
+Primitive ID `28=scanl` has Bool, Int, and Double signatures with matching
+signature/implementation IDs 51, 52, and 53. It accepts the same initializer
+and whole-vector runtime operands and the same lowering-selected closed
+`T × T -> T` OPRF reducer as `foldl`; application-plan ID 10 returns
+`OperandPlusOne(2)` elements and admits `OperandCardinality(2)` work.
+
+Evaluation checks `n + 1`, output byte sizing, prospective live bytes, work,
+and the output allocation ordinal before physical allocation and population.
+It then writes the converted initializer at result index zero and stores each
+strict left accumulator at the next index, so empty input returns `[init]` and
+a reducer fault reports its zero-based input step.
+
+The output is live together with the input during every reducer step. On a
+fault, the output allocation is released first, followed by the ordinary
+reverse input cleanup; completed work stays committed, no uninitialized value
+is observed, and generated C follows the same admission and cleanup order.
+The semantic initialized prefix is the seed plus completed accumulators;
+homogeneous scalar-vector slots own no child resources, so prefix cleanup is
+the single output-buffer release rather than per-element release events.
+
 ## Evidence (`FWIR-PLAN-004`)
 
 Registry unit tests cover stable plan lookup and changed operand/plan
@@ -273,3 +296,11 @@ Issue #46 maps `FWIR-PLAN-011` to
 `foldl_reports_the_leftmost_reducer_fault_with_step_operands_and_reference_origin`,
 `foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly`,
 and the strict C11 success/failure journeys.
+Issue #47 maps `FWIR-PLAN-012` to
+`scanl_records_reducer_identity_initializer_conversion_and_plus_one_plan`,
+`scanl_roundtrips_reducer_links_plus_one_shape_and_direct_dispatch`,
+`scanl_is_seed_inclusive_for_all_types_empty_dynamic_and_non_associative_inputs`,
+`scanl_reports_the_leftmost_reducer_fault_and_initialized_prefix`,
+`scanl_admits_n_plus_one_output_before_population_with_input_live`,
+`scanl_fault_releases_output_before_input_and_retains_full_work`, and the
+strict C11 success/failure journeys.
