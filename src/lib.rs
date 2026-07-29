@@ -67,6 +67,8 @@ pub use resources::{
     AllocationFailureInjection, ExecutionProfile, ResourceEvent, ResourceEventKind, ResourceLimits,
     ResourceObserver, ResourceUsage,
 };
+#[doc(hidden)]
+pub use semantic_registry::{InternalRegistryDiagnosticError, write_internal_registry_diagnostics};
 pub use typed_program::{
     Arena, BuildError, Cardinality, ConstantIndex, ConstantRecord, Conversion, Edge, FanOutBranch,
     Feature, IndexRange, Invariant, LiftMode, MalformedProgram, ModuleMetadata, Node, NodeIndex,
