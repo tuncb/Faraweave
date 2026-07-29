@@ -66,6 +66,7 @@ pub(crate) enum ScalarKernel {
     TanDouble,
     FloorDouble,
     CeilDouble,
+    TruncDouble,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,8 +106,8 @@ enum RegistryValidationError {
     InconsistentImplementationIdentity,
 }
 
-const SIGNATURE_COUNT: u16 = 43;
-const IMPLEMENTATION_COUNT: u16 = 43;
+const SIGNATURE_COUNT: u16 = 44;
+const IMPLEMENTATION_COUNT: u16 = 44;
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
 pub(crate) const BACKEND_NATIVE_MATH_LAST_PRIMITIVE_ID: u16 = 38;
@@ -310,6 +311,16 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         FloorDouble
     ),
     descriptor!(37, "ceil", 43, 43, DOUBLE1, Double, Elementwise, CeilDouble),
+    descriptor!(
+        38,
+        "trunc",
+        44,
+        44,
+        DOUBLE1,
+        Double,
+        Elementwise,
+        TruncDouble
+    ),
 ];
 
 impl PrimitiveId {
@@ -544,6 +555,7 @@ mod tests {
             (35, "tan"),
             (36, "floor"),
             (37, "ceil"),
+            (38, "trunc"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -641,6 +653,14 @@ mod tests {
             Ok(ScalarKernel::CeilDouble)
         );
         assert_eq!(
+            signature_from_numeric(44).map(|descriptor| descriptor.primitive_name),
+            Ok("trunc")
+        );
+        assert_eq!(
+            implementation_from_numeric(44).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::TruncDouble)
+        );
+        assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
         );
@@ -649,11 +669,11 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(44),
+            signature_from_numeric(45),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(44),
+            implementation_from_numeric(45),
             Err(RegistryLookupError::ImplementationId)
         );
     }

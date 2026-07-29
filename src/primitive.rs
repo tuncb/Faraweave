@@ -339,6 +339,9 @@ fn invoke_kernel(
         (ScalarKernel::CeilDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_ceil(*value)))
         }
+        (ScalarKernel::TruncDouble, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_trunc(*value)))
+        }
         (ScalarKernel::IotaInt, _) => None,
         _ => None,
     };
