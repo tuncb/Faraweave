@@ -155,6 +155,26 @@ impl ResourceContext {
         self.admit_request(None, 0, amount, Some(amount), None, location, producer)
     }
 
+    pub(crate) fn size_overflow(
+        &self,
+        requested_elements: Option<usize>,
+        location: SourceLocation,
+        producer: &str,
+    ) -> Error {
+        self.refusal(
+            ResourceErrorReason::SizeOverflow,
+            location,
+            producer,
+            requested_elements,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
     pub(crate) fn admit_vector(
         &mut self,
         element_type: crate::ScalarType,
