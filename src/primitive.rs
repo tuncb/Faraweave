@@ -772,6 +772,9 @@ fn invoke_kernel(
         (ScalarKernel::SinDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_sin(*value)))
         }
+        (ScalarKernel::CosDouble, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_cos(*value)))
+        }
         (
             ScalarKernel::DivInt
             | ScalarKernel::LengthBoolVector
