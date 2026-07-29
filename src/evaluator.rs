@@ -262,6 +262,7 @@ mod tests {
             ("sqrt[9]", "3.0"),
             ("exp[0]", "1.0"),
             ("log[1]", "0.0"),
+            ("log10[1]", "0.0"),
         ];
         for (source, expected) in cases {
             let value = evaluate_expression(source).expect(source).value;
