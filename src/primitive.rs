@@ -318,6 +318,9 @@ fn invoke_kernel(
         (ScalarKernel::ExpDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_exp(*value)))
         }
+        (ScalarKernel::LogDouble, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_log(*value)))
+        }
         (ScalarKernel::IotaInt, _) => None,
         _ => None,
     };
