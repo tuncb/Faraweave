@@ -9,5 +9,6 @@ sum iota count
 all_of equals[iota count iota count]
 any_of equals[iota count iota count]
 none_of not equals[iota count iota count]
+foldl[@add 0 iota[count]]
 add[ratio count]
 not[enabled]

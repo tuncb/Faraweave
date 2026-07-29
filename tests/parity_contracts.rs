@@ -505,6 +505,153 @@ fn sum_double_is_left_to_right_strict_and_preserves_special_value_bits() {
 }
 
 #[test]
+fn foldl_accepts_bool_int_double_empty_dynamic_and_non_associative_reducers() {
+    for (source, expected) in [
+        ("foldl[@and true Bool()]", "true"),
+        ("foldl[@and true (true false true)]", "false"),
+        ("foldl[@or false (false true false)]", "true"),
+        ("foldl[@sub 20 Int()]", "20"),
+        ("foldl[@sub 20 (3)]", "17"),
+        ("foldl[@sub 20 (3 4 5)]", "8"),
+        ("foldl[@div 100 (2 5)]", "10"),
+        ("foldl[@sub 20.0 (3.0 4.0 5.0)]", "8.0"),
+        ("foldl[@add 1 (2.5 3.5)]", "7.0"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    for (count, expected) in [(0, 10), (1, 9), (4, 0)] {
+        let result = faraweave::evaluate_source_with_arguments(
+            "parameters[n Int]\nfoldl[@sub 10 iota[n]]\n",
+            &[Value::Int(count)],
+            EvaluationConfiguration::default(),
+        )
+        .expect("dynamic parameterized foldl");
+        assert_eq!(result.values, [Value::Int(expected)], "count {count}");
+    }
+}
+
+#[test]
+fn foldl_rejects_invalid_references_and_runtime_operand_types_statically() {
+    for (source, kind, primitive, message) in [
+        (
+            "foldl[@missing 0 (1 2)]",
+            ErrorKind::UnknownPrimitive,
+            "missing",
+            "@missing is not a registered built-in operation",
+        ),
+        (
+            "foldl[@not 0 (1 2)]",
+            ErrorKind::ArityError,
+            "not",
+            "@not referenced operation has incompatible arity",
+        ),
+        (
+            "foldl[@foldl 0 (1 2)]",
+            ErrorKind::TypeError,
+            "foldl",
+            "@foldl referenced operation has unsupported structural behavior",
+        ),
+        (
+            "foldl[@equals 0 (1 2)]",
+            ErrorKind::TypeError,
+            "equals",
+            "@equals referenced operation has no compatible signature",
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some(primitive), "{source}");
+        assert_eq!(error.message, message, "{source}");
+        assert_eq!(error.location.line, 1, "{source}");
+        assert_eq!(error.location.column, 8, "{source}");
+    }
+
+    for (source, position, column, actual_types) in [
+        (
+            "foldl[@add true (1 2)]",
+            3,
+            17,
+            vec![
+                Type::Scalar(ScalarType::Bool),
+                Type::Vector(ScalarType::Int),
+            ],
+        ),
+        (
+            "foldl[@add 0 true]",
+            3,
+            14,
+            vec![
+                Type::Scalar(ScalarType::Int),
+                Type::Scalar(ScalarType::Bool),
+            ],
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("foldl"), "{source}");
+        assert_eq!(error.argument_position, Some(position), "{source}");
+        assert_eq!(error.location.column, column, "{source}");
+        assert_eq!(error.actual_types, actual_types, "{source}");
+        assert_eq!(
+            error.message,
+            format!(
+                "foldl arguments do not match an accepted signature; first unsupported argument is {position}"
+            ),
+            "{source}"
+        );
+    }
+
+    let misplaced = evaluate_expression("@add").expect_err("standalone reference");
+    assert_eq!(misplaced.kind, ErrorKind::SyntaxError);
+    assert_eq!(
+        misplaced.message,
+        "built-in operation reference is not accepted in this position"
+    );
+}
+
+#[test]
+fn foldl_reports_the_leftmost_reducer_fault_with_step_operands_and_reference_origin() {
+    for (source, reason, expected_index, expected_operands) in [
+        (
+            "foldl[@add 9223372036854775806 (1 1 -1)]",
+            DomainErrorReason::IntegerOverflow,
+            1,
+            vec![Value::Int(i64::MAX), Value::Int(1)],
+        ),
+        (
+            "foldl[@div 100 (2 0 5)]",
+            DomainErrorReason::DivisionByZero,
+            1,
+            vec![Value::Int(50), Value::Int(0)],
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::DomainError, "{source}");
+        assert_eq!(
+            error.primitive.as_deref(),
+            Some(if reason == DomainErrorReason::IntegerOverflow {
+                "add"
+            } else {
+                "div"
+            })
+        );
+        assert_eq!(error.location.column, 7, "{source}");
+        let domain = error.domain.expect("structured foldl reducer fault");
+        assert_eq!(domain.reason, reason);
+        assert_eq!(domain.result_type, ScalarType::Int);
+        assert_eq!(domain.operands, expected_operands);
+        assert_eq!(domain.element_index, Some(expected_index));
+    }
+
+    assert_eq!(
+        formatted("foldl[@div 7 Int()]"),
+        "7",
+        "empty fold must not invoke its reducer"
+    );
+}
+
+#[test]
 fn all_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_false_position() {
     assert_eq!(formatted("all_of[Bool()]"), "true");
     assert_eq!(formatted("all_of[(true true true true)]"), "true");

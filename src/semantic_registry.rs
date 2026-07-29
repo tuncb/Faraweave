@@ -70,6 +70,7 @@ pub(crate) enum StructuralBehavior {
     VectorAllOf,
     VectorAnyOf,
     VectorNoneOf,
+    Foldl,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +102,9 @@ pub(crate) enum ScalarKernel {
     AllOfBoolVector,
     AnyOfBoolVector,
     NoneOfBoolVector,
+    FoldlBool,
+    FoldlInt,
+    FoldlDouble,
     EqualsBool,
     EqualsInt,
     EqualsDouble,
@@ -167,10 +171,10 @@ enum RegistryValidationError {
     InconsistentApplicationPlanIdentity,
 }
 
-const PRIMITIVE_COUNT: u16 = 26;
-const SIGNATURE_COUNT: u16 = 47;
-const IMPLEMENTATION_COUNT: u16 = 47;
-const APPLICATION_PLAN_COUNT: u16 = 8;
+const PRIMITIVE_COUNT: u16 = 27;
+const SIGNATURE_COUNT: u16 = 50;
+const IMPLEMENTATION_COUNT: u16 = 50;
+const APPLICATION_PLAN_COUNT: u16 = 9;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
     OperandDescriptor {
@@ -198,6 +202,16 @@ const BOOL2: &[OperandDescriptor] = &[elementwise(ScalarType::Bool), elementwise
 const WHOLE_BOOL1: &[OperandDescriptor] = &[whole_vector(ScalarType::Bool)];
 const WHOLE_INT1: &[OperandDescriptor] = &[whole_vector(ScalarType::Int)];
 const WHOLE_DOUBLE1: &[OperandDescriptor] = &[whole_vector(ScalarType::Double)];
+const FOLDL_BOOL: &[OperandDescriptor] = &[
+    elementwise(ScalarType::Bool),
+    whole_vector(ScalarType::Bool),
+];
+const FOLDL_INT: &[OperandDescriptor] =
+    &[elementwise(ScalarType::Int), whole_vector(ScalarType::Int)];
+const FOLDL_DOUBLE: &[OperandDescriptor] = &[
+    elementwise(ScalarType::Double),
+    whole_vector(ScalarType::Double),
+];
 
 const ELEMENTWISE_PLAN: ApplicationPlan = ApplicationPlan {
     id: ApplicationPlanId(1),
@@ -263,6 +277,14 @@ const NONE_OF_PLAN: ApplicationPlan = ApplicationPlan {
     },
 };
 
+const FOLDL_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(9),
+    result_cardinality: ResultCardinality::Scalar,
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::OperandCardinality(2),
+    },
+};
+
 const APPLICATION_PLANS: &[ApplicationPlan] = &[
     ELEMENTWISE_PLAN,
     IOTA_PLAN,
@@ -272,6 +294,7 @@ const APPLICATION_PLANS: &[ApplicationPlan] = &[
     ALL_OF_PLAN,
     ANY_OF_PLAN,
     NONE_OF_PLAN,
+    FOLDL_PLAN,
 ];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
@@ -808,6 +831,23 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         NONE_OF_PLAN,
         NoneOfBoolVector
     ),
+    descriptor!(
+        27, "foldl", 48, 48, FOLDL_BOOL, Bool, Foldl, FOLDL_PLAN, FoldlBool
+    ),
+    descriptor!(
+        27, "foldl", 49, 49, FOLDL_INT, Int, Foldl, FOLDL_PLAN, FoldlInt
+    ),
+    descriptor!(
+        27,
+        "foldl",
+        50,
+        50,
+        FOLDL_DOUBLE,
+        Double,
+        Foldl,
+        FOLDL_PLAN,
+        FoldlDouble
+    ),
 ];
 
 impl PrimitiveId {
@@ -1145,6 +1185,9 @@ mod tests {
             (24, "all_of"),
             (25, "any_of"),
             (26, "none_of"),
+            (27, "foldl"),
+            (27, "foldl"),
+            (27, "foldl"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1168,6 +1211,7 @@ mod tests {
         assert_eq!(primitive_from_name("all_of"), primitive_from_numeric(24));
         assert_eq!(primitive_from_name("any_of"), primitive_from_numeric(25));
         assert_eq!(primitive_from_name("none_of"), primitive_from_numeric(26));
+        assert_eq!(primitive_from_name("foldl"), primitive_from_numeric(27));
         assert_eq!(
             signature_from_numeric(36).map(|descriptor| descriptor.primitive_name),
             Ok("div")
@@ -1225,6 +1269,14 @@ mod tests {
             Ok(ScalarKernel::NoneOfBoolVector)
         );
         assert_eq!(
+            signature_from_numeric(50).map(|descriptor| descriptor.primitive_name),
+            Ok("foldl")
+        );
+        assert_eq!(
+            implementation_from_numeric(50).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::FoldlDouble)
+        );
+        assert_eq!(
             implementation_from_numeric(34).map(|descriptor| descriptor.kernel),
             Ok(ScalarKernel::IotaInt)
         );
@@ -1236,6 +1288,7 @@ mod tests {
         assert_eq!(application_plan_from_numeric(6), Ok(ALL_OF_PLAN));
         assert_eq!(application_plan_from_numeric(7), Ok(ANY_OF_PLAN));
         assert_eq!(application_plan_from_numeric(8), Ok(NONE_OF_PLAN));
+        assert_eq!(application_plan_from_numeric(9), Ok(FOLDL_PLAN));
         assert!(
             SEMANTIC_REGISTRY
                 .iter()
@@ -1246,6 +1299,19 @@ mod tests {
                             .parameters
                             .iter()
                             .all(|operand| operand.consumption == OperandConsumption::Elementwise)
+                })
+        );
+        assert!(
+            SEMANTIC_REGISTRY
+                .iter()
+                .filter(|descriptor| descriptor.behavior == StructuralBehavior::Foldl)
+                .all(|descriptor| {
+                    descriptor.application_plan == FOLDL_PLAN
+                        && descriptor.parameters.len() == 2
+                        && descriptor.parameters[0].element_type == descriptor.result
+                        && descriptor.parameters[0].consumption == OperandConsumption::Elementwise
+                        && descriptor.parameters[1].element_type == descriptor.result
+                        && descriptor.parameters[1].consumption == OperandConsumption::WholeVector
                 })
         );
         assert!(
@@ -1320,15 +1386,15 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(48),
+            signature_from_numeric(51),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(48),
+            implementation_from_numeric(51),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
-            application_plan_from_numeric(9),
+            application_plan_from_numeric(10),
             Err(RegistryLookupError::ApplicationPlanId)
         );
     }
@@ -1366,7 +1432,7 @@ mod tests {
             Err(RegistryValidationError::DuplicatePrimitiveName)
         );
 
-        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 2];
+        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 3];
         assert_eq!(
             validate_registry(missing),
             Err(RegistryValidationError::MissingPrimitiveId)
@@ -1525,6 +1591,7 @@ mod tests {
                     ALL_OF_PLAN,
                     ANY_OF_PLAN,
                     NONE_OF_PLAN,
+                    FOLDL_PLAN,
                     IOTA_PLAN,
                 ],
             ),

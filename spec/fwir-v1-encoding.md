@@ -204,8 +204,10 @@ outside SelectedApply.
 - SelectedApply: `a0=primitive_id`, `a1=signature_id`,
   `a2=implementation_id`, `a3=primitive_origin`,
   `a4=static_anchor` (`NONE` when absent), `a5=dynamic_check_start`,
-  `a6=dynamic_check_count`, and `a7=0`. Stable semantic IDs fit `u16`, so the
-  upper 16 bits of `a0` through `a2` MUST be zero. Lift adds
+  `a6=dynamic_check_count`, and `a7=operation_reference_plus_one`. The last
+  field is zero for ordinary applications; `foldl` requires feature 6 and
+  stores its zero-based `OPRF` index plus one. Stable semantic IDs fit `u16`,
+  so the upper 16 bits of `a0` through `a2` MUST be zero. Lift adds
   `4=ContainerScalar` and `5=ContainerVector` only under feature 5.
 - FanOut: `a0=branch_start`, `a1=branch_count`,
   `a2=keyword_origin`; `a3` through `a7` are zero.
@@ -226,6 +228,10 @@ reserved:u16, origin:u32, reserved:u32`. Both reserved fields are zero.
 Verification requires the three IDs to identify one closed registered
 elementwise descriptor and requires `origin` to be in range; inconsistent or
 structural identities are malformed rather than runtime-dispatched by name.
+Every `foldl` SelectedApply links exactly one `OPRF` record through nonzero
+`NODE.a7`; the referenced descriptor must have the fold type as both parameter
+types and result type. Non-fold applications require zero, and missing,
+out-of-range, structurally invalid, or type-incompatible links are malformed.
 
 ### 4.6 Producer metadata
 
@@ -253,6 +259,7 @@ asserts provenance but conveys no trust.
 | `constants`, `constant_elements` | `CONS`, `COEL` |
 | `nodes`, except the application-plan sidecar | `NODE` |
 | `SelectedApply.application_plan_id` | `APPL` with feature 5; reconstructed from the validated implementation identity in v1.0 |
+| `SelectedApply.operation_reference` | `NODE.a7 - 1` when nonzero, validated against `OPRF`; zero means absent |
 | `edges`, `shape_checks` | `EDGE`, `SHCK` |
 | `origins` | `ORIG` |
 | `operation_references` | `OPRF` |
@@ -303,6 +310,9 @@ The physical format version and semantic contract version are separate.
 - `OPRF` records or feature `6=OperationReferences` require semantic version
   1.1 and physical format minor 1. Semantic 1.0/physical 1.0 artifacts cannot
   opt into that mandatory sidecar capability.
+- A `foldl` SelectedApply requires feature 6, a nonzero in-range `NODE.a7`,
+  and one compatible stable reducer identity; other applications require
+  `NODE.a7=0`.
 - A lower format minor is accepted when the major matches and every required
   v1 section/record rule used by the artifact is supported.
 

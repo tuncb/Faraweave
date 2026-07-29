@@ -691,6 +691,108 @@ fn none_of_container_plan_roundtrips_and_dispatches_by_its_own_verified_identity
 }
 
 #[test]
+fn foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities() {
+    let source = "parameters[n Int]\n\
+                  foldl[@sub 10 Int()]\n\
+                  foldl[@sub 20 (3 4 5)]\n\
+                  foldl[@add 0 iota[n]]\n\
+                  foldl[@add 1 Double()]\n";
+    let program =
+        compile_source_to_verified_program(source, "foldl.faraweave").expect("compile foldl");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::OperationReferences.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 27,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference,
+                lift,
+                ..
+            } => Some((
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference.map(|index| index.0),
+                lift,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (49, 49, 9, Some(0), LiftMode::ContainerScalar),
+            (49, 49, 9, Some(1), LiftMode::ContainerScalar),
+            (49, 49, 9, Some(2), LiftMode::ContainerScalar),
+            (50, 50, 9, Some(3), LiftMode::ContainerScalar),
+        ]
+    );
+    assert_eq!(
+        program
+            .as_raw()
+            .operation_references
+            .iter()
+            .map(|reference| (
+                reference.primitive_id,
+                reference.signature_id,
+                reference.implementation_id,
+            ))
+            .collect::<Vec<_>>(),
+        [(6, 11, 11), (6, 11, 11), (5, 9, 9), (5, 10, 10)]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode foldl");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified foldl");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode foldl"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct foldl");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded foldl");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["10", "8", "10", "1.0"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_49_opr_0("));
+    assert!(emitted.source.contains("static int fw_impl_49_opr_1("));
+    assert!(emitted.source.contains("static int fw_impl_50_opr_3("));
+    assert!(
+        emitted
+            .source
+            .contains("fw_apply_selected_foldl(fw_kernel_11")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
 fn inspection_is_deterministic_and_carries_exact_binary64_bits() {
     let program = compile_source_to_verified_program("-0.0\nnan\n", "bits.faraweave")
         .expect("compile exact doubles");

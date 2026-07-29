@@ -90,6 +90,7 @@ struct Lowerer {
     needs_spread: bool,
     needs_fan_out: bool,
     needs_application_plans: bool,
+    needs_operation_references: bool,
     needs_backend_native_math: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
@@ -240,10 +241,8 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
     Ok(())
 }
 
-fn operation_reference_position(_consumer: &str, _zero_based_argument: usize) -> bool {
-    // Issue #38 introduces the carrier and resolver but no executable
-    // higher-order consumer. Future consumers extend this closed position map.
-    false
+fn operation_reference_position(consumer: &str, zero_based_argument: usize) -> bool {
+    consumer == "foldl" && zero_based_argument == 0
 }
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
@@ -326,18 +325,28 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
             )?));
         }
     };
-    if descriptors(primitive).any(|descriptor| descriptor.parameters.len() == actual) {
+    let reference_arguments = usize::from(name == "foldl");
+    if descriptors(primitive).any(|descriptor| {
+        descriptor.parameters.len().checked_add(reference_arguments) == Some(actual)
+    }) {
         return Ok(());
     }
     let mut accepted = Vec::new();
     for descriptor in descriptors(primitive) {
-        if !accepted.contains(&descriptor.parameters.len()) {
+        let arity = descriptor
+            .parameters
+            .len()
+            .checked_add(reference_arguments)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Node,
+            }))?;
+        if !accepted.contains(&arity) {
             accepted.try_reserve(1).map_err(|_| {
                 LowerError::Build(BuildError::AllocationUnavailable {
                     arena: crate::Arena::Node,
                 })
             })?;
-            accepted.push(descriptor.parameters.len());
+            accepted.push(arity);
         }
     }
     accepted.sort_unstable();
@@ -464,6 +473,7 @@ fn lower_program_with_builder_and_diagnostics(
         needs_spread: false,
         needs_fan_out: false,
         needs_application_plans: false,
+        needs_operation_references: false,
         needs_backend_native_math: false,
         placeholder: None,
         releases: Vec::new(),
@@ -563,6 +573,12 @@ fn lower_program_with_builder_and_diagnostics(
         lowerer
             .builder
             .push_feature(Feature::ApplicationPlans.numeric())?;
+        lowerer.builder.set_semantic_minor(1);
+    }
+    if lowerer.needs_operation_references {
+        lowerer
+            .builder
+            .push_feature(Feature::OperationReferences.numeric())?;
         lowerer.builder.set_semantic_minor(1);
     }
     if lowerer.needs_backend_native_math {
@@ -705,6 +721,7 @@ impl Lowerer {
                         call_origin,
                         step.span.begin,
                         operands,
+                        None,
                     )?;
                 }
                 Ok(current)
@@ -1063,6 +1080,9 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
+        if name == "foldl" {
+            return self.lower_foldl(arguments, name_span, origin, location);
+        }
         let primitive_origin = self.push_origin(name_span)?;
         let mut lowered = Vec::new();
         lowered.try_reserve(arguments.len()).map_err(|_| {
@@ -1094,7 +1114,54 @@ impl Lowerer {
         for argument in lowered {
             operands.push(CallOperand::Whole(argument));
         }
-        self.lower_selected_call(name, primitive_origin, origin, location, operands)
+        self.lower_selected_call(name, primitive_origin, origin, location, operands, None)
+    }
+
+    fn lower_foldl(
+        &mut self,
+        arguments: &[Expr],
+        name_span: SourceSpan,
+        origin: OriginIndex,
+        location: SourceLocation,
+    ) -> Result<Lowered, LowerError> {
+        let [reference_expression, initializer, vector] = arguments else {
+            return Err(LowerError::Source(Error::new(
+                ErrorKind::ArityError,
+                location,
+                "foldl requires a reducer reference, initializer, and vector",
+            )));
+        };
+        let ExprKind::OperationReference {
+            name: reducer_name,
+            name_span: reducer_name_span,
+        } = &reference_expression.kind
+        else {
+            return Err(LowerError::Source(Error::at_span(
+                ErrorKind::TypeError,
+                reference_expression.span,
+                "foldl argument 1 must be a built-in operation reference",
+            )));
+        };
+        let primitive_origin = self.push_origin(name_span)?;
+        let reference_origin = self.push_origin(reference_expression.span)?;
+        let initializer = self.lower_expr(initializer)?;
+        let vector = self.lower_expr(vector)?;
+        let mut operands = Vec::new();
+        operands.try_reserve_exact(2).map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        operands.push(CallOperand::Whole(initializer));
+        operands.push(CallOperand::Whole(vector));
+        self.lower_selected_call(
+            "foldl",
+            primitive_origin,
+            origin,
+            location,
+            operands,
+            Some((reducer_name, *reducer_name_span, reference_origin)),
+        )
     }
 
     fn lower_prefix_call(
@@ -1154,7 +1221,7 @@ impl Lowerer {
             });
         }
         let result =
-            self.lower_selected_call(name, primitive_origin, origin, location, operands)?;
+            self.lower_selected_call(name, primitive_origin, origin, location, operands, None)?;
         self.set_release(prepare, ReleaseAfter::Node(result.node))?;
         self.needs_spread = true;
         Ok(result)
@@ -1167,8 +1234,36 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
         operands: Vec<CallOperand>,
+        operation_reference: Option<(&str, SourceSpan, OriginIndex)>,
     ) -> Result<Lowered, LowerError> {
-        let descriptor = select_descriptor(name, &operands, location, &mut self.diagnostics)?;
+        let descriptor = if operation_reference.is_some() {
+            select_descriptor_with_argument_offset(
+                name,
+                &operands,
+                location,
+                1,
+                &mut self.diagnostics,
+            )?
+        } else {
+            select_descriptor(name, &operands, location, &mut self.diagnostics)?
+        };
+        let operation_reference =
+            if let Some((reference_name, reference_span, reference_origin)) = operation_reference {
+                let reference = resolve_operation_reference(
+                    reference_name,
+                    reference_span,
+                    reference_origin,
+                    OperationReferenceConstraint {
+                        parameter_types: &[Some(descriptor.result), Some(descriptor.result)],
+                        result_type: Some(descriptor.result),
+                    },
+                    &mut self.diagnostics,
+                )?;
+                self.needs_operation_references = true;
+                Some(self.builder.push_operation_reference(reference)?)
+            } else {
+                None
+            };
         self.needs_application_plans |= descriptor
             .parameters
             .iter()
@@ -1455,6 +1550,7 @@ impl Lowerer {
                 signature_id: descriptor.signature_id.numeric(),
                 implementation_id: descriptor.implementation_id.numeric(),
                 application_plan_id: descriptor.application_plan.id.numeric(),
+                operation_reference,
                 primitive_origin,
                 lift,
                 result_element_type: descriptor.result,
@@ -1757,6 +1853,16 @@ fn select_descriptor(
     location: SourceLocation,
     diagnostics: &mut DiagnosticReservations,
 ) -> Result<&'static SemanticDescriptor, LowerError> {
+    select_descriptor_with_argument_offset(name, operands, location, 0, diagnostics)
+}
+
+fn select_descriptor_with_argument_offset(
+    name: &str,
+    operands: &[CallOperand],
+    location: SourceLocation,
+    argument_offset: usize,
+    diagnostics: &mut DiagnosticReservations,
+) -> Result<&'static SemanticDescriptor, LowerError> {
     let primitive = match primitive_from_name(name) {
         Ok(primitive) => primitive,
         Err(_) => {
@@ -1781,10 +1887,15 @@ fn select_descriptor(
             .first()
             .is_some_and(|operand| !matches!(operand.parts().2, Type::Scalar(_)))
     {
-        let message = unsupported_signature_message(name, 1, diagnostics)?;
+        let source_position = 1_usize.saturating_add(argument_offset);
+        let message = if argument_offset == 0 {
+            unsupported_signature_message(name, 1, diagnostics)?
+        } else {
+            unsupported_signature_message(name, source_position, diagnostics)?
+        };
         let mut error = Error::new(ErrorKind::TypeError, operands[0].parts().6, message);
         error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
-        error.argument_position = Some(1);
+        error.argument_position = Some(source_position);
         error
             .actual_types
             .try_reserve(operands.len())
@@ -1846,14 +1957,15 @@ fn select_descriptor(
             .max()
             .unwrap_or(0);
         let first_unsupported = (matched_prefix + 1).min(operands.len());
-        let message = unsupported_signature_message(name, first_unsupported, diagnostics)?;
+        let source_position = first_unsupported.saturating_add(argument_offset);
+        let message = unsupported_signature_message(name, source_position, diagnostics)?;
         let mut error = Error::new(
             ErrorKind::TypeError,
             operands[first_unsupported - 1].parts().6,
             message,
         );
         error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
-        error.argument_position = Some(first_unsupported);
+        error.argument_position = Some(source_position);
         error
             .actual_types
             .try_reserve(operands.len())
@@ -2804,6 +2916,98 @@ mod tests {
     }
 
     #[test]
+    fn foldl_records_reducer_identity_initializer_conversion_and_vector_work_plan() {
+        let program = must_compile(
+            "parameters[n Int]\n\
+             foldl[@sub 20 (3 4 5)]\n\
+             foldl[@add 0 iota[n]]\n\
+             foldl[@add 1 Double()]\n",
+        );
+        let raw = program.as_raw();
+        assert_eq!(
+            raw.features,
+            vec![
+                Feature::StableSemanticIds.numeric(),
+                Feature::ApplicationPlans.numeric(),
+                Feature::OperationReferences.numeric(),
+            ]
+        );
+        assert_eq!(raw.operation_references.len(), 3);
+        assert_eq!(
+            raw.operation_references
+                .iter()
+                .map(|reference| (
+                    reference.primitive_id,
+                    reference.signature_id,
+                    reference.implementation_id,
+                ))
+                .collect::<Vec<_>>(),
+            [(6, 11, 11), (5, 9, 9), (5, 10, 10)]
+        );
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 27,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 3);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3, apply.4))
+                .collect::<Vec<_>>(),
+            [
+                (49, 49, 9, Some(crate::OperationReferenceIndex(0))),
+                (49, 49, 9, Some(crate::OperationReferenceIndex(1))),
+                (50, 50, 9, Some(crate::OperationReferenceIndex(2))),
+            ]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.0.cardinality == Some(Cardinality::StaticScalar)
+                && apply.5 == LiftMode::ContainerScalar
+        }));
+        let final_edges =
+            &raw.edges[applies[2].0.edges.start as usize..applies[2].0.edges.start as usize + 2];
+        assert_eq!(
+            final_edges[0].conversion,
+            crate::Conversion::PromoteIntToDouble
+        );
+        assert_eq!(final_edges[1].conversion, crate::Conversion::Identity);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    raw.edges
+                        .get(apply.0.edges.start as usize + 1)
+                        .and_then(|edge| edge.cardinality)
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(3)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(0)),
+            ]
+        );
+    }
+
+    #[test]
     fn prefix_spread_preserves_immediate_element_metadata() {
         let program = must_compile("add [1 (2 3)]\n");
         let raw = program.as_raw();
@@ -3209,10 +3413,11 @@ mod tests {
              all_of[(true false)]\n\
              any_of[(true false)]\n\
              none_of[(true false)]\n\
+             foldl[@sub 10 (1 2)]\n\
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 12_489_862_592_513_062_379);
+        assert_eq!(debug_digest(&matrix), 9_622_858_128_876_183_874);
 
         let depth = 256;
         let mut deep = String::new();
@@ -3237,7 +3442,7 @@ mod tests {
         unary.push('1');
         assert_eq!(
             debug_digest(&must_compile(&unary)),
-            13_834_072_937_139_451_108
+            9_029_834_920_760_033_112
         );
     }
 
