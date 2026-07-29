@@ -1409,16 +1409,17 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                     {
                         return Err(record_error(nodes, index, 24, "semantic_id"));
                     }
-                    let is_reducer_consumer = implementation_descriptor.is_ok_and(|descriptor| {
+                    let is_reference_consumer = implementation_descriptor.is_ok_and(|descriptor| {
                         matches!(
                             descriptor.behavior,
                             crate::semantic_registry::StructuralBehavior::Foldl
                                 | crate::semantic_registry::StructuralBehavior::Scanl
+                                | crate::semantic_registry::StructuralBehavior::VectorFilter
                         )
                     });
                     let reference_count =
                         section(plan, 18).map_or(0, |references| references.record_count());
-                    if is_reducer_consumer {
+                    if is_reference_consumer {
                         let reference = arguments[7];
                         if !explicit_operation_references
                             || reference == 0

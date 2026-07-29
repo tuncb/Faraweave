@@ -561,6 +561,181 @@ fn none_of_container_plan_roundtrips_and_dispatches_by_its_own_verified_identity
 }
 
 #[test]
+fn filter_roundtrips_predicate_links_dynamic_subset_metadata_and_direct_dispatch() {
+    let source = "parameters[n Int]\n\
+                  filter[@not Bool()]\n\
+                  filter[@odd (1 2 3 4 5)]\n\
+                  filter[@odd iota[n]]\n\
+                  filter[@is_positive (-2.0 -0.0 0.0 3.0 inf nan)]\n";
+    let program =
+        compile_source_to_verified_program(source, "filter.faraweave").expect("compile filter");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::OperationReferences.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 39,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference,
+                lift,
+                ..
+            } => Some((
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                operation_reference.map(|index| index.0),
+                lift,
+                node.cardinality,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (
+                64,
+                64,
+                11,
+                Some(0),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::DynamicVector),
+            ),
+            (
+                65,
+                65,
+                11,
+                Some(1),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::DynamicVector),
+            ),
+            (
+                65,
+                65,
+                11,
+                Some(2),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::DynamicVector),
+            ),
+            (
+                66,
+                66,
+                11,
+                Some(3),
+                LiftMode::ContainerVector,
+                Some(faraweave::Cardinality::DynamicVector),
+            ),
+        ]
+    );
+    assert_eq!(
+        program
+            .as_raw()
+            .operation_references
+            .iter()
+            .map(|reference| (
+                reference.primitive_id,
+                reference.signature_id,
+                reference.implementation_id,
+            ))
+            .collect::<Vec<_>>(),
+        [(10, 21, 21), (13, 24, 24), (13, 24, 24), (15, 27, 27)]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode filter");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified filter");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode filter"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["5"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct filter");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["5"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded filter");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["()", "(1 3 5)", "(1 3 5)", "(3.0 inf)"]);
+}
+
+#[test]
+fn filter_randomized_direct_and_decoded_fwir_results_agree() {
+    let mut state = 0x5eed_86f1_7e12_4a39_u64;
+    for case in 0..128 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let length = usize::try_from(state % 33).expect("bounded length");
+        let mut values = Vec::with_capacity(length);
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(i64::try_from(state % 2_001).expect("bounded value") - 1_000);
+        }
+        let source = if values.is_empty() {
+            "filter[@odd Int()]\n".to_owned()
+        } else {
+            format!(
+                "filter[@odd ({})]\n",
+                values
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        let program = compile_source_to_verified_program(&source, "random-filter.faraweave")
+            .expect("compile randomized filter");
+        let encoded =
+            encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode randomized filter");
+        let decoded =
+            decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode randomized filter");
+        let direct = evaluate_verified_program_with_arguments(
+            &program,
+            &[],
+            EvaluationConfiguration::default(),
+        )
+        .expect("direct randomized filter");
+        let loaded = evaluate_verified_program_with_arguments(
+            &decoded,
+            &[],
+            EvaluationConfiguration::default(),
+        )
+        .expect("decoded randomized filter");
+        assert_eq!(loaded, direct, "case {case}");
+        assert_eq!(
+            direct.values,
+            [Value::IntVector(
+                values.into_iter().filter(|value| value % 2 != 0).collect()
+            )],
+            "case {case}"
+        );
+    }
+}
+
+#[test]
 fn foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities() {
     let source = "parameters[n Int]\n\
                   foldl[@sub 10 Int()]\n\

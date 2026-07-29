@@ -205,8 +205,8 @@ outside SelectedApply.
   `a2=implementation_id`, `a3=primitive_origin`,
   `a4=static_anchor` (`NONE` when absent), `a5=dynamic_check_start`,
   `a6=dynamic_check_count`, and `a7=operation_reference_plus_one`. The last
-  field is zero for ordinary applications; `foldl` and `scanl` require feature
-  6 and store their zero-based `OPRF` index plus one. Stable semantic IDs fit `u16`,
+  field is zero for ordinary applications; `foldl`, `scanl`, and `filter`
+  require feature 6 and store their zero-based `OPRF` index plus one. Stable semantic IDs fit `u16`,
   so the upper 16 bits of `a0` through `a2` MUST be zero. Lift adds
   `4=ContainerScalar` and `5=ContainerVector` only under feature 5.
 - FanOut: `a0=branch_start`, `a1=branch_count`,
@@ -222,16 +222,23 @@ reserved:u16`; records cover every SelectedApply exactly once in ascending
 node order. Application-plan IDs are nonzero, fit `u16`, and must match the
 selected implementation's registry descriptor. A v1.0 artifact omits `APPL`
 and reconstructs the plan from its validated implementation identity.
+Application-plan ID 11 is the filter-only dynamic subset plan with
+operand-cardinality work admitted before exact result admission; its meaning
+is reconstructed from the stable selected identity and adds no new physical
+record field. Existing section layouts and canonical 1.0/1.1 bytes are
+unchanged.
 
 `OPRF` is `primitive_id:u16, signature_id:u16, implementation_id:u16,
 reserved:u16, origin:u32, reserved:u32`. Both reserved fields are zero.
 Verification requires the three IDs to identify one closed registered
 elementwise descriptor and requires `origin` to be in range; inconsistent or
 structural identities are malformed rather than runtime-dispatched by name.
-Every `foldl` or `scanl` SelectedApply links exactly one `OPRF` record through
-nonzero `NODE.a7`; the referenced descriptor must have the container element
-type as both parameter types and result type. Other applications require zero, and missing,
-out-of-range, structurally invalid, or type-incompatible links are malformed.
+Every `foldl`, `scanl`, or `filter` SelectedApply links exactly one `OPRF`
+record through nonzero `NODE.a7`. Fold and scan require the container element
+type as both parameter types and result type; filter requires one exact
+container-element parameter, Bool result, and a declared total pure predicate
+implementation. Other applications require zero, and missing, out-of-range,
+structurally invalid, or type-incompatible links are malformed.
 
 ### 4.6 Producer metadata
 
@@ -310,9 +317,9 @@ The physical format version and semantic contract version are separate.
 - `OPRF` records or feature `6=OperationReferences` require semantic version
   1.1 and physical format minor 1. Semantic 1.0/physical 1.0 artifacts cannot
   opt into that mandatory sidecar capability.
-- A `foldl` or `scanl` SelectedApply requires feature 6, a nonzero in-range
-  `NODE.a7`, and one compatible stable reducer identity; other applications
-  require `NODE.a7=0`.
+- A `foldl`, `scanl`, or `filter` SelectedApply requires feature 6, a nonzero
+  in-range `NODE.a7`, and one compatible stable operation identity; other
+  applications require `NODE.a7=0`.
 - A lower format minor is accepted when the major matches and every required
   v1 section/record rule used by the artifact is supported.
 

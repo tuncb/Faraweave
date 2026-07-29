@@ -1915,8 +1915,8 @@ fn verify_apply(
     injection: VerifyAllocationFailureInjection,
 ) -> Result<(), VerifyError> {
     use crate::semantic_registry::{
-        OperandConsumption, ResultCardinality, StructuralBehavior, WorkAdmission,
-        application_plan_from_numeric, implementation_from_numeric,
+        AdmissionSequence, OperandConsumption, ResultCardinality, StructuralBehavior,
+        WorkAdmission, application_plan_from_numeric, implementation_from_numeric,
     };
     let descriptor = implementation_from_numeric(implementation_id).map_err(|_| {
         malformed(
@@ -2001,7 +2001,50 @@ fn verify_apply(
                 ));
             }
         }
-        (StructuralBehavior::Foldl | StructuralBehavior::Scanl, None) | (_, Some(_)) => {
+        (StructuralBehavior::VectorFilter, Some(reference_index)) => {
+            let reference = program
+                .operation_references
+                .get(reference_index.0 as usize)
+                .ok_or_else(|| {
+                    malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "operation_reference",
+                    )
+                })?;
+            let predicate =
+                implementation_from_numeric(reference.implementation_id).map_err(|_| {
+                    malformed(
+                        Invariant::InvalidSemanticIdentity,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "operation_reference",
+                    )
+                })?;
+            let predicate_matches = predicate.primitive_id.numeric() == reference.primitive_id
+                && predicate.signature_id.numeric() == reference.signature_id
+                && crate::semantic_registry::is_total_unary_predicate(predicate)
+                && predicate
+                    .parameters
+                    .first()
+                    .is_some_and(|parameter| parameter.element_type == descriptor.result);
+            if !predicate_matches {
+                return Err(malformed(
+                    Invariant::InvalidSemanticIdentity,
+                    RecordKind::Node,
+                    Some(node_index),
+                    "operation_reference",
+                ));
+            }
+        }
+        (
+            StructuralBehavior::Foldl
+            | StructuralBehavior::Scanl
+            | StructuralBehavior::VectorFilter,
+            None,
+        )
+        | (_, Some(_)) => {
             return Err(malformed(
                 Invariant::InvalidRecord,
                 RecordKind::Node,
@@ -2017,6 +2060,23 @@ fn verify_apply(
                 .parameters
                 .get(usize::from(position - 1))
                 .is_none_or(|operand| operand.consumption != OperandConsumption::WholeVector))
+    {
+        return Err(malformed(
+            Invariant::InvalidSemanticIdentity,
+            RecordKind::Node,
+            Some(node_index),
+            "resource_admission",
+        ));
+    }
+    if application_plan.resources.sequence
+        != if matches!(
+            application_plan.result_cardinality,
+            ResultCardinality::SubsetOfOperand(_)
+        ) {
+            AdmissionSequence::WorkThenResult
+        } else {
+            AdmissionSequence::Combined
+        }
     {
         return Err(malformed(
             Invariant::InvalidSemanticIdentity,
@@ -2218,6 +2278,24 @@ fn verify_apply(
                 (
                     TypeRecord::Vector(descriptor.result),
                     cardinality,
+                    LiftMode::ContainerVector,
+                )
+            }
+            ResultCardinality::SubsetOfOperand(position) => {
+                match operand_cardinality(position) {
+                    Some(Cardinality::StaticVector(_) | Cardinality::DynamicVector) => {}
+                    _ => {
+                        return Err(malformed(
+                            Invariant::InconsistentResultMetadata,
+                            RecordKind::Node,
+                            Some(node_index),
+                            "result_cardinality",
+                        ));
+                    }
+                }
+                (
+                    TypeRecord::Vector(descriptor.result),
+                    Cardinality::DynamicVector,
                     LiftMode::ContainerVector,
                 )
             }
@@ -3007,6 +3085,7 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
                         ResultCardinality::Scalar
                             | ResultCardinality::PreserveOperand(_)
                             | ResultCardinality::OperandPlusOne(_)
+                            | ResultCardinality::SubsetOfOperand(_)
                     )
             },
         )
@@ -3417,6 +3496,16 @@ mod tests {
         ) {
             Ok(program) => program.raw,
             Err(error) => panic!("scanl fixture did not lower: {error}"),
+        }
+    }
+
+    fn filter_program() -> RawProgram {
+        match crate::lowering::compile_source_with_name(
+            "filter[@odd (1 2 3 4 5)]\n",
+            "filter.faraweave",
+        ) {
+            Ok(program) => program.raw,
+            Err(error) => panic!("filter fixture did not lower: {error}"),
         }
     }
 
@@ -5114,6 +5203,123 @@ mod tests {
         missing_feature.module.ranges.features.count =
             u32::try_from(missing_feature.features.len()).unwrap_or(u32::MAX);
         verify_error(missing_feature, Invariant::MissingFeature);
+    }
+
+    #[test]
+    fn filter_plan_predicate_subset_metadata_features_and_ownership_are_verified() {
+        assert!(filter_program().verify().is_ok());
+
+        let filter_node = |program: &RawProgram| {
+            program
+                .nodes
+                .iter()
+                .position(|node| {
+                    matches!(
+                        node.kind,
+                        NodeKind::SelectedApply {
+                            primitive_id: 39,
+                            ..
+                        }
+                    )
+                })
+                .unwrap_or(usize::MAX)
+        };
+
+        let mut missing_reference = filter_program();
+        let index = filter_node(&missing_reference);
+        let NodeKind::SelectedApply {
+            ref mut operation_reference,
+            ..
+        } = missing_reference.nodes[index].kind
+        else {
+            panic!("filter node kind changed");
+        };
+        *operation_reference = None;
+        verify_error(missing_reference, Invariant::InvalidRecord);
+
+        let mut incompatible_predicate = filter_program();
+        incompatible_predicate.operation_references[0] = OperationReference {
+            primitive_id: 1,
+            signature_id: 1,
+            implementation_id: 1,
+            origin: incompatible_predicate.operation_references[0].origin,
+        };
+        verify_error(incompatible_predicate, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_predicate_type = filter_program();
+        wrong_predicate_type.operation_references[0] = OperationReference {
+            primitive_id: 15,
+            signature_id: 27,
+            implementation_id: 27,
+            origin: wrong_predicate_type.operation_references[0].origin,
+        };
+        verify_error(wrong_predicate_type, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_identity = filter_program();
+        let index = filter_node(&wrong_identity);
+        let NodeKind::SelectedApply {
+            ref mut implementation_id,
+            ..
+        } = wrong_identity.nodes[index].kind
+        else {
+            panic!("filter node kind changed");
+        };
+        *implementation_id = 64;
+        verify_error(wrong_identity, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_plan = filter_program();
+        let index = filter_node(&wrong_plan);
+        let NodeKind::SelectedApply {
+            ref mut application_plan_id,
+            ..
+        } = wrong_plan.nodes[index].kind
+        else {
+            panic!("filter node kind changed");
+        };
+        *application_plan_id = 10;
+        verify_error(wrong_plan, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_cardinality = filter_program();
+        let index = filter_node(&wrong_cardinality);
+        wrong_cardinality.nodes[index].cardinality = Some(Cardinality::StaticVector(3));
+        verify_error(wrong_cardinality, Invariant::InconsistentResultMetadata);
+
+        let mut wrong_lift = filter_program();
+        let index = filter_node(&wrong_lift);
+        let NodeKind::SelectedApply { ref mut lift, .. } = wrong_lift.nodes[index].kind else {
+            panic!("filter node kind changed");
+        };
+        *lift = LiftMode::Vector;
+        verify_error(wrong_lift, Invariant::InconsistentResultMetadata);
+
+        for feature in [Feature::ApplicationPlans, Feature::OperationReferences] {
+            let mut missing_feature = filter_program();
+            missing_feature
+                .features
+                .retain(|candidate| *candidate != feature.numeric());
+            missing_feature.module.ranges.features.count =
+                u32::try_from(missing_feature.features.len()).unwrap_or(u32::MAX);
+            verify_error(missing_feature, Invariant::MissingFeature);
+        }
+
+        let mut wrong_ownership = filter_program();
+        let index = filter_node(&wrong_ownership);
+        let edge_index = wrong_ownership.nodes[index].edges.start as usize;
+        wrong_ownership.edges[edge_index].ownership = OwnershipMode::ImmutableBorrow;
+        verify_error(wrong_ownership, Invariant::AmbiguousOwnership);
+
+        let mut wrong_release = filter_program();
+        let index = filter_node(&wrong_release);
+        let input = wrong_release.edges[wrong_release.nodes[index].edges.start as usize].producer;
+        let Some(ownership) = wrong_release
+            .ownership
+            .iter_mut()
+            .find(|ownership| ownership.owner == input)
+        else {
+            panic!("filter input ownership");
+        };
+        ownership.release_after = ReleaseAfter::Root(RootIndex(0));
+        verify_error(wrong_release, Invariant::AmbiguousOwnership);
     }
 
     #[test]
