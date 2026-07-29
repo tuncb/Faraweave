@@ -781,6 +781,9 @@ fn invoke_kernel(
         (ScalarKernel::FloorDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_floor(*value)))
         }
+        (ScalarKernel::CeilDouble, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_ceil(*value)))
+        }
         (
             ScalarKernel::DivInt
             | ScalarKernel::LengthBoolVector

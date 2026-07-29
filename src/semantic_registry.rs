@@ -138,6 +138,7 @@ pub(crate) enum ScalarKernel {
     CosDouble,
     TanDouble,
     FloorDouble,
+    CeilDouble,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,9 +225,9 @@ impl InternalRegistryDiagnosticFailureInjection {
     }
 }
 
-const PRIMITIVE_COUNT: u16 = 36;
-const SIGNATURE_COUNT: u16 = 61;
-const IMPLEMENTATION_COUNT: u16 = 61;
+const PRIMITIVE_COUNT: u16 = 37;
+const SIGNATURE_COUNT: u16 = 62;
+const IMPLEMENTATION_COUNT: u16 = 62;
 const APPLICATION_PLAN_COUNT: u16 = 10;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
@@ -1015,6 +1016,17 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         ELEMENTWISE_PLAN,
         FloorDouble
     ),
+    descriptor!(
+        37,
+        "ceil",
+        62,
+        62,
+        DOUBLE1,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        CeilDouble
+    ),
 ];
 
 impl PrimitiveId {
@@ -1350,6 +1362,7 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::CosDouble => "cos_double",
         ScalarKernel::TanDouble => "tan_double",
         ScalarKernel::FloorDouble => "floor_double",
+        ScalarKernel::CeilDouble => "ceil_double",
     }
 }
 
@@ -1842,6 +1855,7 @@ mod tests {
             (34, "cos"),
             (35, "tan"),
             (36, "floor"),
+            (37, "ceil"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -2119,6 +2133,14 @@ mod tests {
             Ok(ScalarKernel::FloorDouble)
         );
         assert_eq!(
+            signature_from_numeric(62).map(|descriptor| descriptor.primitive_name),
+            Ok("ceil")
+        );
+        assert_eq!(
+            implementation_from_numeric(62).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::CeilDouble)
+        );
+        assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
         );
@@ -2127,11 +2149,11 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(62),
+            signature_from_numeric(63),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(62),
+            implementation_from_numeric(63),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
