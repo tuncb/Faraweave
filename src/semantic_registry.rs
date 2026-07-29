@@ -69,6 +69,7 @@ pub(crate) enum StructuralBehavior {
     VectorSort,
     VectorSum,
     VectorAllOf,
+    VectorAnyOf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +99,7 @@ pub(crate) enum ScalarKernel {
     SumIntVector,
     SumDoubleVector,
     AllOfBoolVector,
+    AnyOfBoolVector,
     EqualsBool,
     EqualsInt,
     EqualsDouble,
@@ -204,10 +206,10 @@ impl InternalRegistryDiagnosticFailureInjection {
     }
 }
 
-const PRIMITIVE_COUNT: u16 = 24;
-const SIGNATURE_COUNT: u16 = 45;
-const IMPLEMENTATION_COUNT: u16 = 45;
-const APPLICATION_PLAN_COUNT: u16 = 6;
+const PRIMITIVE_COUNT: u16 = 25;
+const SIGNATURE_COUNT: u16 = 46;
+const IMPLEMENTATION_COUNT: u16 = 46;
+const APPLICATION_PLAN_COUNT: u16 = 7;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
     OperandDescriptor {
@@ -284,6 +286,14 @@ const ALL_OF_PLAN: ApplicationPlan = ApplicationPlan {
     },
 };
 
+const ANY_OF_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(7),
+    result_cardinality: ResultCardinality::Scalar,
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::OperandCardinality(1),
+    },
+};
+
 const APPLICATION_PLANS: &[ApplicationPlan] = &[
     ELEMENTWISE_PLAN,
     IOTA_PLAN,
@@ -291,6 +301,7 @@ const APPLICATION_PLANS: &[ApplicationPlan] = &[
     SORT_PLAN,
     SUM_PLAN,
     ALL_OF_PLAN,
+    ANY_OF_PLAN,
 ];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
@@ -805,6 +816,17 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         ALL_OF_PLAN,
         AllOfBoolVector
     ),
+    descriptor!(
+        25,
+        "any_of",
+        46,
+        46,
+        WHOLE_BOOL1,
+        Bool,
+        VectorAnyOf,
+        ANY_OF_PLAN,
+        AnyOfBoolVector
+    ),
 ];
 
 impl PrimitiveId {
@@ -1070,6 +1092,7 @@ const fn structural_behavior_name(value: StructuralBehavior) -> &'static str {
         StructuralBehavior::VectorSort => "vector_sort",
         StructuralBehavior::VectorSum => "vector_sum",
         StructuralBehavior::VectorAllOf => "vector_all_of",
+        StructuralBehavior::VectorAnyOf => "vector_any_of",
     }
 }
 
@@ -1120,6 +1143,7 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::SumIntVector => "sum_int_vector",
         ScalarKernel::SumDoubleVector => "sum_double_vector",
         ScalarKernel::AllOfBoolVector => "all_of_bool_vector",
+        ScalarKernel::AnyOfBoolVector => "any_of_bool_vector",
     }
 }
 
@@ -1590,6 +1614,7 @@ mod tests {
             (23, "sum"),
             (23, "sum"),
             (24, "all_of"),
+            (25, "any_of"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1611,6 +1636,7 @@ mod tests {
         assert_eq!(primitive_from_name("sort"), primitive_from_numeric(22));
         assert_eq!(primitive_from_name("sum"), primitive_from_numeric(23));
         assert_eq!(primitive_from_name("all_of"), primitive_from_numeric(24));
+        assert_eq!(primitive_from_name("any_of"), primitive_from_numeric(25));
         assert_eq!(
             signature_from_numeric(36).map(|descriptor| descriptor.primitive_name),
             Ok("div")
@@ -1652,6 +1678,14 @@ mod tests {
             Ok(ScalarKernel::AllOfBoolVector)
         );
         assert_eq!(
+            signature_from_numeric(46).map(|descriptor| descriptor.primitive_name),
+            Ok("any_of")
+        );
+        assert_eq!(
+            implementation_from_numeric(46).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::AnyOfBoolVector)
+        );
+        assert_eq!(
             implementation_from_numeric(34).map(|descriptor| descriptor.kernel),
             Ok(ScalarKernel::IotaInt)
         );
@@ -1661,6 +1695,7 @@ mod tests {
         assert_eq!(application_plan_from_numeric(4), Ok(SORT_PLAN));
         assert_eq!(application_plan_from_numeric(5), Ok(SUM_PLAN));
         assert_eq!(application_plan_from_numeric(6), Ok(ALL_OF_PLAN));
+        assert_eq!(application_plan_from_numeric(7), Ok(ANY_OF_PLAN));
         assert!(
             SEMANTIC_REGISTRY
                 .iter()
@@ -1697,6 +1732,16 @@ mod tests {
         assert!(
             SEMANTIC_REGISTRY
                 .iter()
+                .filter(|descriptor| descriptor.behavior == StructuralBehavior::VectorAnyOf)
+                .all(|descriptor| {
+                    descriptor.application_plan == ANY_OF_PLAN
+                        && descriptor.parameters == WHOLE_BOOL1
+                        && descriptor.result == ScalarType::Bool
+                })
+        );
+        assert!(
+            SEMANTIC_REGISTRY
+                .iter()
                 .filter(|descriptor| descriptor.behavior == StructuralBehavior::VectorSort)
                 .all(|descriptor| {
                     descriptor.application_plan == SORT_PLAN
@@ -1725,15 +1770,15 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(46),
+            signature_from_numeric(47),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(46),
+            implementation_from_numeric(47),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
-            application_plan_from_numeric(7),
+            application_plan_from_numeric(8),
             Err(RegistryLookupError::ApplicationPlanId)
         );
     }
@@ -1928,6 +1973,7 @@ mod tests {
                     SORT_PLAN,
                     SUM_PLAN,
                     ALL_OF_PLAN,
+                    ANY_OF_PLAN,
                     IOTA_PLAN,
                 ],
             ),

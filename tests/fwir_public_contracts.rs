@@ -533,6 +533,85 @@ fn all_of_container_plan_roundtrips_and_dispatches_by_verified_identity() {
 }
 
 #[test]
+fn any_of_container_plan_roundtrips_and_dispatches_by_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  any_of[Bool()]\n\
+                  any_of[(false false false)]\n\
+                  any_of equals[iota n iota n]\n";
+    let program =
+        compile_source_to_verified_program(source, "any-of.faraweave").expect("compile any_of");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 25,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (46, 46, 7, LiftMode::ContainerScalar),
+            (46, 46, 7, LiftMode::ContainerScalar),
+            (46, 46, 7, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode any_of");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified any_of");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode any_of"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct any_of");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded any_of");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["false", "false", "true"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_46("));
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_any_of(")
+            .count(),
+        1
+    );
+    assert!(
+        emitted
+            .source
+            .contains("if(!fw_charge_work(args[0].len,name,line,column))return 0;")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
 fn inspection_is_deterministic_and_carries_exact_binary64_bits() {
     let program = compile_source_to_verified_program("-0.0\nnan\n", "bits.faraweave")
         .expect("compile exact doubles");
