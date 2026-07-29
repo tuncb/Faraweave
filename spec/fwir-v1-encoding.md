@@ -289,8 +289,8 @@ A UI MAY display a named cryptographic digest of those bytes, but the
 algorithm and spelling are not part of FWIR v1.
 
 Producer version, source digest, source filesystem path, compilation time,
-execution profile, resource limits, compiler choice, and target platform do
-not participate in identity. Diagnostic source-unit names and all origins do
+execution profile, resource limits, and target platform do not participate in
+identity. Diagnostic source-unit names and all origins do
 participate because they affect structured errors.
 
 ## 7. Version, feature, and extension compatibility
@@ -453,15 +453,13 @@ The explicit CLI spellings are:
 faraweave compile-ir <source> -o <artifact.fwir>
 faraweave inspect-ir <artifact.fwir>
 faraweave run-ir <artifact.fwir> [-- <arguments...>]
-faraweave emit-c-ir <artifact.fwir> -o <output.c>
-faraweave build-ir <artifact.fwir> -o <executable> [--cc <compiler>]
 ```
 
 Commands never infer source versus FWIR from the extension. Every file
 publication is atomic, rejects input/output aliases, and preserves an existing
-destination on compile, decode, verify, format, C-compiler, or publication
-failure. Argument count and decoding begin only after a complete artifact has
-become a `VerifiedProgram`.
+destination on compile, decode, verify, format, or publication failure.
+Argument count and decoding begin only after a complete artifact has become a
+`VerifiedProgram`.
 
 ## 11. Alternatives and measurement decision
 
@@ -469,8 +467,8 @@ become a `VerifiedProgram`.
 selected format with canonical JSON and an explicit-schema Protocol Buffers
 wire model. The sectioned format is selected for bounded nonrecursive framing,
 exact fixed-width values, zero production/schema-runtime dependencies, and
-symmetric safe-Rust/strict-C11 implementation, not because it wins every size
-case. Protocol Buffers is smaller in all measured fixtures but its official
+straightforward checked safe-Rust implementation, not because it wins every
+size case. Protocol Buffers is smaller in all measured fixtures but its official
 [encoding rules](https://protobuf.dev/programming-guides/encoding/) do not
 guarantee field serialization order, requiring another canonicalization layer;
 canonical JSON is retained only as an inspection model because exact integer
@@ -504,9 +502,9 @@ features. Consumers reject unsupported mandatory semantics rather than
 guessing, defaulting, or redispatching by a source name.
 
 The decoder treats bytes as hostile, applies checked bounds and caller limits,
-and yields no backend input before complete verification. That is an
-input-safety boundary, not a sandbox: generated C, the selected C compiler,
-and native executables run with the invoking process's authority.
+and yields no interpreter input before complete verification. That is an
+input-safety boundary, not a sandbox: interpreter execution runs with the
+invoking process's authority.
 
 FWIR is not confidential or encrypted. Canonical bytes and inspection output
 can reveal diagnostic source names, literal constants, type and node graphs,

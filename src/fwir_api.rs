@@ -1,10 +1,9 @@
 use crate::{
-    CEmissionResult, Error, ErrorKind, EvaluationConfiguration, FwirEncodeError, FwirEncodeOptions,
-    NativeBuildRequest, NativeBuildResult, ProgramResult, RunnerEvaluationResult, SourceLocation,
-    VerifiedProgram, build_native, encode_fwir, evaluate_verified_program, format_value,
+    Error, ErrorKind, EvaluationConfiguration, FwirEncodeError, FwirEncodeOptions, ProgramResult,
+    RunnerEvaluationResult, SourceLocation, VerifiedProgram, encode_fwir,
+    evaluate_verified_program, format_value,
 };
 use std::fmt::Write as _;
-use std::path::Path;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -111,37 +110,6 @@ pub fn evaluate_verified_program_with_arguments(
         values,
         formatted,
         usage,
-    })
-}
-
-/// Emits deterministic strict C11 from a verified program.
-///
-/// Selected implementations, conversions, lifting, shapes, ownership, and
-/// diagnostics come only from the verified records.
-pub fn emit_c_from_verified_program(
-    program: &VerifiedProgram,
-    configuration: EvaluationConfiguration,
-) -> Result<CEmissionResult, Error> {
-    crate::c_emitter::emit_verified_c_program(program, configuration)
-}
-
-/// Emits C and builds a native executable from the same verified program.
-///
-/// The selected compiler is an external trusted process and the resulting
-/// executable is not a sandboxed form of FWIR.
-pub fn build_native_from_verified_program(
-    program: &VerifiedProgram,
-    output_path: &Path,
-    explicit_compiler: Option<&str>,
-    environment_compiler: Option<&str>,
-    configuration: EvaluationConfiguration,
-) -> Result<NativeBuildResult, Error> {
-    let emitted = emit_c_from_verified_program(program, configuration)?;
-    build_native(&NativeBuildRequest {
-        c_source: &emitted.source,
-        output_path,
-        explicit_compiler,
-        environment_compiler,
     })
 }
 

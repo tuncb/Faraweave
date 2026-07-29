@@ -3,10 +3,14 @@
 **Status:** Accepted for implementation
 
 **Authority:** This document is the normative exception to the otherwise exact
-binary64 backend parity required by the
+binary64 execution contract required by the
 [typed FWIR semantic contract](typed-fwir-semantic-contract.md). It is accepted
 by [issue #39](https://github.com/tuncb/Faraweave/issues/39) and its
 [decision record](../decisions/issue-39-backend-native-math-policy.md).
+
+`BackendNativeMathV1` is the stable name of FWIR feature 7. It means that the
+Rust interpreter delegates the covered functions to the host math
+implementation; it does not identify or enable a separate execution backend.
 
 The key words **must**, **must not**, **required**, and **may** are normative.
 
@@ -15,22 +19,22 @@ The key words **must**, **must not**, **required**, and **may** are normative.
 The exception covers only these reserved unary `Double -> Double`
 elementwise operations:
 
-| Primitive ID | Source name | Rust call | C call |
-| ---: | --- | --- | --- |
-| 29 | `sqrt` | `f64::sqrt` | `sqrt` |
-| 30 | `exp` | `f64::exp` | `exp` |
-| 31 | `log` (natural log) | `f64::ln` | `log` |
-| 32 | `log10` | `f64::log10` | `log10` |
-| 33 | `sin` | `f64::sin` | `sin` |
-| 34 | `cos` | `f64::cos` | `cos` |
-| 35 | `tan` | `f64::tan` | `tan` |
-| 36 | `floor` | `f64::floor` | `floor` |
-| 37 | `ceil` | `f64::ceil` | `ceil` |
-| 38 | `trunc` | `f64::trunc` | `trunc` |
+| Primitive ID | Source name | Rust call |
+| ---: | --- | --- |
+| 29 | `sqrt` | `f64::sqrt` |
+| 30 | `exp` | `f64::exp` |
+| 31 | `log` (natural log) | `f64::ln` |
+| 32 | `log10` | `f64::log10` |
+| 33 | `sin` | `f64::sin` |
+| 34 | `cos` | `f64::cos` |
+| 35 | `tan` | `f64::tan` |
+| 36 | `floor` | `f64::floor` |
+| 37 | `ceil` | `f64::ceil` |
+| 38 | `trunc` | `f64::trunc` |
 
 Signature and implementation IDs remain unassigned until each owning primitive
-issue adds its registry row and direct backend dispatch. Implementations must
-call the named backend function; Faraweave must not substitute a software algorithm, bit-level
+issue adds its registry row and direct interpreter dispatch. Implementations
+must call the named Rust function; Faraweave must not substitute a software algorithm, bit-level
 rounding implementation, polynomial, or custom range reduction, and must not
 add a math dependency.
 
@@ -44,8 +48,7 @@ Every produced NaN is normalized immediately to Faraweave's canonical quiet
 NaN bits `0x7ff8000000000000`. NaN payload, sign, signaling state, backend
 `errno`, and floating exception flags are not language values.
 
-The following results are exact across interpreter, generated C, and native
-execution:
+The following results are exact in interpreter execution:
 
 | Operation | Exact requirements |
 | --- | --- |
@@ -98,9 +101,8 @@ description such as π/2.
 Calls execute under the existing Faraweave strict environment: round-to-nearest
 with gradual underflow and masked exceptions. The implementation restores the
 caller's supported control and status state after each scalar call. It must
-not inspect or translate C `errno` or floating exception flags into a
-Faraweave error, and results do not depend on the caller's hostile rounding,
-trap, denormal, or flush controls.
+not translate floating exception flags into a Faraweave error, and results do
+not depend on the caller's hostile rounding, trap, denormal, or flush controls.
 
 Native domain, pole, overflow, and underflow outcomes described above are
 successful Double values, not `DomainError`. Existing argument count, type,
@@ -118,8 +120,8 @@ comparison must never skip or relax surrounding structural or failure data.
 
 FWIR bytes, lowering identities, execution order, and nonnumeric observations
 remain reproducible. Finite covered result bits may vary with the Rust
-standard library, C implementation, target, compiler, or platform math
-library even when every result conforms; callers requiring bit-reproducible
+standard library, target, or platform math library even when every result
+conforms; callers requiring bit-reproducible
 transcendentals must not use these operations.
 
 ## 6. FWIR compatibility (`FWIR-MATH-006`)
@@ -131,8 +133,8 @@ The verifier rejects a missing feature, and a consumer that does not know
 feature 7 rejects the artifact before constructing a `RawProgram`.
 
 Feature 7 applies to every covered implementation, including the portable
-exact rounding operations, because direct backend dispatch and floating-state
-handling are part of their semantics. It is never advisory, and it does not
+exact rounding operations, because direct interpreter dispatch and
+floating-state handling are part of their semantics. It is never advisory, and it does not
 authorize unknown primitive, signature, or implementation IDs.
 
 ## 7. Requirement-to-evidence map
@@ -140,8 +142,8 @@ authorize unknown primitive, signature, or implementation IDs.
 | Requirement | Executable evidence |
 | --- | --- |
 | `FWIR-MATH-001` | `rust:src/semantic_registry.rs::backend_native_math_primitive_reservation_is_narrow`<br>`rust:tests/backend_native_sqrt.rs::sqrt_uses_reserved_ids_double_selection_lifting_and_feature_seven`<br>`rust:tests/backend_native_exp.rs::exp_uses_contiguous_ids_double_selection_lifting_and_feature_seven`<br>`rust:tests/backend_native_log.rs::log_uses_contiguous_ids_lifting_promotion_and_shared_feature`<br>`rust:tests/backend_native_log10.rs::log10_uses_contiguous_ids_lifting_promotion_and_shared_feature`<br>`rust:tests/backend_native_sin.rs::sin_uses_contiguous_ids_lifting_promotion_and_shared_feature`<br>`rust:tests/backend_native_cos.rs::cos_uses_contiguous_ids_lifting_promotion_and_shared_feature`<br>`rust:tests/backend_native_tan.rs::tan_uses_contiguous_ids_lifting_promotion_and_shared_feature`<br>`rust:tests/backend_native_floor.rs::floor_uses_contiguous_ids_lifting_promotion_and_shared_feature`<br>`rust:tests/backend_native_ceil.rs::ceil_uses_contiguous_ids_lifting_promotion_and_shared_feature`<br>`rust:tests/backend_native_trunc.rs::trunc_uses_contiguous_ids_lifting_promotion_and_shared_feature` |
-| `FWIR-MATH-002` | `rust:tests/backend_native_math_policy.rs::backend_native_math_special_values_and_rounding_are_exact`<br>`rust:tests/backend_native_sqrt.rs::sqrt_special_values_finite_envelope_and_vectors_are_public_semantics`<br>`rust:tests/backend_native_exp.rs::exp_special_values_thresholds_finite_envelope_and_vectors_are_public_semantics`<br>`rust:tests/backend_native_log.rs::log_special_domain_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_log10.rs::log10_special_domain_powers_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_sin.rs::sin_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_cos.rs::cos_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_tan.rs::tan_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_floor.rs::floor_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`rust:tests/backend_native_ceil.rs::ceil_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`rust:tests/backend_native_trunc.rs::trunc_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`command:strict-c11-journey` |
-| `FWIR-MATH-003` | `rust:tests/backend_native_math_policy.rs::backend_native_math_rust_reference_vectors_meet_policy`<br>`rust:tests/backend_native_sqrt.rs::sqrt_special_values_finite_envelope_and_vectors_are_public_semantics`<br>`rust:tests/backend_native_exp.rs::exp_special_values_thresholds_finite_envelope_and_vectors_are_public_semantics`<br>`rust:tests/backend_native_log.rs::log_special_domain_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_log10.rs::log10_special_domain_powers_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_sin.rs::sin_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_cos.rs::cos_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_tan.rs::tan_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_floor.rs::floor_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`rust:tests/backend_native_ceil.rs::ceil_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`rust:tests/backend_native_trunc.rs::trunc_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`command:strict-c11-journey` |
-| `FWIR-MATH-004` | `rust:src/strict_float.rs::hostile_x86_environment_is_ignored_and_exactly_restored`<br>`rust:src/strict_float.rs::hostile_aarch64_environment_is_ignored_and_exactly_restored`<br>`command:strict-c11-journey` |
-| `FWIR-MATH-005` | `rust:tests/backend_native_sqrt.rs::sqrt_resource_work_and_allocation_refusals_are_exact`<br>`rust:tests/backend_native_exp.rs::exp_resources_diagnostics_and_allocation_refusals_are_exact`<br>`rust:tests/backend_native_log.rs::log_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_log10.rs::log10_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_sin.rs::sin_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_cos.rs::cos_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_tan.rs::tan_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_floor.rs::floor_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_ceil.rs::ceil_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_trunc.rs::trunc_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/fwir_public_contracts.rs::public_source_artifact_execution_c_and_resource_traces_are_differential`<br>`command:strict-c11-journey` |
+| `FWIR-MATH-002` | `rust:tests/backend_native_math_policy.rs::backend_native_math_special_values_and_rounding_are_exact`<br>`rust:tests/backend_native_sqrt.rs::sqrt_special_values_finite_envelope_and_vectors_are_public_semantics`<br>`rust:tests/backend_native_exp.rs::exp_special_values_thresholds_finite_envelope_and_vectors_are_public_semantics`<br>`rust:tests/backend_native_log.rs::log_special_domain_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_log10.rs::log10_special_domain_powers_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_sin.rs::sin_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_cos.rs::cos_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_tan.rs::tan_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_floor.rs::floor_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`rust:tests/backend_native_ceil.rs::ceil_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`rust:tests/backend_native_trunc.rs::trunc_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics` |
+| `FWIR-MATH-003` | `rust:tests/backend_native_math_policy.rs::backend_native_math_rust_reference_vectors_meet_policy`<br>`rust:tests/backend_native_sqrt.rs::sqrt_special_values_finite_envelope_and_vectors_are_public_semantics`<br>`rust:tests/backend_native_exp.rs::exp_special_values_thresholds_finite_envelope_and_vectors_are_public_semantics`<br>`rust:tests/backend_native_log.rs::log_special_domain_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_log10.rs::log10_special_domain_powers_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_sin.rs::sin_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_cos.rs::cos_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_tan.rs::tan_special_quadrants_boundaries_and_finite_envelope_are_public_semantics`<br>`rust:tests/backend_native_floor.rs::floor_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`rust:tests/backend_native_ceil.rs::ceil_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics`<br>`rust:tests/backend_native_trunc.rs::trunc_fractional_signs_integral_boundaries_and_exact_results_are_public_semantics` |
+| `FWIR-MATH-004` | `rust:src/strict_float.rs::hostile_x86_environment_is_ignored_and_exactly_restored`<br>`rust:src/strict_float.rs::hostile_aarch64_environment_is_ignored_and_exactly_restored` |
+| `FWIR-MATH-005` | `rust:tests/backend_native_sqrt.rs::sqrt_resource_work_and_allocation_refusals_are_exact`<br>`rust:tests/backend_native_exp.rs::exp_resources_diagnostics_and_allocation_refusals_are_exact`<br>`rust:tests/backend_native_log.rs::log_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_log10.rs::log10_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_sin.rs::sin_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_cos.rs::cos_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_tan.rs::tan_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_floor.rs::floor_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_ceil.rs::ceil_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/backend_native_trunc.rs::trunc_resources_failures_cleanup_and_diagnostics_are_exact`<br>`rust:tests/fwir_public_contracts.rs::public_source_and_decoded_artifact_execution_and_resource_traces_match` |
 | `FWIR-MATH-006` | `rust:tests/backend_native_sqrt.rs::sqrt_uses_reserved_ids_double_selection_lifting_and_feature_seven`<br>`rust:tests/backend_native_exp.rs::exp_fwir_roundtrip_and_malformed_identities_are_checked`<br>`rust:tests/backend_native_log.rs::log_fwir_roundtrip_malformed_identities_and_version_are_checked`<br>`rust:tests/backend_native_log10.rs::log10_fwir_roundtrip_malformed_identities_and_version_are_checked`<br>`rust:tests/backend_native_sin.rs::sin_fwir_roundtrip_malformed_identities_and_version_are_checked`<br>`rust:tests/backend_native_cos.rs::cos_fwir_roundtrip_malformed_identities_and_version_are_checked`<br>`rust:tests/backend_native_tan.rs::tan_fwir_roundtrip_malformed_identities_and_version_are_checked`<br>`rust:tests/backend_native_floor.rs::floor_fwir_roundtrip_malformed_identities_and_version_are_checked`<br>`rust:tests/backend_native_ceil.rs::ceil_fwir_roundtrip_malformed_identities_and_version_are_checked`<br>`rust:tests/backend_native_trunc.rs::trunc_fwir_roundtrip_malformed_identities_and_version_are_checked`<br>`rust:tests/fwir_conformance.rs::same_major_optional_compatibility_and_mandatory_rejection_are_exact`<br>`rust:src/fwir_decoder.rs::directory_extensions_and_feature_compatibility_are_explicit` |

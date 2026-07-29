@@ -1,8 +1,7 @@
 use faraweave::{
-    AllocationFailureInjection, CompilerConfiguration, DomainErrorReason, ErrorKind,
-    EvaluationConfiguration, ExecutionProfile, NativePlatform, ResourceLimits, ScalarType,
-    SourceLocation, Type, Value, evaluate_expression, evaluate_expression_with_configuration,
-    evaluate_source, format_type, format_value, select_c_compiler,
+    AllocationFailureInjection, DomainErrorReason, ErrorKind, EvaluationConfiguration,
+    ExecutionProfile, ResourceLimits, ScalarType, SourceLocation, Type, Value, evaluate_expression,
+    evaluate_expression_with_configuration, evaluate_source, format_type, format_value,
 };
 
 fn formatted(source: &str) -> String {
@@ -1238,37 +1237,4 @@ fn typed_public_api_parameter_contract() {
         faraweave::evaluate_source_with_arguments(source, &[], EvaluationConfiguration::default())
             .expect_err("missing");
     assert_eq!(missing.kind, ErrorKind::ArgumentError);
-}
-
-#[test]
-fn native_compiler_selection_is_explicit_then_environment_then_platform() {
-    let explicit = select_c_compiler(
-        Some("explicit compiler"),
-        Some("environment compiler"),
-        NativePlatform::GccLike,
-    )
-    .expect("explicit compiler");
-    assert_eq!(
-        explicit.configuration,
-        CompilerConfiguration::ExplicitOption
-    );
-    assert_eq!(explicit.executable, "explicit compiler");
-
-    let environment =
-        select_c_compiler(None, Some("environment compiler"), NativePlatform::GccLike)
-            .expect("environment compiler");
-    assert_eq!(
-        environment.configuration,
-        CompilerConfiguration::Environment
-    );
-    assert_eq!(environment.executable, "environment compiler");
-
-    let unix = select_c_compiler(None, None, NativePlatform::GccLike).expect("Unix fallback");
-    assert_eq!(unix.configuration, CompilerConfiguration::Fallback);
-    assert_eq!(unix.executable, "cc");
-    let windows =
-        select_c_compiler(None, None, NativePlatform::WindowsMsvc).expect("Windows fallback");
-    assert_eq!(windows.executable, "cl.exe");
-
-    assert!(select_c_compiler(Some(""), Some("cc"), NativePlatform::GccLike).is_err());
 }

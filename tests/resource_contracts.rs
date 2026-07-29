@@ -1,9 +1,9 @@
 use faraweave::{
     AllocationFailureInjection, ArgumentErrorReason, DomainErrorReason, Error, ErrorKind,
     EvaluationConfiguration, ExecutionProfile, ParameterErrorReason, ResourceErrorReason,
-    ResourceLimits, Value, emit_c_source_with_configuration, evaluate_expression,
+    ResourceLimits, Value, compile_source_to_verified_program, evaluate_expression,
     evaluate_expression_with_configuration, evaluate_source, evaluate_source_with_arguments,
-    evaluate_source_with_configuration,
+    evaluate_source_with_configuration, evaluate_verified_program,
 };
 use std::sync::Mutex;
 
@@ -182,7 +182,7 @@ fn resource(error: &Error) -> &faraweave::ResourceErrorContext {
 }
 
 #[test]
-fn profile_configuration_precedes_source_and_backend_analysis() {
+fn profile_configuration_precedes_source_analysis_and_interpreter_execution() {
     let invalid = EvaluationConfiguration {
         profile: ExecutionProfile::TrustedLocalV2,
         limits: ResourceLimits {
@@ -191,10 +191,12 @@ fn profile_configuration_precedes_source_and_backend_analysis() {
         },
         allocation_failure: AllocationFailureInjection::default(),
     };
+    let program =
+        compile_source_to_verified_program("inc[1]\n", "profile.faraweave").expect("valid program");
     for error in [
         evaluate_expression_with_configuration("@", invalid).expect_err("expression profile"),
         evaluate_source_with_configuration("@", invalid).expect_err("program profile"),
-        emit_c_source_with_configuration("@", invalid).expect_err("emitter profile"),
+        evaluate_verified_program(&program, &[], invalid).expect_err("interpreter profile"),
     ] {
         assert_eq!(error.kind, ErrorKind::InvalidExecutionProfile);
     }
@@ -493,44 +495,6 @@ fn parameter_header_reason_and_span_contract_is_structured() {
         expression.parameter.expect("surface context").reason,
         ParameterErrorReason::ProgramOnlyParameterHeader
     );
-}
-
-#[test]
-fn generated_runtime_embeds_profile_and_verified_primitive_selection() {
-    let configuration = EvaluationConfiguration {
-        profile: ExecutionProfile::BoundedV2,
-        limits: ResourceLimits {
-            max_vector_bytes: Some(8),
-            max_tuple_table_bytes: Some(16),
-            max_live_evaluation_bytes: Some(24),
-            max_work_units: Some(1),
-        },
-        allocation_failure: AllocationFailureInjection {
-            fail_at_ordinal: Some(0),
-        },
-    };
-    let emitted = emit_c_source_with_configuration("parameters[n Int]\ninc[n]\n", configuration)
-        .expect("parameterized C");
-    assert!(emitted.source.contains("const int fw_profile = 3;"));
-    assert!(
-        emitted
-            .source
-            .contains("const size_t fw_vector_limit = 8U;")
-    );
-    assert!(
-        emitted
-            .source
-            .contains("const size_t fw_failure_ordinal = 0U;")
-    );
-    assert!(emitted.source.contains("static int fw_kernel_1("));
-    assert!(emitted.source.contains("fw_impl_1(args, 1U"));
-    assert!(!emitted.source.contains("static int fw_apply("));
-    assert!(!emitted.source.contains("fw_apply_scalar"));
-    assert!(emitted.source.contains("(void)fw_make_tuple;"));
-    assert!(emitted.source.contains("setvbuf(stdout,NULL,_IONBF,0)"));
-    assert!(!emitted.source.contains("strcmp(name"));
-    assert!(!emitted.source.contains("fw_format(buffer"));
-    assert!(!emitted.source.contains("fw_free(&value->items"));
 }
 
 #[test]

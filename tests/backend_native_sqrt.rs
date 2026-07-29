@@ -1,7 +1,7 @@
 use faraweave::{
     AllocationFailureInjection, Conversion, ErrorKind, EvaluationConfiguration, ExecutionProfile,
     Feature, LiftMode, NodeKind, ResourceErrorReason, ResourceLimits, Value,
-    compile_source_to_verified_program, emit_c_source, evaluate_expression,
+    compile_source_to_verified_program, evaluate_expression,
     evaluate_expression_with_configuration,
 };
 
@@ -197,16 +197,4 @@ fn sqrt_resource_work_and_allocation_refusals_are_exact() {
     assert_eq!(empty.value, Value::DoubleVector(Vec::new()));
     assert_eq!(empty.usage.work_units, 0);
     assert_eq!(empty.usage.allocation_attempts, 0);
-}
-
-#[test]
-fn sqrt_emitted_c_calls_math_h_sqrt_directly() {
-    let source = emit_c_source("sqrt[(4.0 9.0)]\n")
-        .expect("sqrt C emission")
-        .source;
-    assert!(source.contains("#include <math.h>"));
-    assert!(source.contains("result=sqrt(input);"));
-    assert!(source.contains("fw_set_double(out,fw_backend_native_sqrt(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_54("));
-    assert!(source.contains("static int fw_impl_54("));
 }

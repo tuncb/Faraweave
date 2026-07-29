@@ -3,9 +3,9 @@ use faraweave::{
     FwirDecodeLimits, FwirEncodeOptions, FwirProducerMetadata, Invariant, OperationReference,
     Origin, OriginPosition, OriginSpan, RawProgramBuilder, RecordKind, ResourceErrorReason,
     ResourceEventKind, SourceUnit, Value, VerifyError, compile_source_to_verified_program,
-    decode_fwir, emit_c_from_verified_program, encode_fwir,
-    evaluate_source_with_arguments_and_observer, evaluate_verified_program_with_arguments,
-    evaluate_verified_program_with_observer, inspect_fwir,
+    decode_fwir, encode_fwir, evaluate_source_with_arguments_and_observer,
+    evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
+    inspect_fwir,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -1975,22 +1975,14 @@ fn unique_directory(name: &str) -> PathBuf {
 }
 
 #[test]
-fn every_public_artifact_consumer_verifies_before_arguments_or_backends() {
-    let directory = unique_directory("fwir-backend-gate");
+fn every_public_artifact_consumer_verifies_before_arguments_or_execution() {
+    let directory = unique_directory("fwir-interpreter-gate");
     fs::create_dir_all(&directory).expect("temporary directory");
     let malformed = directory.join("malformed.fwir");
-    let c_destination = directory.join("preserved.c");
-    let native_destination = directory.join(if cfg!(windows) {
-        "preserved.exe"
-    } else {
-        "preserved"
-    });
     let mut bytes = example_bytes("complete");
     let (_, roots, _) = section(&bytes, 16);
     put_u32(&mut bytes, roots, u32::MAX);
     fs::write(&malformed, bytes).expect("malformed artifact");
-    fs::write(&c_destination, b"preserve-c").expect("C sentinel");
-    fs::write(&native_destination, b"preserve-native").expect("native sentinel");
 
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_faraweave"));
     let commands = [
@@ -2000,20 +1992,6 @@ fn every_public_artifact_consumer_verifies_before_arguments_or_backends() {
             malformed.as_os_str().to_owned(),
             "--".into(),
             "not-an-argument".into(),
-        ],
-        vec![
-            "emit-c-ir".into(),
-            malformed.as_os_str().to_owned(),
-            "-o".into(),
-            c_destination.as_os_str().to_owned(),
-        ],
-        vec![
-            "build-ir".into(),
-            malformed.as_os_str().to_owned(),
-            "-o".into(),
-            native_destination.as_os_str().to_owned(),
-            "--cc".into(),
-            "compiler-must-not-run".into(),
         ],
     ];
     for arguments in commands {
@@ -2028,17 +2006,7 @@ fn every_public_artifact_consumer_verifies_before_arguments_or_backends() {
             "{:?}",
             output.stderr
         );
-        assert!(
-            !String::from_utf8_lossy(&output.stderr).contains("compiler-must-not-run"),
-            "{:?}",
-            output.stderr
-        );
     }
-    assert_eq!(fs::read(&c_destination).expect("C sentinel"), b"preserve-c");
-    assert_eq!(
-        fs::read(&native_destination).expect("native sentinel"),
-        b"preserve-native"
-    );
     fs::remove_dir_all(directory).expect("temporary cleanup");
 }
 
@@ -2078,7 +2046,7 @@ fn take_events() -> Vec<Event> {
 }
 
 #[test]
-fn source_memory_decoded_interpreter_c_resources_faults_and_cleanup_are_identical() {
+fn source_memory_and_decoded_interpreter_resources_faults_and_cleanup_are_identical() {
     let source = "parameters[n Int]\nfanout[iota[n] {inc[_]} {add[_ 10]}]\n";
     let memory = compile_source_to_verified_program(source, "corpus.fw").expect("source lowering");
     let canonical = encode_fwir(&memory, &FwirEncodeOptions::default()).expect("encode");
@@ -2098,13 +2066,6 @@ fn source_memory_decoded_interpreter_c_resources_faults_and_cleanup_are_identica
     .expect("decoded result");
     assert_eq!(memory_result, decoded_result);
     assert_eq!(memory_result.formatted, ["[(2 3 4) (11 12 13)]"]);
-    assert_eq!(
-        emit_c_from_verified_program(&memory, EvaluationConfiguration::default())
-            .expect("memory C"),
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default())
-            .expect("decoded C")
-    );
-
     let arguments = [Value::Int(3)];
     let _ = take_events();
     let source_observed = evaluate_source_with_arguments_and_observer(
@@ -2256,7 +2217,6 @@ fn traceability_references_complete_executable_evidence_sets() {
             "operation-reference-canonical-roundtrip",
         ),
         ("surfaces.source_memory_decoded", "differential-runtime"),
-        ("surfaces.c_native", "strict-native-journey"),
         (
             "surfaces.resources_faults_cleanup",
             "differential-resource-faults",

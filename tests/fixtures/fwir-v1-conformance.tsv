@@ -138,5 +138,4 @@ decoder.no_backend_before_verify	canonical-complete	public-backend-gate
 canonical.byte_identity	canonical-complete	corpus-hash
 canonical.host_neutral	canonical-complete	corpus-host-neutral
 surfaces.source_memory_decoded	canonical-complete	differential-runtime
-surfaces.c_native	canonical-complete	strict-native-journey
 surfaces.resources_faults_cleanup	canonical-complete	differential-resource-faults

@@ -2,8 +2,8 @@ use faraweave::{
     AllocationFailureInjection, Conversion, ErrorKind, EvaluationConfiguration, ExecutionProfile,
     Feature, FwirDecodeErrorKind, FwirDecodeLimits, FwirEncodeOptions, Invariant, LiftMode,
     NodeKind, ResourceErrorReason, ResourceLimits, ScalarType, Value, VerifyError,
-    compile_source_to_fwir, compile_source_to_verified_program, decode_fwir, emit_c_source,
-    encode_fwir, evaluate_expression, evaluate_expression_with_configuration,
+    compile_source_to_fwir, compile_source_to_verified_program, decode_fwir, encode_fwir,
+    evaluate_expression, evaluate_expression_with_configuration,
 };
 
 const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
@@ -360,16 +360,4 @@ fn exp_fwir_roundtrip_and_malformed_identities_are_checked() {
             if malformed.invariant == Invariant::MissingFeature
                 && malformed.field == "backend_native_math_v1"
     ));
-}
-
-#[test]
-fn exp_emitted_c_calls_math_h_exp_directly() {
-    let source = emit_c_source("exp[(0.0 1.0)]\n")
-        .expect("exp C emission")
-        .source;
-    assert!(source.contains("#include <math.h>"));
-    assert!(source.contains("result=exp(input);"));
-    assert!(source.contains("fw_set_double(out,fw_backend_native_exp(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_55("));
-    assert!(source.contains("static int fw_impl_55("));
 }
