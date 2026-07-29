@@ -310,6 +310,9 @@ impl<'a> IrCGenerator<'a> {
             ScalarKernel::TanDouble => {
                 "fw_set_double(out,fw_backend_native_tan(args[0].d));return 1;"
             }
+            ScalarKernel::FloorDouble => {
+                "fw_set_double(out,fw_backend_native_floor(args[0].d));return 1;"
+            }
             ScalarKernel::IotaInt => return Err(emission_error()),
         };
         writeln!(
@@ -1023,6 +1026,14 @@ static double fw_backend_native_tan(double value) {
   return fw_double_is_nan(result)
       ?fw_double_from_bits(UINT64_C(0x7ff8000000000000)):result;
 }
+static double fw_backend_native_floor(double value) {
+  FWStrictEnvironment environment;volatile double input=value,result=0.0;
+  fw_begin_strict_environment(&environment);
+  result=floor(input);
+  fw_restore_strict_environment(&environment);
+  return fw_double_is_nan(result)
+      ?fw_double_from_bits(UINT64_C(0x7ff8000000000000)):result;
+}
 static void fw_set_bool(FWV *out, int value) {
   (void)memset(out, 0, sizeof(*out)); out->b = value != 0;
 }
@@ -1385,6 +1396,7 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   (void)fw_backend_native_sin;
   (void)fw_backend_native_cos;
   (void)fw_backend_native_tan;
+  (void)fw_backend_native_floor;
   (void)fw_double_equal;
   (void)fw_double_less_than;
   (void)fw_set_int;
@@ -1600,9 +1612,9 @@ mod ir_tests {
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
               is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
               less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
-              sqrt[4.0]\nexp[1.0]\nlog[1.0]\nlog10[1.0]\nsin[1.0]\ncos[1.0]\ntan[1.0]\n",
+              sqrt[4.0]\nexp[1.0]\nlog[1.0]\nlog10[1.0]\nsin[1.0]\ncos[1.0]\ntan[1.0]\nfloor[1.5]\n",
         );
-        for implementation in (1..=41).filter(|implementation| *implementation != 34) {
+        for implementation in (1..=42).filter(|implementation| *implementation != 34) {
             assert!(
                 source.contains(&format!("static int fw_kernel_{implementation}(")),
                 "missing kernel {implementation}"

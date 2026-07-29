@@ -155,6 +155,13 @@ TAN_OUTPUT_LEAVES = (
     (0x3FF6_BE41_1F37_AC77, 16, 2.0**-46),
     (0xBF74_530C_FE72_9484, 16, 2.0**-46),
 )
+FLOOR_OUTPUT = (
+    b"0.0\n-0.0\n(inf -inf nan)\n"
+    b"(1.0 -2.0 0.0 -1.0)\n"
+    b"(0.0 -1.0 4.503599627370495e15 -4.503599627370496e15)\n"
+    b"(4.503599627370496e15 4.503599627370497e15)\n"
+    b"9.223372036854776e18\n1.7976931348623157e308\n"
+)
 NUMERIC_LEAF = re.compile(
     rb"(?<![A-Za-z0-9_.])[-+]?(?:[0-9]+\.[0-9]+|[0-9]+)"
     rb"(?:e[-+]?[0-9]+)?(?![A-Za-z0-9_.])"
@@ -1175,6 +1182,11 @@ def main() -> None:
                 [],
                 TAN_OUTPUT,
             ),
+            (
+                ROOT / "tests/fixtures/backend-native-floor.bennu",
+                [],
+                FLOOR_OUTPUT,
+            ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
             artifact = work / f"fixture-{index}.fwir"
@@ -1253,6 +1265,15 @@ def main() -> None:
             elif fixture.name == "backend-native-tan.bennu":
                 require_tan_output(generated_output, "generated tan output")
                 require_tan_output(evaluator_output, "evaluator tan output")
+            elif fixture.name == "backend-native-floor.bennu":
+                require(
+                    generated_output == FLOOR_OUTPUT,
+                    "generated floor output is not exact and canonical",
+                )
+                require(
+                    evaluator_output == FLOOR_OUTPUT,
+                    "evaluator floor output is not exact and canonical",
+                )
             else:
                 require(
                     generated_output == normalize_newlines(expected),
@@ -1281,6 +1302,7 @@ def main() -> None:
                 "backend-native-sin.bennu",
                 "backend-native-cos.bennu",
                 "backend-native-tan.bennu",
+                "backend-native-floor.bennu",
             }:
                 operation = fixture.stem.removeprefix("backend-native-")
                 hostile_source = work / f"{fixture.stem}-hostile.c"
@@ -1391,10 +1413,15 @@ int main(int argc, char **argv) {
                         hostile_output,
                         "cos hostile generated-C output",
                     )
-                else:
+                elif operation == "tan":
                     require_tan_output(
                         hostile_output,
                         "tan hostile generated-C output",
+                    )
+                else:
+                    require(
+                        hostile_output == FLOOR_OUTPUT,
+                        "floor hostile generated-C output is not exact and canonical",
                     )
             if index == 0 and platform.system() == "Linux":
                 sanitized = work / "fixture-sanitized"
