@@ -130,6 +130,31 @@ COS_OUTPUT_LEAVES = (
     (0xBFE2_6990_22AD_C4C1, 8, 2.0**-48),
     (0xBFEF_FFE6_2ECF_AB75, 8, 2.0**-48),
 )
+TAN_OUTPUT = (
+    b"0.0\n-0.0\n(nan nan nan)\n"
+    b"(1.5574077246549023 1.7320508075688767 1.633123935319537e16 "
+    b"-1.2246467991473532e-16)\n"
+    b"(3.5301143212171575e15 -6.218431163823738e15 "
+    b"5.443746451065123e15 -2.4492935982947064e-16)\n"
+    b"5e-324\n1.4214488238747245\n-0.004962015874444895\n"
+)
+# Signed-zero leaves are exact. Every other numeric leaf uses
+# FWIR-MATH-003's sixteen-ULP-or-2^-46-absolute checked-reference envelope.
+TAN_OUTPUT_LEAVES = (
+    (0x0000_0000_0000_0000, 0, 0.0),
+    (0x8000_0000_0000_0000, 0, 0.0),
+    (0x3FF8_EB24_5CBE_E3A6, 16, 2.0**-46),
+    (0x3FFB_B67A_E858_4CA8, 16, 2.0**-46),
+    (0x434D_0296_7C31_CDB5, 16, 2.0**-46),
+    (0xBCA1_A626_3314_5C07, 16, 2.0**-46),
+    (0x4329_153D_9443_ED0B, 16, 2.0**-46),
+    (0xC336_17A1_5494_767A, 16, 2.0**-46),
+    (0x4333_570E_FD76_8923, 16, 2.0**-46),
+    (0xBCB1_A626_3314_5C07, 16, 2.0**-46),
+    (0x0000_0000_0000_0001, 16, 2.0**-46),
+    (0x3FF6_BE41_1F37_AC77, 16, 2.0**-46),
+    (0xBF74_530C_FE72_9484, 16, 2.0**-46),
+)
 NUMERIC_LEAF = re.compile(
     rb"(?<![A-Za-z0-9_.])[-+]?(?:[0-9]+\.[0-9]+|[0-9]+)"
     rb"(?:e[-+]?[0-9]+)?(?![A-Za-z0-9_.])"
@@ -511,6 +536,19 @@ def cos_output_mismatch(
     )
 
 
+def tan_output_mismatch(
+    actual: bytes,
+    reference_output: bytes = TAN_OUTPUT,
+    leaf_specs: tuple[tuple[int, int, float], ...] = TAN_OUTPUT_LEAVES,
+) -> str | None:
+    return backend_math_output_mismatch_with_absolute(
+        "tan",
+        actual,
+        reference_output,
+        leaf_specs,
+    )
+
+
 def require_sqrt_output(actual: bytes, label: str) -> None:
     mismatch = sqrt_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
@@ -538,6 +576,11 @@ def require_sin_output(actual: bytes, label: str) -> None:
 
 def require_cos_output(actual: bytes, label: str) -> None:
     mismatch = cos_output_mismatch(actual)
+    require(mismatch is None, f"{label}: {mismatch}")
+
+
+def require_tan_output(actual: bytes, label: str) -> None:
+    mismatch = tan_output_mismatch(actual)
     require(mismatch is None, f"{label}: {mismatch}")
 
 
@@ -825,6 +868,79 @@ def validate_cos_output_comparator() -> None:
         )
 
 
+def validate_tan_output_comparator() -> None:
+    reference = b"0.0\n0.5\n-0.5\n"
+    leaves = (
+        (0x0000_0000_0000_0000, 0, 0.0),
+        (0x3FE0_0000_0000_0000, 16, 2.0**-46),
+        (0xBFE0_0000_0000_0000, 16, 2.0**-46),
+    )
+    require(
+        tan_output_mismatch(reference, reference, leaves) is None,
+        "tan comparator exact",
+    )
+    require(
+        tan_output_mismatch(
+            b"0.0\n0.5000000000000018\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "tan comparator +16 ULP",
+    )
+    require(
+        tan_output_mismatch(
+            b"0.0\n0.4999999999999991\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "tan comparator -16 ULP",
+    )
+    require(
+        tan_output_mismatch(
+            b"0.0\n0.5000000000000142\n-0.5\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "tan comparator absolute-error fallback",
+    )
+    for invalid, label in [
+        (b"0.0\n0.5000000000000143\n-0.5\n", "outside mixed envelope"),
+        (b"-0.0\n0.5\n-0.5\n", "signed zero"),
+        (b"0.0\n-0.5\n-0.5\n", "finite sign"),
+        (b"0.0\n0.5\nnan\n", "special value"),
+        (b"0.0\n(0.5)\n-0.5\n", "structure"),
+        (b"0.00\n0.5\n-0.5\n", "canonical exact formatting"),
+        (
+            b"0.0\n0.50000000000000180\n-0.5\n",
+            "allowed-neighbor trailing zero",
+        ),
+        (
+            b"0.0\n+0.5000000000000018\n-0.5\n",
+            "allowed-neighbor leading plus",
+        ),
+        (
+            b"0.0\n0.5000000000000018e0\n-0.5\n",
+            "allowed-neighbor redundant exponent",
+        ),
+        (
+            b"0.0\n0.49999999999999910\n-0.5\n",
+            "opposite-neighbor trailing zero",
+        ),
+        (
+            b"0.0\n0.4999999999999991e0\n-0.5\n",
+            "opposite-neighbor redundant exponent",
+        ),
+        (b"0.0\n-0.5\n0.5\n", "root order"),
+    ]:
+        require(
+            tan_output_mismatch(invalid, reference, leaves) is not None,
+            f"tan comparator accepted invalid {label}",
+        )
+
+
 def validate_backend_native_math_policy(
     compiler: str,
     environment: dict[str, str],
@@ -991,6 +1107,7 @@ def main() -> None:
     validate_log10_output_comparator()
     validate_sin_output_comparator()
     validate_cos_output_comparator()
+    validate_tan_output_comparator()
     executable = Path(
         os.environ.get(
             "FARAWEAVE_EXE",
@@ -1052,6 +1169,11 @@ def main() -> None:
                 ROOT / "tests/fixtures/backend-native-cos.bennu",
                 [],
                 COS_OUTPUT,
+            ),
+            (
+                ROOT / "tests/fixtures/backend-native-tan.bennu",
+                [],
+                TAN_OUTPUT,
             ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
@@ -1128,6 +1250,9 @@ def main() -> None:
             elif fixture.name == "backend-native-cos.bennu":
                 require_cos_output(generated_output, "generated cos output")
                 require_cos_output(evaluator_output, "evaluator cos output")
+            elif fixture.name == "backend-native-tan.bennu":
+                require_tan_output(generated_output, "generated tan output")
+                require_tan_output(evaluator_output, "evaluator tan output")
             else:
                 require(
                     generated_output == normalize_newlines(expected),
@@ -1155,6 +1280,7 @@ def main() -> None:
                 "backend-native-log10.bennu",
                 "backend-native-sin.bennu",
                 "backend-native-cos.bennu",
+                "backend-native-tan.bennu",
             }:
                 operation = fixture.stem.removeprefix("backend-native-")
                 hostile_source = work / f"{fixture.stem}-hostile.c"
@@ -1301,10 +1427,15 @@ int main(int argc, char **argv) {
                         hostile_output,
                         "sin hostile generated-C output",
                     )
-                else:
+                elif operation == "cos":
                     require_cos_output(
                         hostile_output,
                         "cos hostile generated-C output",
+                    )
+                else:
+                    require_tan_output(
+                        hostile_output,
+                        "tan hostile generated-C output",
                     )
             if index == 0:
                 hostile_source = work / "fixture-hostile-fp.c"
