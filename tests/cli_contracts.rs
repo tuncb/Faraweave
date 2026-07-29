@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -541,32 +542,94 @@ fn cli_parameters_and_diagnostics_contract() {
     let directory = unique("parameters");
     fs::create_dir_all(&directory).expect("mkdir");
     let source = directory.join("args.faraweave");
+    let artifact = directory.join("args.fwir");
     fs::write(
         &source,
         "parameters[n Int scale Double enabled Bool]\nn\nscale\nenabled\n",
     )
     .expect("source");
-    let success = Command::new(binary())
-        .args(["run"])
+    let compiled = Command::new(binary())
+        .arg("compile-ir")
         .arg(&source)
-        .args(["--", "-5", "2.5", "true"])
+        .args(["-o"])
+        .arg(&artifact)
         .output()
-        .expect("run");
-    assert!(success.status.success());
-    assert_eq!(success.stdout, b"-5\n2.5\ntrue\n");
-    let missing = Command::new(binary())
-        .args(["run"])
+        .expect("compile IR");
+    assert!(compiled.status.success(), "{:?}", compiled.stderr);
+
+    for (command, input) in [("run", &source), ("run-ir", &artifact)] {
+        let success = Command::new(binary())
+            .arg(command)
+            .arg(input)
+            .args(["--", "-5", "2.5", "true"])
+            .output()
+            .expect("runner");
+        assert!(success.status.success(), "{command}: {:?}", success.stderr);
+        assert_eq!(success.stdout, b"-5\n2.5\ntrue\n", "{command}");
+        assert!(success.stderr.is_empty(), "{command}");
+
+        let missing = Command::new(binary())
+            .arg(command)
+            .arg(input)
+            .args(["--", "-5"])
+            .output()
+            .expect("missing argument");
+        assert!(!missing.status.success(), "{command}");
+        assert!(missing.stdout.is_empty(), "{command}");
+        assert!(
+            missing
+                .stderr
+                .starts_with(b"faraweave_argument_error reason=missing"),
+            "{command}: {:?}",
+            missing.stderr
+        );
+    }
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn cli_run_and_run_ir_reject_invalid_unicode_arguments_identically() {
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[0xd800])
+    };
+
+    let directory = unique("invalid-unicode-arguments");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("args.faraweave");
+    let artifact = directory.join("args.fwir");
+    fs::write(&source, "parameters[n Int]\nn\n").expect("source");
+    let compiled = Command::new(binary())
+        .arg("compile-ir")
         .arg(&source)
-        .args(["--", "-5"])
+        .args(["-o"])
+        .arg(&artifact)
         .output()
-        .expect("missing");
-    assert!(!missing.status.success());
-    assert!(missing.stdout.is_empty());
-    assert!(
-        missing
-            .stderr
-            .starts_with(b"faraweave_argument_error reason=missing")
-    );
+        .expect("compile IR");
+    assert!(compiled.status.success(), "{:?}", compiled.stderr);
+
+    for (command, input) in [("run", &source), ("run-ir", &artifact)] {
+        let failure = Command::new(binary())
+            .arg(command)
+            .arg(input)
+            .arg("--")
+            .arg(&invalid)
+            .output()
+            .expect("runner with invalid Unicode");
+        assert!(!failure.status.success(), "{command}");
+        assert!(failure.stdout.is_empty(), "{command}");
+        assert_eq!(
+            failure.stderr, b"error: unable to decode Unicode command line\n",
+            "{command}"
+        );
+    }
+
     fs::remove_dir_all(directory).expect("cleanup");
 }
 
