@@ -274,6 +274,29 @@ def binary64_order_key(bits: int) -> int:
     return (~bits & 0xFFFF_FFFF_FFFF_FFFF) if bits >> 63 else bits | (1 << 63)
 
 
+def canonical_binary64_text(bits: int) -> bytes:
+    value = binary64(bits)
+    magnitude = abs(value)
+    if bits == 0:
+        return b"0.0"
+    if bits == 0x8000_0000_0000_0000:
+        return b"-0.0"
+    if magnitude >= 1.0e6 or magnitude < 1.0e-4:
+        for precision in range(17):
+            candidate = f"{value:.{precision}e}"
+            if binary64_bits(float(candidate)) == bits:
+                mantissa, exponent = candidate.split("e")
+                return f"{mantissa}e{int(exponent)}".encode("ascii")
+    else:
+        for precision in range(21):
+            candidate = f"{value:.{precision}f}"
+            if binary64_bits(float(candidate)) == bits:
+                if "." not in candidate:
+                    candidate += ".0"
+                return candidate.encode("ascii")
+    raise ValueError(f"cannot canonically format binary64 {bits:016x}")
+
+
 def numeric_leaf_view(output: bytes) -> tuple[bytes, list[bytes]]:
     skeleton = bytearray()
     leaves = []
@@ -338,7 +361,7 @@ def backend_math_output_mismatch(
                 f"{operation} numeric leaf {index} exceeds {max_ulps} ULP: "
                 f"actual={actual_bits:016x} reference={reference_bits:016x}"
             )
-        if actual_bits == reference_bits and actual_text != reference_text:
+        if actual_text != canonical_binary64_text(actual_bits):
             return (
                 f"{operation} numeric leaf {index} "
                 "changed canonical formatting"
@@ -493,6 +516,11 @@ def validate_exp_output_comparator() -> None:
     )
     for invalid, label in [
         (b"1.000000000000001\n0.0\n(2.0 inf nan)\n", "five ULPs"),
+        (b"1.00000000000000090\n0.0\n(2.0 inf nan)\n", "trailing zero"),
+        (b"+1.0000000000000009\n0.0\n(2.0 inf nan)\n", "leading plus"),
+        (b"1.0000000000000009e0\n0.0\n(2.0 inf nan)\n", "redundant exponent"),
+        (b"0.99999999999999960\n0.0\n(2.0 inf nan)\n", "neighbor trailing zero"),
+        (b"0.9999999999999996e0\n0.0\n(2.0 inf nan)\n", "neighbor exponent"),
         (b"1.0\n-0.0\n(2.0 inf nan)\n", "signed zero"),
         (b"1.0\n0.0\n[2.0 inf nan]\n", "structure"),
         (b"1.0\n0.0\n(2.0 nan nan)\n", "special value"),
