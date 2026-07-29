@@ -1,0 +1,8 @@
+inc 5
+sub[10 3]
+mul[6 7]
+div[-7 3]
+add[1 2.5]
+odd[7]
+greater_than[3.5 2]
+and[true not[false]]

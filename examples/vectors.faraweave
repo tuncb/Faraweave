@@ -1,0 +1,9 @@
+iota[5]
+add[iota[5] 10]
+mul[(1 2 3) (4 5 6)]
+equals[2 (1 2 3 2)]
+sort[(4 1 3 2)]
+length[(10 20 30)]
+sum[(1 2 3 4)]
+any_of[(false false true)]
+Double()

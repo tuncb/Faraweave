@@ -1,0 +1,8 @@
+sum[(1 2 3 4)]
+all_of[(true true false)]
+any_of[(false false true)]
+none_of[(false false false)]
+foldl[@add 0 (1 2 3 4)]
+foldl[@mul 1 iota[5]]
+scanl[@add 0 (1 2 3 4)]
+scanl[@and true (true true false true)]

@@ -1,0 +1,5 @@
+parameters[count Int scale Double enabled Bool]
+iota[count]
+mul[iota[count] scale]
+fanout[iota[count] {mul[_ scale]} {greater_than[_ 2]}]
+and[enabled greater_than[count 0]]

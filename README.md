@@ -135,6 +135,9 @@ cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
 cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
+More runnable programs are collected in the
+[examples guide](examples/README.md).
+
 Within the REPL, `.internal` prints a read-only view of the production semantic
 registry for overload and lifting diagnosis. Its human-readable text is an
 internal troubleshooting aid, not a stable machine-readable format or
