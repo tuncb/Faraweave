@@ -263,6 +263,7 @@ mod tests {
             ("exp[0]", "1.0"),
             ("log[1]", "0.0"),
             ("log10[1]", "0.0"),
+            ("sin[0]", "0.0"),
         ];
         for (source, expected) in cases {
             let value = evaluate_expression(source).expect(source).value;

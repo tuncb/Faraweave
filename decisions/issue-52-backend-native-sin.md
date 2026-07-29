@@ -1,0 +1,3 @@
+# Issue #52 — backend-native `sin`
+
+Primitive ID 33 uses signature and implementation IDs 39 with the existing unary Double elementwise plan, Int promotion, semantic 1.1, and mandatory feature 7. Rust calls `f64::sin` and generated C calls `<math.h>` `sin` inside the strict floating environment, preserving signed zero and canonicalizing non-finite NaNs without observing `errno` or exception flags. Finite results use the backend-native eight-ULP-or-2^-48-absolute envelope, including deliberately platform-sensitive large-argument range reduction, while resources, diagnostics, ownership, cleanup, and publication remain exact.
