@@ -25,6 +25,7 @@ structural tuples. The public primitives are:
 | Boolean reduction | `all_of` |
 | Boolean reduction | `any_of` |
 | Boolean reduction | `none_of` |
+| Explicit-initializer reduction | `foldl` |
 
 Calls use adjacent brackets (`sub[10 2.5]`) or right-associative prefix syntax
 (`inc iota 3`). Vectors use parentheses: `(1 2 3)`, `(false true)`,
@@ -77,6 +78,14 @@ input length, keeping work limits and resource observers position-independent.
 false, including the empty vector. It has its own selected identity,
 diagnostics, and resource producer while using the same complete-length work
 admission before an optional first-true short circuit.
+
+`foldl[@add init vector]` accepts a closed registered binary operation
+reference, a scalar initializer, and a homogeneous Bool, Int, or Double vector.
+It applies the reducer strictly left-to-right, returns the initializer without
+invoking the reducer for an empty vector, and charges the full vector length as
+work before the first step. Reducer overloads and the only permitted
+initializer promotion (`Int` to `Double`) are fixed during lowering; no backend
+performs runtime name lookup.
 
 The accepted [architecture](doc/architecture.md) and
 [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md) define
@@ -263,9 +272,9 @@ bracket calls, checked Int64 arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit
 currying, functions, effects, reductions other than `sum`, `all_of`, `any_of`,
-and `none_of`,
+`none_of`, and explicit-initializer `foldl`,
 multidimensional arrays, or container-wide operations other than `length`,
-`sort`, `sum`, `all_of`, `any_of`, and `none_of`.
+`sort`, `sum`, `all_of`, `any_of`, `none_of`, and `foldl`.
 
 Rust enums and vectors replace C++ tagged/plain records at the public boundary.
 Ordinary syntax remains visibly separated by parse, resolution, analysis, and

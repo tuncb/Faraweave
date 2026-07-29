@@ -73,7 +73,9 @@ physical format minor 1. With that feature, mandatory section
 `node:u32`, `application_plan_id:u16`, and `reserved:u16`. Every SelectedApply
 has exactly one nonzero plan record and the reserved field is zero.
 
-`NODE.a7` remains zero in every v1 minor. Semantic/format 1.0 artifacts omit
+`NODE.a7` remains zero except for a `foldl` SelectedApply under feature 6,
+where it is the one-based index of the selected reducer's `OPRF` record.
+Semantic/format 1.0 artifacts omit
 section 17, retain their exact canonical bytes, and keep their previous
 behavior. A 1.0 decoder path reconstructs plan ID 1 or 2
 from the already validated implementation identity before constructing
@@ -197,6 +199,29 @@ primitive, and resource producer remain `none_of` rather than `any_of`; the
 scalar result has no byte admission or allocation attempt, while invalid
 operands fail during static signature selection.
 
+## Explicit-initializer left fold (`FWIR-PLAN-011`)
+
+Primitive ID `27=foldl` has Bool, Int, and Double signatures with matching
+signature/implementation IDs 48, 49, and 50. Its runtime operands are a scalar
+initializer followed by a same-element-type whole vector; application-plan ID
+9 returns a scalar of that type and admits `OperandCardinality(2)` work.
+Initializer Int may promote to Double, while the whole vector permits only
+identity conversion.
+
+Source argument 1 is an `@name` reference resolved during lowering to a closed
+registered `Elementwise` descriptor with exactly `T × T -> T`; the SelectedApply
+stores the one-based `OPRF` link in `NODE.a7`. Unknown, wrong-arity,
+structural, incompatible-result, and ambiguous references are static errors,
+and verified backends dispatch the recorded reducer implementation ID without
+name lookup.
+
+Evaluation starts with the converted initializer and applies
+`accumulator op element` in increasing element order. Empty input returns the
+initializer without invoking the reducer; otherwise the full input length is
+charged before step zero, the first reducer fault records its zero-based step
+and operands, and the scalar result creates no byte admission or allocation
+attempt.
+
 ## Evidence (`FWIR-PLAN-004`)
 
 Registry unit tests cover stable plan lookup and changed operand/plan
@@ -241,3 +266,10 @@ Issue #45 maps `FWIR-PLAN-010` to
 `none_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`,
 `none_of_work_and_observer_trace_use_its_identity_at_every_decisive_position`,
 and the strict C11 success journey.
+Issue #46 maps `FWIR-PLAN-011` to
+`foldl_records_reducer_identity_initializer_conversion_and_vector_work_plan`,
+`foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities`,
+`foldl_accepts_bool_int_double_empty_dynamic_and_non_associative_reducers`,
+`foldl_reports_the_leftmost_reducer_fault_with_step_operands_and_reference_origin`,
+`foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly`,
+and the strict C11 success/failure journeys.

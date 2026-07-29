@@ -715,6 +715,7 @@ fn encode_sections(
                 signature_id,
                 implementation_id,
                 application_plan_id: _,
+                operation_reference,
                 primitive_origin,
                 lift,
                 result_element_type,
@@ -737,7 +738,17 @@ fn encode_sections(
                     shape.static_anchor.unwrap_or(NONE),
                     shape.dynamic_checks.start,
                     shape.dynamic_checks.count,
-                    0,
+                    operation_reference
+                        .map(|index| {
+                            index
+                                .0
+                                .checked_add(1)
+                                .ok_or(FwirEncodeError::CountOverflow {
+                                    field: "node.operation_reference",
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or(0),
                 ],
             ),
             NodeKind::PrefixSpreadPrepare => (5, 0, 0, [0; 8]),

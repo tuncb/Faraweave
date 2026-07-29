@@ -211,6 +211,7 @@ pub enum NodeKind {
         signature_id: u16,
         implementation_id: u16,
         application_plan_id: u16,
+        operation_reference: Option<OperationReferenceIndex>,
         primitive_origin: OriginIndex,
         lift: LiftMode,
         result_element_type: ScalarType,
@@ -1824,6 +1825,7 @@ fn verify_node(
             signature_id,
             implementation_id,
             application_plan_id,
+            operation_reference,
             primitive_origin,
             lift,
             result_element_type,
@@ -1838,6 +1840,7 @@ fn verify_node(
                 signature_id,
                 implementation_id,
                 application_plan_id,
+                operation_reference,
                 primitive_origin,
                 lift,
                 result_element_type,
@@ -1904,6 +1907,7 @@ fn verify_apply(
     signature_id: u16,
     implementation_id: u16,
     application_plan_id: u16,
+    operation_reference: Option<OperationReferenceIndex>,
     primitive_origin: OriginIndex,
     lift: LiftMode,
     result_element_type: ScalarType,
@@ -1911,8 +1915,8 @@ fn verify_apply(
     injection: VerifyAllocationFailureInjection,
 ) -> Result<(), VerifyError> {
     use crate::semantic_registry::{
-        OperandConsumption, ResultCardinality, WorkAdmission, application_plan_from_numeric,
-        implementation_from_numeric,
+        OperandConsumption, ResultCardinality, StructuralBehavior, WorkAdmission,
+        application_plan_from_numeric, implementation_from_numeric,
     };
     let descriptor = implementation_from_numeric(implementation_id).map_err(|_| {
         malformed(
@@ -1956,6 +1960,56 @@ fn verify_apply(
             Some(node_index),
             "application_plan_id",
         ));
+    }
+    match (descriptor.behavior, operation_reference) {
+        (StructuralBehavior::Foldl, Some(reference_index)) => {
+            let reference = program
+                .operation_references
+                .get(reference_index.0 as usize)
+                .ok_or_else(|| {
+                    malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "operation_reference",
+                    )
+                })?;
+            let reducer =
+                implementation_from_numeric(reference.implementation_id).map_err(|_| {
+                    malformed(
+                        Invariant::InvalidSemanticIdentity,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "operation_reference",
+                    )
+                })?;
+            let reducer_matches = reducer.primitive_id.numeric() == reference.primitive_id
+                && reducer.signature_id.numeric() == reference.signature_id
+                && reducer.behavior == StructuralBehavior::Elementwise
+                && reducer.result == descriptor.result
+                && reducer.parameters.len() == 2
+                && reducer.parameters.iter().all(|operand| {
+                    operand.consumption == OperandConsumption::Elementwise
+                        && operand.element_type == descriptor.result
+                });
+            if !reducer_matches {
+                return Err(malformed(
+                    Invariant::InvalidSemanticIdentity,
+                    RecordKind::Node,
+                    Some(node_index),
+                    "operation_reference",
+                ));
+            }
+        }
+        (StructuralBehavior::Foldl, None) | (_, Some(_)) => {
+            return Err(malformed(
+                Invariant::InvalidRecord,
+                RecordKind::Node,
+                Some(node_index),
+                "operation_reference",
+            ));
+        }
+        (_, None) => {}
     }
     if let WorkAdmission::OperandCardinality(position) = application_plan.resources.work
         && (position == 0
@@ -3205,6 +3259,7 @@ mod tests {
                 signature_id: 9,
                 implementation_id: 9,
                 application_plan_id: 1,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::Vector,
                 result_element_type: ScalarType::Int,
@@ -3264,6 +3319,7 @@ mod tests {
                 signature_id: 34,
                 implementation_id: 34,
                 application_plan_id: 2,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::DynamicVector,
                 result_element_type: ScalarType::Int,
@@ -3340,6 +3396,16 @@ mod tests {
         }
     }
 
+    fn foldl_program() -> RawProgram {
+        match crate::lowering::compile_source_with_name(
+            "foldl[@sub 20 (3 4 5)]\n",
+            "foldl.faraweave",
+        ) {
+            Ok(program) => program.raw,
+            Err(error) => panic!("foldl fixture did not lower: {error}"),
+        }
+    }
+
     fn dynamic_shape_program() -> RawProgram {
         let mut builder = RawProgramBuilder::new();
         must(builder.push_feature(Feature::StableSemanticIds.numeric()));
@@ -3383,6 +3449,7 @@ mod tests {
                 signature_id: 34,
                 implementation_id: 34,
                 application_plan_id: 2,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::DynamicVector,
                 result_element_type: ScalarType::Int,
@@ -3411,6 +3478,7 @@ mod tests {
                 signature_id: 34,
                 implementation_id: 34,
                 application_plan_id: 2,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::DynamicVector,
                 result_element_type: ScalarType::Int,
@@ -3443,6 +3511,7 @@ mod tests {
                 signature_id: 9,
                 implementation_id: 9,
                 application_plan_id: 1,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::Vector,
                 result_element_type: ScalarType::Int,
@@ -3520,6 +3589,7 @@ mod tests {
                 signature_id: 9,
                 implementation_id: 9,
                 application_plan_id: 1,
+                operation_reference: None,
                 primitive_origin: OriginIndex(0),
                 lift: LiftMode::Scalar,
                 result_element_type: ScalarType::Int,
@@ -3648,6 +3718,7 @@ mod tests {
                 signature_id: 1,
                 implementation_id: 1,
                 application_plan_id: 1,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::Scalar,
                 result_element_type: ScalarType::Int,
@@ -3727,6 +3798,7 @@ mod tests {
                 signature_id: 1,
                 implementation_id: 1,
                 application_plan_id: 1,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::Scalar,
                 result_element_type: ScalarType::Int,
@@ -4126,6 +4198,7 @@ mod tests {
                 signature_id: 9,
                 implementation_id: 9,
                 application_plan_id: 1,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::Scalar,
                 result_element_type: ScalarType::Int,
@@ -5030,6 +5103,124 @@ mod tests {
     }
 
     #[test]
+    fn foldl_plan_and_reducer_reference_are_verified_as_one_closed_selection() {
+        assert!(foldl_program().verify().is_ok());
+
+        let mut missing_reference = foldl_program();
+        let Some(node) = missing_reference.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 27,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing foldl node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut operation_reference,
+            ..
+        } = node.kind
+        else {
+            panic!("foldl node kind changed");
+        };
+        *operation_reference = None;
+        verify_error(missing_reference, Invariant::InvalidRecord);
+
+        let mut out_of_bounds = foldl_program();
+        let Some(node) = out_of_bounds.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 27,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing foldl node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut operation_reference,
+            ..
+        } = node.kind
+        else {
+            panic!("foldl node kind changed");
+        };
+        *operation_reference = Some(OperationReferenceIndex(99));
+        verify_error(out_of_bounds, Invariant::IndexOutOfBounds);
+
+        let mut incompatible_reducer = foldl_program();
+        incompatible_reducer.operation_references[0] = OperationReference {
+            primitive_id: 8,
+            signature_id: 16,
+            implementation_id: 16,
+            origin: incompatible_reducer.operation_references[0].origin,
+        };
+        verify_error(incompatible_reducer, Invariant::InvalidSemanticIdentity);
+
+        let mut wrong_plan = foldl_program();
+        let Some(node) = wrong_plan.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 27,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing foldl node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut application_plan_id,
+            ..
+        } = node.kind
+        else {
+            panic!("foldl node kind changed");
+        };
+        *application_plan_id = 8;
+        verify_error(wrong_plan, Invariant::InvalidSemanticIdentity);
+
+        let mut missing_feature = foldl_program();
+        missing_feature
+            .features
+            .retain(|feature| *feature != Feature::OperationReferences.numeric());
+        missing_feature.module.ranges.features.count =
+            u32::try_from(missing_feature.features.len()).unwrap_or(u32::MAX);
+        verify_error(missing_feature, Invariant::MissingFeature);
+
+        let mut unexpected_reference = none_of_program();
+        unexpected_reference
+            .operation_references
+            .push(foldl_program().operation_references[0]);
+        unexpected_reference
+            .module
+            .ranges
+            .operation_references
+            .count = 1;
+        let Some(node) = unexpected_reference.nodes.iter_mut().find(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    primitive_id: 26,
+                    ..
+                }
+            )
+        }) else {
+            panic!("missing none_of node");
+        };
+        let NodeKind::SelectedApply {
+            ref mut operation_reference,
+            ..
+        } = node.kind
+        else {
+            panic!("none_of node kind changed");
+        };
+        *operation_reference = Some(OperationReferenceIndex(0));
+        verify_error(unexpected_reference, Invariant::InvalidRecord);
+    }
+
+    #[test]
     fn fan_out_region_placeholder_and_result_invariants_are_rejected() {
         let mut placeholder = fan_out_program();
         placeholder.edges[0].access = ValueAccess::WholeValue;
@@ -5123,6 +5314,7 @@ mod tests {
                         signature_id: 34,
                         implementation_id: 34,
                         application_plan_id: 2,
+                        operation_reference: None,
                         primitive_origin: origin,
                         lift: LiftMode::DynamicVector,
                         result_element_type: ScalarType::Int,
@@ -5238,6 +5430,7 @@ mod tests {
                 signature_id: 9,
                 implementation_id: 9,
                 application_plan_id: 1,
+                operation_reference: None,
                 primitive_origin: origin,
                 lift: LiftMode::Vector,
                 result_element_type: ScalarType::Int,
@@ -5565,6 +5758,7 @@ mod tests {
                     signature_id: 1,
                     implementation_id: 1,
                     application_plan_id: 1,
+                    operation_reference: None,
                     primitive_origin: origin,
                     lift: LiftMode::Scalar,
                     result_element_type: ScalarType::Int,
@@ -5640,6 +5834,7 @@ mod tests {
                     signature_id: 1,
                     implementation_id: 1,
                     application_plan_id: 1,
+                    operation_reference: None,
                     primitive_origin: origin,
                     lift: LiftMode::Scalar,
                     result_element_type: ScalarType::Int,

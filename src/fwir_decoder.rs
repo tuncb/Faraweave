@@ -1,10 +1,11 @@
 use crate::{
     Cardinality, ConstantIndex, ConstantRecord, Conversion, Edge, FanOutBranch, Feature,
-    IndexRange, LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, OperationReference, Origin,
-    OriginIndex, OriginPosition, OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex,
-    ProgramRanges, RawProgram, ReleaseAfter, Root, RootIndex, ScalarConstant, ScalarType,
-    ShapePlan, SourceUnit, SourceUnitIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
-    VerifyAllocationFailureInjection, VerifyAllocationSite, VerifyError,
+    IndexRange, LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, OperationReference,
+    OperationReferenceIndex, Origin, OriginIndex, OriginPosition, OriginSpan, Ownership,
+    OwnershipMode, Parameter, ParameterIndex, ProgramRanges, RawProgram, ReleaseAfter, Root,
+    RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit, SourceUnitIndex, TypeIndex,
+    TypeRecord, ValueAccess, VerifiedProgram, VerifyAllocationFailureInjection,
+    VerifyAllocationSite, VerifyError,
 };
 use std::collections::TryReserveError;
 
@@ -1238,9 +1239,25 @@ fn has_application_plans_feature(bytes: &[u8], plan: &DecodePlan) -> Result<bool
     Ok(false)
 }
 
+fn has_operation_references_feature(
+    bytes: &[u8],
+    plan: &DecodePlan,
+) -> Result<bool, FwirDecodeError> {
+    let Some(features) = section(plan, 2) else {
+        return Ok(false);
+    };
+    for index in 0..features.record_count() {
+        if record_u16(bytes, features, index, 0)? == Feature::OperationReferences.numeric() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeError> {
     validate_features(bytes, plan)?;
     let explicit_application_plans = has_application_plans_feature(bytes, plan)?;
+    let explicit_operation_references = has_operation_references_feature(bytes, plan)?;
 
     if let Some(sources) = section(plan, 4) {
         for index in 0..sources.record_count() {
@@ -1365,7 +1382,6 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                         || arguments[0..3]
                             .iter()
                             .any(|value| *value > u32::from(u16::MAX))
-                        || arguments[7] != 0
                     {
                         return Err(record_error(nodes, index, 2, "selected_apply"));
                     }
@@ -1392,6 +1408,24 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                         || !identities_match
                     {
                         return Err(record_error(nodes, index, 24, "semantic_id"));
+                    }
+                    let is_foldl = implementation_descriptor.is_ok_and(|descriptor| {
+                        descriptor.behavior == crate::semantic_registry::StructuralBehavior::Foldl
+                    });
+                    let reference_count =
+                        section(plan, 18).map_or(0, |references| references.record_count());
+                    if is_foldl {
+                        let reference = arguments[7];
+                        if !explicit_operation_references
+                            || reference == 0
+                            || usize::try_from(reference - 1)
+                                .ok()
+                                .is_none_or(|index| index >= reference_count)
+                        {
+                            return Err(record_error(nodes, index, 52, "operation_reference"));
+                        }
+                    } else if arguments[7] != 0 {
+                        return Err(record_error(nodes, index, 52, "operation_reference"));
                     }
                 }
                 6 => {
@@ -1991,6 +2025,10 @@ fn reconstruct_program(
                             .map_err(|_| record_error(records, index, 28, "semantic_id"))?,
                         implementation_id,
                         application_plan_id,
+                        operation_reference: match record_u32(bytes, records, index, 52)? {
+                            0 => None,
+                            encoded => Some(OperationReferenceIndex(encoded - 1)),
+                        },
                         primitive_origin: OriginIndex(record_u32(bytes, records, index, 36)?),
                         lift,
                         result_element_type: scalar_type_from_tag(record_u8(
@@ -2853,6 +2891,13 @@ mod tests {
         ))
     }
 
+    fn foldl_program() -> VerifiedProgram {
+        must(crate::lowering::compile_source_with_name(
+            "foldl[@sub 20 (3 4 5)]\n",
+            "foldl.faraweave",
+        ))
+    }
+
     fn planned_program_with_features(
         depth: u32,
         explicit_application_plans: bool,
@@ -2922,6 +2967,7 @@ mod tests {
                     signature_id: 1,
                     implementation_id: 1,
                     application_plan_id: 1,
+                    operation_reference: None,
                     primitive_origin: origin,
                     lift: LiftMode::Scalar,
                     result_element_type: ScalarType::Int,
@@ -3310,6 +3356,72 @@ mod tests {
                         invariant: crate::Invariant::InconsistentResultMetadata,
                         record: crate::RecordKind::Node,
                         field: "result",
+                        ..
+                    }
+                )),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn foldl_plan_and_reducer_link_roundtrip_and_reject_malformed_records() {
+        let encoded = must(encode_fwir(&foldl_program(), &FwirEncodeOptions::default()));
+        assert_eq!(read_u16(&encoded, 10, None, None), Ok(1));
+        let (_, plans, plans_length) = test_section(&encoded, 17);
+        assert_eq!(plans_length, 8);
+        assert_eq!(read_u16(&encoded, plans + 4, Some(17), Some(0)), Ok(9));
+        let (_, references, references_length) = test_section(&encoded, 18);
+        assert_eq!(references_length, 16);
+        let (_, nodes, nodes_length) = test_section(&encoded, 14);
+        let foldl_node = encoded[nodes..nodes + nodes_length]
+            .chunks_exact(56)
+            .position(|record| record[0] == 4 && test_u32(record, 24) == 27)
+            .map(|index| nodes + index * 56)
+            .unwrap_or(nodes);
+        assert_eq!(read_u32(&encoded, foldl_node + 52, Some(14), None), Ok(1));
+        let decoded = must(decode_fwir(&encoded, &FwirDecodeLimits::default()));
+        assert_eq!(
+            must(encode_fwir(&decoded, &FwirEncodeOptions::default())),
+            encoded
+        );
+
+        let mut missing_reference = encoded.clone();
+        put_u32_at(&mut missing_reference, foldl_node + 52, 0);
+        assert_noncanonical_record(
+            &missing_reference,
+            "operation_reference",
+            foldl_node + 52,
+            14,
+            Some(((foldl_node - nodes) / 56) as u32),
+        );
+
+        let mut out_of_bounds = encoded.clone();
+        put_u32_at(&mut out_of_bounds, foldl_node + 52, 2);
+        assert_noncanonical_record(
+            &out_of_bounds,
+            "operation_reference",
+            foldl_node + 52,
+            14,
+            Some(((foldl_node - nodes) / 56) as u32),
+        );
+
+        let mut wrong_plan = encoded.clone();
+        put_u16_at(&mut wrong_plan, plans + 4, 8);
+        assert_noncanonical_record(&wrong_plan, "application_plan_id", plans + 4, 17, Some(0));
+
+        let mut incompatible_reference = encoded;
+        put_u16_at(&mut incompatible_reference, references, 8);
+        put_u16_at(&mut incompatible_reference, references + 2, 16);
+        put_u16_at(&mut incompatible_reference, references + 4, 16);
+        assert!(matches!(
+            decode_fwir(&incompatible_reference, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                    crate::MalformedProgram {
+                        invariant: crate::Invariant::InvalidSemanticIdentity,
+                        record: crate::RecordKind::Node,
+                        field: "operation_reference",
                         ..
                     }
                 )),

@@ -379,7 +379,7 @@ def main() -> None:
             (
                 ROOT / "tests/fixtures/parameterized-artifact-success.bennu",
                 ["3", "2.5", "true"],
-                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n5.5\nfalse\n",
+                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n6\n5.5\nfalse\n",
             ),
             (
                 ROOT / "tests/fixtures/parameterized-artifact-double.bennu",
@@ -557,21 +557,36 @@ int main(int argc, char **argv) {
                     "output-device failure diagnostic",
                 )
 
-        for name, source_text, expected_reason in [
+        for name, source_text, expected_column, expected_reason in [
             (
                 "div-zero",
                 "div[(8 9 10) (2 0 5)]\n",
+                1,
                 b"DomainError: div failed: division_by_zero at result index 1\n",
             ),
             (
                 "div-overflow",
                 "div[-9223372036854775808 -1]\n",
+                1,
                 b"DomainError: div failed: integer_overflow\n",
             ),
             (
                 "sum-overflow",
                 "sum[(9223372036854775807 1 -1)]\n",
+                1,
                 b"DomainError: sum failed: integer_overflow at result index 1\n",
+            ),
+            (
+                "foldl-overflow",
+                "foldl[@add 9223372036854775807 (1)]\n",
+                7,
+                b"DomainError: add failed: integer_overflow at result index 0\n",
+            ),
+            (
+                "foldl-div-zero",
+                "foldl[@div 8 (2 0 4)]\n",
+                7,
+                b"DomainError: div failed: division_by_zero at result index 1\n",
             ),
         ]:
             fixture = work / f"{name}.bennu"
@@ -633,8 +648,11 @@ int main(int argc, char **argv) {
                 f"evaluator={evaluator.stderr!r} artifact={artifact_runner.stderr!r}",
             )
             require(
-                evaluator.stderr.endswith(b":1:1: " + expected_reason)
-                and generated.stderr == b"<generated>:1:1: " + expected_reason,
+                evaluator.stderr.endswith(
+                    f":1:{expected_column}: ".encode() + expected_reason
+                )
+                and generated.stderr
+                == f"<generated>:1:{expected_column}: ".encode() + expected_reason,
                 f"{name} exact diagnostic reason",
             )
 
@@ -799,7 +817,7 @@ int main(int argc, char **argv) {
         )
         require(
             normalize_newlines(native_result.stdout)
-            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n5.5\nfalse\n",
+            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n6\n5.5\nfalse\n",
             "native build output",
         )
         artifact = work / "native-build.fwir"

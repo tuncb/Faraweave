@@ -1,5 +1,8 @@
 use crate::evaluator::{EvaluationConfiguration, ProgramResult};
-use crate::primitive::{SelectedApplicationArgument, apply_implementation, implementation_name};
+use crate::primitive::{
+    SelectedApplicationArgument, apply_foldl_implementation, apply_implementation,
+    implementation_name,
+};
 use crate::resources::ResourceContext;
 use crate::{
     ArgumentErrorContext, ArgumentErrorReason, ConstantRecord, Edge, Error, ErrorKind, Feature,
@@ -157,6 +160,7 @@ impl<'a> Interpreter<'a> {
             NodeKind::SelectedApply {
                 implementation_id,
                 application_plan_id,
+                operation_reference,
                 lift,
                 result_element_type,
                 shape,
@@ -166,6 +170,7 @@ impl<'a> Interpreter<'a> {
                 node,
                 implementation_id,
                 application_plan_id,
+                operation_reference,
                 lift,
                 result_element_type,
                 shape,
@@ -236,6 +241,7 @@ impl<'a> Interpreter<'a> {
         node: crate::Node,
         implementation_id: u16,
         application_plan_id: u16,
+        operation_reference: Option<crate::OperationReferenceIndex>,
         lift: crate::LiftMode,
         result_type: ScalarType,
         shape: crate::ShapePlan,
@@ -253,15 +259,35 @@ impl<'a> Interpreter<'a> {
                 conversion: edge.conversion,
             });
         }
-        let applied = apply_implementation(
-            implementation_id,
-            application_plan_id,
-            &arguments,
-            lift,
-            result_type,
-            location,
-            &mut self.resources,
-        );
+        let applied = if let Some(reference_index) = operation_reference {
+            let reference = *self
+                .raw
+                .operation_references
+                .get(reference_index.0 as usize)
+                .ok_or_else(|| execution_invariant_error(location))?;
+            let reference_location = self.origin_location(reference.origin)?;
+            apply_foldl_implementation(
+                implementation_id,
+                application_plan_id,
+                &reference,
+                &arguments,
+                lift,
+                result_type,
+                location,
+                reference_location,
+                &mut self.resources,
+            )
+        } else {
+            apply_implementation(
+                implementation_id,
+                application_plan_id,
+                &arguments,
+                lift,
+                result_type,
+                location,
+                &mut self.resources,
+            )
+        };
         drop(arguments);
         let (value, accounted) = applied?;
         self.put_owned(index, value, accounted)?;
@@ -1010,6 +1036,8 @@ mod tests {
             ("any_of[(false true false)]\n", vec![]),
             ("none_of[Bool()]\n", vec![]),
             ("none_of[(false true false)]\n", vec![]),
+            ("foldl[@sub 20 (3 4 5)]\n", vec![]),
+            ("foldl[@add 1 (2.5 3.5)]\n", vec![]),
             ("add [1 2]\n", vec![]),
             ("[1 (2 3) true]\n", vec![]),
             ("fanout[iota[3] {inc[_]} {add[_ 10]}]\n", vec![]),
@@ -1061,6 +1089,9 @@ mod tests {
             "all_of[(true false)]\n",
             "any_of[(true false)]\n",
             "none_of[(true false)]\n",
+            "foldl[@and true (true false)]\n",
+            "foldl[@sub 10 (1 2)]\n",
+            "foldl[@add 1 (2.0 3.0)]\n",
             "equals[true false]\n",
             "equals[1 2]\n",
             "equals[1.0 2.0]\n",

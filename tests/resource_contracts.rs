@@ -25,6 +25,7 @@ static SUM_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::
 static ALL_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static ANY_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static NONE_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static FOLDL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
@@ -112,6 +113,20 @@ fn observe_any_of_resource_event(event: &faraweave::ResourceEvent<'_>) {
 
 fn observe_none_of_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = NONE_OF_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_foldl_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = FOLDL_RESOURCE_EVENTS.lock() {
         events.push(ObservedResourceEvent {
             kind: event.kind,
             producer: event.producer.to_owned(),
@@ -1175,6 +1190,105 @@ fn none_of_empty_allocation_and_work_refusal_precedence_are_exact() {
     assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
     assert_eq!(resource(&refusal).usage_before, Some(0));
     assert_eq!(resource(&refusal).refused_charge, Some(3));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly() {
+    for source in [
+        "foldl[@sub 20 (3 4 5)]",
+        "foldl[@add 0 (3 4 5)]",
+        "foldl[@div 60 (3 4 5)]",
+    ] {
+        FOLDL_RESOURCE_EVENTS.lock().expect("event lock").clear();
+        let result = faraweave::evaluate_expression_with_observer(
+            source,
+            EvaluationConfiguration::default(),
+            observe_foldl_resource_event,
+        )
+        .expect("foldl reduction");
+        assert_eq!(result.usage.work_units, 3, "{source}");
+        assert_eq!(result.usage.allocation_attempts, 1, "{source}");
+        let events = FOLDL_RESOURCE_EVENTS.lock().expect("event lock").clone();
+        assert_eq!(events.len(), 3, "{source}");
+        assert_eq!(events[0].producer, "vector_literal", "{source}");
+        assert_eq!(events[0].bytes, Some(24), "{source}");
+        assert_eq!(events[1].producer, "foldl", "{source}");
+        assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+        assert_eq!(events[1].bytes, None, "{source}");
+        assert_eq!(events[1].work, 3, "{source}");
+        assert_eq!(events[1].ordinal, None, "{source}");
+        assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    }
+
+    FOLDL_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let fault = faraweave::evaluate_expression_with_observer(
+        "foldl[@div 10 (0 2)]",
+        EvaluationConfiguration::default(),
+        observe_foldl_resource_event,
+    )
+    .expect_err("first reducer step faults");
+    assert_eq!(fault.kind, ErrorKind::DomainError);
+    let usage = fault.usage.expect("post-cleanup foldl usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 2);
+    assert_eq!(usage.allocation_attempts, 1);
+    let events = FOLDL_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].producer, "foldl");
+    assert_eq!(events[1].work, 2);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 0);
+}
+
+#[test]
+fn foldl_empty_allocation_and_work_refusal_precedence_are_exact() {
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "foldl[@add 0 (1 2 3)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("foldl performs no result allocation");
+    assert_eq!(no_result_allocation.value, Value::Int(6));
+    assert_eq!(no_result_allocation.usage.work_units, 3);
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let empty = evaluate_expression_with_configuration(
+        "foldl[@div 7 Int()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty foldl has no allocation ordinal");
+    assert_eq!(empty.value, Value::Int(7));
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+
+    let refusal = evaluate_expression_with_configuration(
+        "foldl[@div 10 (0)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(8),
+            max_work_units: Some(0),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("foldl work refusal precedes reducer fault");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(refusal.primitive.as_deref(), Some("foldl"));
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(0));
+    assert_eq!(resource(&refusal).refused_charge, Some(1));
     let usage = refusal.usage.expect("post-cleanup usage");
     assert_eq!(usage.live_evaluation_bytes, 0);
     assert_eq!(usage.work_units, 0);

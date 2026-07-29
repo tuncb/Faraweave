@@ -178,7 +178,7 @@ impl<'a> IrCGenerator<'a> {
 
     fn emit_selected_implementation_wrappers(&mut self) -> Result<(), Error> {
         for descriptor in SEMANTIC_REGISTRY {
-            let used = self.program.nodes.iter().any(|node| {
+            let selected = self.program.nodes.iter().any(|node| {
                 matches!(
                     node.kind,
                     NodeKind::SelectedApply {
@@ -187,7 +187,10 @@ impl<'a> IrCGenerator<'a> {
                     } if implementation_id == descriptor.implementation_id.numeric()
                 )
             });
-            if !used {
+            let referenced = self.program.operation_references.iter().any(|reference| {
+                reference.implementation_id == descriptor.implementation_id.numeric()
+            });
+            if !selected && !referenced {
                 continue;
             }
             let implementation = descriptor.implementation_id.numeric();
@@ -313,7 +316,63 @@ impl<'a> IrCGenerator<'a> {
                 .map_err(|_| emission_error())?;
                 continue;
             }
+            if matches!(
+                descriptor.kernel,
+                ScalarKernel::FoldlBool | ScalarKernel::FoldlInt | ScalarKernel::FoldlDouble
+            ) {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::Scalar
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(2)
+                {
+                    return Err(emission_error());
+                }
+                let mut emitted_references = Vec::new();
+                emitted_references
+                    .try_reserve(self.program.operation_references.len())
+                    .map_err(|_| emission_error())?;
+                for node in &self.program.nodes {
+                    let NodeKind::SelectedApply {
+                        implementation_id,
+                        operation_reference: Some(reference_index),
+                        ..
+                    } = node.kind
+                    else {
+                        continue;
+                    };
+                    if implementation_id != implementation {
+                        continue;
+                    }
+                    let reference = self
+                        .program
+                        .operation_references
+                        .get(reference_index.0 as usize)
+                        .ok_or_else(emission_error)?;
+                    if emitted_references.contains(&reference_index) {
+                        continue;
+                    }
+                    let reducer = implementation_from_numeric(reference.implementation_id)
+                        .map_err(|_| emission_error())?;
+                    let reference_origin = self.origin(reference.origin.0)?;
+                    emitted_references.push(reference_index);
+                    writeln!(
+                        self.definitions,
+                        "static int fw_impl_{implementation}_opr_{}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)lift; return fw_apply_selected_foldl(fw_kernel_{}, {}, {}, args, out, line, column, {}U, {}U, conversions); }}",
+                        reference_index.0,
+                        reference.implementation_id,
+                        c_string(descriptor.primitive_name),
+                        c_string(reducer.primitive_name),
+                        reference_origin.span.begin.line,
+                        reference_origin.span.begin.column,
+                    )
+                    .map_err(|_| emission_error())?;
+                }
+                continue;
+            }
             self.emit_selected_kernel(implementation, descriptor.kernel)?;
+            if !selected {
+                continue;
+            }
             writeln!(
                 self.definitions,
                 "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ return fw_apply_selected(fw_kernel_{implementation}, {}, {}, args, count, out, line, column, origins, origin_count, static_anchor, shape_checks, shape_count, conversions, lift); }}",
@@ -421,6 +480,9 @@ impl<'a> IrCGenerator<'a> {
             | ScalarKernel::AllOfBoolVector
             | ScalarKernel::AnyOfBoolVector
             | ScalarKernel::NoneOfBoolVector
+            | ScalarKernel::FoldlBool
+            | ScalarKernel::FoldlInt
+            | ScalarKernel::FoldlDouble
             | ScalarKernel::IotaInt => return Err(emission_error()),
         };
         writeln!(
@@ -451,14 +513,20 @@ impl<'a> IrCGenerator<'a> {
             NodeKind::SelectedApply {
                 implementation_id,
                 application_plan_id,
+                operation_reference,
                 primitive_origin: _,
                 lift,
                 result_element_type: _,
                 shape,
                 ..
-            } => {
-                self.emit_ir_selected(node, implementation_id, application_plan_id, lift, shape)?
-            }
+            } => self.emit_ir_selected(
+                node,
+                implementation_id,
+                application_plan_id,
+                operation_reference,
+                lift,
+                shape,
+            )?,
             NodeKind::FanOut { branches, .. } => self.emit_ir_fan_out(node, branches)?,
         }
         self.definitions.push_str("}\n");
@@ -602,6 +670,7 @@ impl<'a> IrCGenerator<'a> {
         node: Node,
         implementation_id: u16,
         application_plan_id: u16,
+        operation_reference: Option<crate::OperationReferenceIndex>,
         lift: LiftMode,
         shape: crate::ShapePlan,
     ) -> Result<(), Error> {
@@ -707,9 +776,14 @@ impl<'a> IrCGenerator<'a> {
             write!(self.definitions, "{relative}U,").map_err(|_| emission_error())?;
         }
         self.definitions.push_str("0U};\n");
+        let implementation_name = if let Some(reference_index) = operation_reference {
+            format!("fw_impl_{implementation_id}_opr_{}", reference_index.0)
+        } else {
+            format!("fw_impl_{implementation_id}")
+        };
         writeln!(
             self.definitions,
-            "  ok = fw_impl_{implementation_id}(args, {}U, out, {}U, {}U, origins, {}U, {}, shape_checks, {}U, conversions, {});",
+            "  ok = {implementation_name}(args, {}U, out, {}U, {}U, origins, {}U, {}, shape_checks, {}U, conversions, {});",
             edges.len(),
             origin.span.begin.line,
             origin.span.begin.column,
@@ -1402,6 +1476,22 @@ static int fw_apply_selected_none_of(const char *name,const FWV *args,FWV *out,
   }
   fw_set_bool(out,1);return 1;
 }
+static int fw_apply_selected_foldl(FWSelectedKernel reducer,const char *name,
+                                   const char *reducer_name,const FWV *args,FWV *out,
+                                   size_t line,size_t column,size_t reducer_line,
+                                   size_t reducer_column,const int *conversions) {
+  FWV accumulator=fw_scalar_at_selected(args,0U,conversions[0]);
+  size_t index;
+  if(!fw_charge_work(args[1].len,name,line,column))return 0;
+  for(index=0U;index<args[1].len;++index){
+    FWV reducer_args[2]={{0}};FWV next={0};
+    reducer_args[0]=accumulator;
+    reducer_args[1]=fw_scalar_at(&args[1],index);
+    if(!reducer(reducer_args,&next,reducer_name,reducer_line,reducer_column,index,1))return 0;
+    accumulator=next;
+  }
+  *out=accumulator;return 1;
+}
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
 static int fw_append(FWBuffer *buffer,const char *text) {
   size_t n=strlen(text),needed; char *grown;
@@ -1577,6 +1667,7 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   (void)fw_apply_selected_all_of;
   (void)fw_apply_selected_any_of;
   (void)fw_apply_selected_none_of;
+  (void)fw_apply_selected_foldl;
   (void)fw_selected_integer_overflow;
   (void)fw_selected_division_by_zero;
   (void)fw_as_double;
@@ -1808,7 +1899,8 @@ mod ir_tests {
              length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
              sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n\
              sum[(1 2)]\nsum[(1.0 2.0)]\nall_of[(true false)]\nany_of[(true false)]\n\
-             none_of[(true false)]\n",
+             none_of[(true false)]\nfoldl[@and true (true false)]\n\
+             foldl[@sub 10 (1 2)]\nfoldl[@add 1 (2.0 3.0)]\n",
         );
         for implementation in (1..=36).filter(|implementation| *implementation != 34) {
             assert!(
@@ -1867,6 +1959,14 @@ mod ir_tests {
             source.matches("return fw_apply_selected_none_of(").count(),
             1
         );
+        for (reference, implementation, reducer) in [(0, 48, 22), (1, 49, 11), (2, 50, 10)] {
+            assert!(source.contains(&format!(
+                "static int fw_impl_{implementation}_opr_{reference}("
+            )));
+            assert!(source.contains(&format!(
+                "return fw_apply_selected_foldl(fw_kernel_{reducer},"
+            )));
+        }
         assert!(!source.contains("fw_apply_scalar"));
         assert!(!source.contains("primitive=="));
     }
@@ -1985,6 +2085,35 @@ mod ir_tests {
         assert!(!runtime.contains("fw_apply_selected_any_of"));
         assert!(!runtime.contains("fw_make_vector"));
         assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn foldl_dispatches_the_verified_reducer_and_charges_full_work_before_steps() {
+        let source = emit(
+            "foldl[@sub 20 (3 4 5)]\n\
+             foldl[@and true Bool()]\n\
+             foldl[@add 1 (2.5 3.5)]\n",
+        );
+        assert!(source.contains("static int fw_impl_49_opr_0("));
+        assert!(source.contains(
+            "return fw_apply_selected_foldl(fw_kernel_11, \"foldl\", \"sub\", args, out"
+        ));
+        assert!(source.contains("static int fw_impl_48_opr_1("));
+        assert!(source.contains("static int fw_impl_50_opr_2("));
+        let runtime = source
+            .split("static int fw_apply_selected_foldl")
+            .nth(1)
+            .and_then(|tail| tail.split("typedef struct { char *data").next())
+            .unwrap_or("");
+        let work = runtime.find("fw_charge_work(args[1].len,name,line,column)");
+        let loop_start = runtime.find("for(index=0U;index<args[1].len;++index)");
+        let reducer = runtime.find("if(!reducer(reducer_args,&next,reducer_name");
+        assert!(
+            matches!((work, loop_start, reducer), (Some(work), Some(loop_start), Some(reducer)) if work < loop_start && loop_start < reducer)
+        );
+        assert!(runtime.contains("accumulator=next"));
+        assert!(!runtime.contains("strcmp"));
+        assert!(!runtime.contains("fw_make_vector"));
     }
 
     #[test]
@@ -2234,6 +2363,17 @@ mod ir_tests {
                 "parameters[n Int]\nnone_of not equals[iota n iota n]\n",
                 &["3"],
             ),
+            ("foldl[@and true Bool()]\n", &[]),
+            ("foldl[@and true (true false true)]\n", &[]),
+            ("foldl[@sub 20 (3 4 5)]\n", &[]),
+            ("foldl[@add 1 (2.5 3.5)]\n", &[]),
+            ("parameters[n Int]\nfoldl[@add 0 iota[n]]\n", &["3"]),
+            ("foldl[@add 9223372036854775807 (1)]\n", &[]),
+            ("foldl[@div 8 (2 0 4)]\n", &[]),
+            (
+                "foldl[@add 0 (1 2)]\nfoldl[@add 9223372036854775807 (1)]\n",
+                &[],
+            ),
             ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
         ];
         for (source, arguments) in corpus {
@@ -2385,6 +2525,32 @@ mod ir_tests {
             "none_of[(true false false)]\n",
             &[],
             none_of_allocation_configuration,
+        );
+
+        let foldl_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(2),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "foldl[@div 8 (2 0 4)]\n",
+            &[],
+            foldl_work_configuration,
+        );
+
+        let foldl_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "foldl[@add 7 Int()]\n",
+            &[],
+            foldl_allocation_configuration,
         );
     }
 

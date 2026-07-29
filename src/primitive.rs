@@ -1,8 +1,8 @@
 use crate::parser::{Expr, ExprKind, Program};
 use crate::resources::ResourceContext;
 use crate::semantic_registry::{
-    ApplicationPlan, ScalarKernel, WorkAdmission, application_plan_from_numeric,
-    implementation_from_numeric, primitive_from_name,
+    ApplicationPlan, ScalarKernel, StructuralBehavior, WorkAdmission,
+    application_plan_from_numeric, implementation_from_numeric, primitive_from_name,
 };
 use crate::strict_float::{self, Binary64Operation};
 use crate::{
@@ -345,6 +345,103 @@ pub(crate) fn apply_implementation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_foldl_implementation(
+    implementation_id: u16,
+    application_plan_id: u16,
+    reference: &crate::OperationReference,
+    arguments: &[SelectedApplicationArgument<'_>],
+    lift: crate::LiftMode,
+    result_type: ScalarType,
+    location: SourceLocation,
+    reference_location: SourceLocation,
+    resources: &mut ResourceContext,
+) -> Result<(Value, bool), Error> {
+    let descriptor = implementation_from_numeric(implementation_id)
+        .map_err(|_| type_runtime_error("selected implementation", location))?;
+    let application_plan = application_plan_from_numeric(application_plan_id)
+        .map_err(|_| type_runtime_error("selected application plan", location))?;
+    if descriptor.behavior != StructuralBehavior::Foldl
+        || descriptor.application_plan != application_plan
+        || lift != crate::LiftMode::ContainerScalar
+        || descriptor.result != result_type
+    {
+        return Err(type_runtime_error("foldl", location));
+    }
+    let [initializer, vector] = arguments else {
+        return Err(type_runtime_error("foldl", location));
+    };
+    if vector.conversion != crate::Conversion::Identity {
+        return Err(type_runtime_error("foldl", location));
+    }
+    let reducer = implementation_from_numeric(reference.implementation_id)
+        .map_err(|_| type_runtime_error("referenced operation", reference_location))?;
+    if reducer.primitive_id.numeric() != reference.primitive_id
+        || reducer.signature_id.numeric() != reference.signature_id
+        || reducer.behavior != StructuralBehavior::Elementwise
+        || reducer.result != result_type
+        || reducer.parameters.len() != 2
+        || reducer.parameters.iter().any(|operand| {
+            operand.consumption != crate::semantic_registry::OperandConsumption::Elementwise
+                || operand.element_type != result_type
+        })
+    {
+        return Err(type_runtime_error(
+            "referenced operation",
+            reference_location,
+        ));
+    }
+    let mut accumulator = match (initializer.conversion, initializer.value) {
+        (crate::Conversion::Identity, Value::Bool(value)) if result_type == ScalarType::Bool => {
+            Value::Bool(*value)
+        }
+        (crate::Conversion::Identity, Value::Int(value)) if result_type == ScalarType::Int => {
+            Value::Int(*value)
+        }
+        (crate::Conversion::Identity, Value::Double(value))
+            if result_type == ScalarType::Double =>
+        {
+            Value::Double(*value)
+        }
+        (crate::Conversion::PromoteIntToDouble, Value::Int(value))
+            if result_type == ScalarType::Double =>
+        {
+            Value::Double(strict_float::int_to_binary64(*value))
+        }
+        _ => return Err(type_runtime_error("foldl", location)),
+    };
+    let length = match (descriptor.kernel, vector.value) {
+        (ScalarKernel::FoldlBool, Value::BoolVector(values)) => values.len(),
+        (ScalarKernel::FoldlInt, Value::IntVector(values)) => values.len(),
+        (ScalarKernel::FoldlDouble, Value::DoubleVector(values)) => values.len(),
+        _ => return Err(type_runtime_error("foldl", location)),
+    };
+    let work = admitted_work(application_plan, 1, arguments, "foldl", location)?;
+    if work != length {
+        return Err(type_runtime_error("foldl", location));
+    }
+    resources.charge_work(work, location, "foldl")?;
+    for index in 0..length {
+        let element = match vector.value {
+            Value::BoolVector(values) => values.get(index).copied().map(Value::Bool),
+            Value::IntVector(values) => values.get(index).copied().map(Value::Int),
+            Value::DoubleVector(values) => values.get(index).copied().map(Value::Double),
+            _ => None,
+        }
+        .ok_or_else(|| type_runtime_error("foldl", location))?;
+        let operands = [accumulator, element];
+        accumulator = invoke_kernel(
+            reducer.kernel,
+            reducer.primitive_name,
+            &operands,
+            result_type,
+            reference_location,
+            Some(index),
+        )?;
+    }
+    Ok((accumulator, false))
+}
+
 #[allow(dead_code)]
 pub(crate) fn apply_operation_reference(
     reference: &crate::OperationReference,
@@ -558,6 +655,9 @@ fn invoke_kernel(
             | ScalarKernel::AllOfBoolVector
             | ScalarKernel::AnyOfBoolVector
             | ScalarKernel::NoneOfBoolVector
+            | ScalarKernel::FoldlBool
+            | ScalarKernel::FoldlInt
+            | ScalarKernel::FoldlDouble
             | ScalarKernel::IotaInt,
             _,
         ) => None,
