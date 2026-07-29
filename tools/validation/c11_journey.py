@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import struct
 import subprocess
@@ -12,6 +13,28 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+SQRT_OUTPUT = (
+    b"2.0\n3.0\n(0.0 -0.0 nan nan inf nan)\n"
+    b"(1.0 2.0 3.0 4.0)\n2.2227587494850775e-162\n"
+)
+# Numeric leaves in SQRT_OUTPUT, in root/element order. Signed zeros are exact
+# special values; every other finite sqrt leaf uses FWIR-MATH-003's one-ULP
+# checked-reference envelope.
+SQRT_OUTPUT_LEAVES = (
+    (0x4000_0000_0000_0000, 1),
+    (0x4008_0000_0000_0000, 1),
+    (0x0000_0000_0000_0000, 0),
+    (0x8000_0000_0000_0000, 0),
+    (0x3FF0_0000_0000_0000, 1),
+    (0x4000_0000_0000_0000, 1),
+    (0x4008_0000_0000_0000, 1),
+    (0x4010_0000_0000_0000, 1),
+    (0x1E60_0000_0000_0000, 1),
+)
+NUMERIC_LEAF = re.compile(
+    rb"(?<![A-Za-z0-9_.])[-+]?(?:[0-9]+\.[0-9]+|[0-9]+)"
+    rb"(?:e[-+]?[0-9]+)?(?![A-Za-z0-9_.])"
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -190,8 +213,123 @@ def binary64(bits: int) -> float:
     return struct.unpack(">d", bits.to_bytes(8, "big"))[0]
 
 
+def binary64_bits(value: float) -> int:
+    return int.from_bytes(struct.pack(">d", value), "big")
+
+
 def binary64_order_key(bits: int) -> int:
     return (~bits & 0xFFFF_FFFF_FFFF_FFFF) if bits >> 63 else bits | (1 << 63)
+
+
+def numeric_leaf_view(output: bytes) -> tuple[bytes, list[bytes]]:
+    skeleton = bytearray()
+    leaves = []
+    cursor = 0
+    for match in NUMERIC_LEAF.finditer(output):
+        skeleton.extend(output[cursor : match.start()])
+        skeleton.extend(b"<sqrt-leaf>")
+        leaves.append(match.group())
+        cursor = match.end()
+    skeleton.extend(output[cursor:])
+    return bytes(skeleton), leaves
+
+
+def sqrt_output_mismatch(
+    actual: bytes,
+    reference_output: bytes = SQRT_OUTPUT,
+    leaf_specs: tuple[tuple[int, int], ...] = SQRT_OUTPUT_LEAVES,
+) -> str | None:
+    reference_skeleton, reference_leaves = numeric_leaf_view(reference_output)
+    actual_skeleton, actual_leaves = numeric_leaf_view(actual)
+    if actual_skeleton != reference_skeleton:
+        return (
+            "sqrt structural/special output changed: "
+            f"actual={actual!r} reference={reference_output!r}"
+        )
+    if len(reference_leaves) != len(leaf_specs):
+        return "sqrt checked-reference leaf map is stale"
+    if len(actual_leaves) != len(reference_leaves):
+        return "sqrt numeric leaf count changed"
+
+    for index, (actual_text, reference_text, leaf) in enumerate(
+        zip(actual_leaves, reference_leaves, leaf_specs)
+    ):
+        reference_bits, max_ulps = leaf
+        try:
+            actual_bits = binary64_bits(float(actual_text.decode("ascii")))
+            formatted_reference_bits = binary64_bits(
+                float(reference_text.decode("ascii"))
+            )
+        except (UnicodeDecodeError, ValueError, OverflowError):
+            return f"sqrt numeric leaf {index} is not canonical ASCII binary64"
+        if formatted_reference_bits != reference_bits:
+            return f"sqrt checked-reference leaf {index} no longer matches its bits"
+
+        actual_value = binary64(actual_bits)
+        if actual_value != actual_value or abs(actual_value) == float("inf"):
+            return f"sqrt numeric leaf {index} is not finite"
+        if (actual_bits >> 63) != (reference_bits >> 63):
+            return f"sqrt numeric leaf {index} changed sign"
+        ulps = abs(
+            binary64_order_key(actual_bits) - binary64_order_key(reference_bits)
+        )
+        if ulps > max_ulps:
+            return (
+                f"sqrt numeric leaf {index} exceeds {max_ulps} ULP: "
+                f"actual={actual_bits:016x} reference={reference_bits:016x}"
+            )
+        if actual_bits == reference_bits and actual_text != reference_text:
+            return f"sqrt numeric leaf {index} changed canonical formatting"
+    return None
+
+
+def require_sqrt_output(actual: bytes, label: str) -> None:
+    mismatch = sqrt_output_mismatch(actual)
+    require(mismatch is None, f"{label}: {mismatch}")
+
+
+def validate_sqrt_output_comparator() -> None:
+    reference = b"1.0\n2.0\n(0.0 -0.0 nan inf)\n"
+    leaves = (
+        (0x3FF0_0000_0000_0000, 1),
+        (0x4000_0000_0000_0000, 1),
+        (0x0000_0000_0000_0000, 0),
+        (0x8000_0000_0000_0000, 0),
+    )
+    require(
+        sqrt_output_mismatch(reference, reference, leaves) is None,
+        "sqrt comparator exact",
+    )
+    require(
+        sqrt_output_mismatch(
+            b"1.0000000000000002\n2.0\n(0.0 -0.0 nan inf)\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "sqrt comparator +1 ULP",
+    )
+    require(
+        sqrt_output_mismatch(
+            b"0.9999999999999999\n2.0\n(0.0 -0.0 nan inf)\n",
+            reference,
+            leaves,
+        )
+        is None,
+        "sqrt comparator -1 ULP",
+    )
+    for invalid, label in [
+        (b"1.0000000000000004\n2.0\n(0.0 -0.0 nan inf)\n", "two ULPs"),
+        (b"1.0\n2.0\n(0.0 0.0 nan inf)\n", "signed zero"),
+        (b"1.0\n2.0\n[0.0 -0.0 nan inf]\n", "structure"),
+        (b"1.0\n2.0\n(0.0 -0.0 inf inf)\n", "special value"),
+        (b"1\n2.0\n(0.0 -0.0 nan inf)\n", "canonical formatting"),
+        (b"2.0\n1.0\n(0.0 -0.0 nan inf)\n", "root order"),
+    ]:
+        require(
+            sqrt_output_mismatch(invalid, reference, leaves) is not None,
+            f"sqrt comparator accepted invalid {label}",
+        )
 
 
 def validate_backend_native_math_policy(
@@ -354,6 +492,7 @@ int main(void) {
 
 
 def main() -> None:
+    validate_sqrt_output_comparator()
     executable = Path(
         os.environ.get(
             "FARAWEAVE_EXE",
@@ -389,8 +528,7 @@ def main() -> None:
             (
                 ROOT / "tests/fixtures/backend-native-sqrt.bennu",
                 [],
-                b"2.0\n3.0\n(0.0 -0.0 nan nan inf nan)\n"
-                b"(1.0 2.0 3.0 4.0)\n2.2227587494850775e-162\n",
+                SQRT_OUTPUT,
             ),
         ]
         for index, (fixture, arguments, expected) in enumerate(fixtures):
@@ -447,18 +585,23 @@ def main() -> None:
                 [str(executable), "run-ir", str(artifact), "--", *arguments],
                 environment=environment,
             )
-            require(
-                normalize_newlines(generated.stdout) == normalize_newlines(expected),
-                f"generated output mismatch for {fixture.name}",
-            )
-            require(
-                normalize_newlines(evaluator.stdout)
-                == normalize_newlines(generated.stdout),
-                f"evaluator/generated mismatch for {fixture.name}",
-            )
+            generated_output = normalize_newlines(generated.stdout)
+            evaluator_output = normalize_newlines(evaluator.stdout)
+            if fixture.name == "backend-native-sqrt.bennu":
+                require_sqrt_output(generated_output, "generated sqrt output")
+                require_sqrt_output(evaluator_output, "evaluator sqrt output")
+            else:
+                require(
+                    generated_output == normalize_newlines(expected),
+                    f"generated output mismatch for {fixture.name}",
+                )
+                require(
+                    evaluator_output == generated_output,
+                    f"evaluator/generated mismatch for {fixture.name}",
+                )
             require(
                 normalize_newlines(artifact_runner.stdout)
-                == normalize_newlines(evaluator.stdout),
+                == evaluator_output,
                 f"source/artifact evaluator mismatch for {fixture.name}",
             )
             require(
@@ -495,6 +638,31 @@ int main(int argc, char **argv) {
   _mm_setcsr(original);
   if(result!=0)return result;
   return restored==hostile?0:1;
+#elif defined(__aarch64__)
+  uint64_t original_control,original_status,requested_control,requested_status;
+  uint64_t hostile_control,hostile_status,restored_control,restored_status;
+  int result;
+  __asm__ volatile("mrs %0, fpcr":"=r"(original_control));
+  __asm__ volatile("mrs %0, fpsr":"=r"(original_status));
+  requested_control=original_control|
+      UINT64_C(0x00009f00)|UINT64_C(0x00c00000)|UINT64_C(0x03000000);
+  requested_status=original_status|UINT64_C(0x0000009f);
+  __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(requested_control):"memory");
+  __asm__ volatile("msr fpsr, %0"::"r"(requested_status):"memory");
+  __asm__ volatile("mrs %0, fpcr":"=r"(hostile_control));
+  __asm__ volatile("mrs %0, fpsr":"=r"(hostile_status));
+  result=fw_generated_main(argc,argv);
+  __asm__ volatile("mrs %0, fpcr":"=r"(restored_control));
+  __asm__ volatile("mrs %0, fpsr":"=r"(restored_status));
+  __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(original_control):"memory");
+  __asm__ volatile("msr fpsr, %0"::"r"(original_status):"memory");
+  if(result!=0)return result;
+  if((hostile_control&(UINT64_C(0x00c00000)|UINT64_C(0x03000000)))!=
+     (requested_control&(UINT64_C(0x00c00000)|UINT64_C(0x03000000))))
+    return 1;
+  if((hostile_status&UINT64_C(0x0000009f))!=
+     (requested_status&UINT64_C(0x0000009f)))return 1;
+  return restored_control==hostile_control&&restored_status==hostile_status?0:1;
 #else
   return fw_generated_main(argc,argv);
 #endif
@@ -512,11 +680,18 @@ int main(int argc, char **argv) {
                     [str(hostile_native)],
                     environment=environment,
                 )
+                hostile_output = normalize_newlines(hostile_result.stdout)
                 require(
-                    normalize_newlines(hostile_result.stdout)
-                    == normalize_newlines(expected)
-                    and not hostile_result.stderr,
-                    "sqrt hostile generated-C mismatch",
+                    not hostile_result.stderr,
+                    "sqrt hostile generated-C stderr",
+                )
+                require(
+                    hostile_output == generated_output,
+                    "sqrt hostile FP state changed generated-C output",
+                )
+                require_sqrt_output(
+                    hostile_output,
+                    "sqrt hostile generated-C output",
                 )
             if index == 0 and platform.system() == "Linux":
                 sanitized = work / "fixture-sanitized"

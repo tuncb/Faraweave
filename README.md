@@ -18,6 +18,7 @@ structural tuples. The public primitives are:
 | Integer predicates | `odd`, `even` |
 | Numeric predicates | `is_positive`, `is_negative` |
 | Numeric ordering | `less_than`, `greater_than` |
+| Backend-native numeric unary | `sqrt` |
 | Structural constructor | `iota` |
 
 Calls use adjacent brackets (`sub[10 2.5]`) or right-associative prefix syntax
@@ -39,6 +40,14 @@ conversion is `Int` to `Double`. Integer arithmetic is checked and publishes no
 partial result on overflow. Double results canonicalize NaNs; signed zero,
 infinities, gradual underflow, and IEEE unordered comparisons are preserved.
 Canonical output includes visible `.0` for integral Doubles.
+
+`sqrt` accepts Double scalars and vectors, with the existing Int-to-Double
+promotion, and calls the platform's Rust or C square-root function directly.
+Its portable special values are exact; finite results use the checked-reference
+envelope of at most one ULP, while types, shapes, resources, diagnostics, and
+all nonnumeric observations remain exact. The complete exception and
+reproducibility rules are the
+[backend-native math v1 policy](spec/backend-native-math-v1.md).
 
 The accepted [architecture](doc/architecture.md) and
 [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md) define

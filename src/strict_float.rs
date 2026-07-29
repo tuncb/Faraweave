@@ -453,4 +453,76 @@ mod tests {
             assert_eq!(restored, hostile);
         }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn hostile_aarch64_environment_is_ignored_and_exactly_restored() {
+        use core::arch::asm;
+
+        unsafe fn read_environment() -> (u64, u64) {
+            let control;
+            let status;
+            // SAFETY: MRS copies the current thread's FPCR/FPSR into ordinary
+            // integer registers without dereferencing memory.
+            unsafe {
+                asm!("mrs {value}, fpcr", value = out(reg) control);
+                asm!("mrs {value}, fpsr", value = out(reg) status);
+            }
+            (control, status)
+        }
+
+        unsafe fn write_environment(control: u64, status: u64) {
+            // SAFETY: the values only modify documented FPCR/FPSR fields and
+            // the caller restores the exact captured pair before returning.
+            unsafe {
+                asm!(
+                    "msr fpcr, {value}",
+                    "isb",
+                    value = in(reg) control,
+                    options(nostack)
+                );
+                asm!("msr fpsr, {value}", value = in(reg) status, options(nostack));
+            }
+        }
+
+        // SAFETY: the hostile values are derived from a valid captured state
+        // and set only documented exception-enable, rounding, FZ/DN, and
+        // cumulative-status fields. The original pair is restored before any
+        // assertion or test return.
+        unsafe {
+            let reference_sqrt = backend_native_sqrt(f64::from_bits(1)).to_bits();
+            let reference_arithmetic = arithmetic(
+                f64::from_bits(0x0000_0000_0000_0001),
+                2.0,
+                Binary64Operation::Multiply,
+            )
+            .to_bits();
+            let original = read_environment();
+            let requested_control = original.0 | 0x0000_9f00 | 0x00c0_0000 | 0x0300_0000;
+            let requested_status = original.1 | 0x0000_009f;
+            write_environment(requested_control, requested_status);
+            let hostile = read_environment();
+
+            let sqrt_result = backend_native_sqrt(f64::from_bits(1)).to_bits();
+            let after_sqrt = read_environment();
+            let arithmetic_result = arithmetic(
+                f64::from_bits(0x0000_0000_0000_0001),
+                2.0,
+                Binary64Operation::Multiply,
+            )
+            .to_bits();
+            let after_arithmetic = read_environment();
+            write_environment(original.0, original.1);
+
+            assert_eq!(
+                hostile.0 & (0x00c0_0000 | 0x0300_0000),
+                requested_control & (0x00c0_0000 | 0x0300_0000)
+            );
+            assert_eq!(hostile.1 & 0x0000_009f, requested_status & 0x0000_009f);
+            assert_eq!(sqrt_result, reference_sqrt);
+            assert_eq!(after_sqrt, hostile);
+            assert_eq!(arithmetic_result, reference_arithmetic);
+            assert_eq!(after_arithmetic, hostile);
+        }
+    }
 }
