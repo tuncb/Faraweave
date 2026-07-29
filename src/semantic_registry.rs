@@ -1,4 +1,5 @@
 use crate::ScalarType;
+use std::io::Write;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PrimitiveId(u16);
@@ -159,6 +160,46 @@ enum RegistryValidationError {
     InconsistentSignatureIdentity,
     InconsistentImplementationIdentity,
     InconsistentApplicationPlanIdentity,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InternalRegistryDiagnosticError {
+    InvalidRegistry,
+    AllocationUnavailable,
+    WriteFailed,
+    FlushFailed,
+}
+
+impl InternalRegistryDiagnosticError {
+    pub const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::InvalidRegistry => "production registry is invalid",
+            Self::AllocationUnavailable => "unable to allocate registry diagnostics",
+            Self::WriteFailed => "unable to write registry diagnostics",
+            Self::FlushFailed => "unable to flush registry diagnostics",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InternalRegistryDiagnosticFailureInjection {
+    refuse_reservation: bool,
+}
+
+impl InternalRegistryDiagnosticFailureInjection {
+    const fn none() -> Self {
+        Self {
+            refuse_reservation: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn refuse_reservation() -> Self {
+        Self {
+            refuse_reservation: true,
+        }
+    }
 }
 
 const PRIMITIVE_COUNT: u16 = 23;
@@ -836,6 +877,228 @@ pub(crate) fn conversion(actual: ScalarType, accepted: ScalarType) -> Option<Con
     }
 }
 
+/// Writes a human-readable view of the production semantic registry.
+///
+/// This is internal diagnostic output: its spelling and layout are not a stable
+/// machine-readable interface and may change without compatibility guarantees.
+#[doc(hidden)]
+pub fn write_internal_registry_diagnostics(
+    output: &mut impl Write,
+) -> Result<(), InternalRegistryDiagnosticError> {
+    write_registry_diagnostics(
+        SEMANTIC_REGISTRY,
+        output,
+        InternalRegistryDiagnosticFailureInjection::none(),
+    )
+}
+
+fn write_registry_diagnostics(
+    registry: &[SemanticDescriptor],
+    output: &mut impl Write,
+    injection: InternalRegistryDiagnosticFailureInjection,
+) -> Result<(), InternalRegistryDiagnosticError> {
+    validate_registry(registry).map_err(|_| InternalRegistryDiagnosticError::InvalidRegistry)?;
+
+    let mut ordered: Vec<&SemanticDescriptor> = Vec::new();
+    if injection.refuse_reservation || ordered.try_reserve_exact(registry.len()).is_err() {
+        return Err(InternalRegistryDiagnosticError::AllocationUnavailable);
+    }
+    ordered.extend(registry);
+    ordered.sort_unstable_by_key(|descriptor| {
+        (
+            descriptor.primitive_id.numeric(),
+            descriptor.signature_id.numeric(),
+            descriptor.implementation_id.numeric(),
+        )
+    });
+
+    writeln!(
+        output,
+        "Faraweave semantic registry (internal human-readable diagnostics; format is unstable)"
+    )
+    .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+    let mut previous_primitive = None;
+    for descriptor in ordered {
+        if previous_primitive != Some(descriptor.primitive_id) {
+            writeln!(
+                output,
+                "primitive id={} name={} behavior={}",
+                descriptor.primitive_id.numeric(),
+                descriptor.primitive_name,
+                structural_behavior_name(descriptor.behavior),
+            )
+            .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+            previous_primitive = Some(descriptor.primitive_id);
+        }
+        write!(
+            output,
+            "  signature id={} implementation={} parameters=[",
+            descriptor.signature_id.numeric(),
+            descriptor.implementation_id.numeric(),
+        )
+        .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+        for (index, parameter) in descriptor.parameters.iter().enumerate() {
+            if index != 0 {
+                write!(output, "; ").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+            }
+            write!(
+                output,
+                "{}:accepted={},lift={},actual={{",
+                index + 1,
+                parameter.element_type.name(),
+                operand_consumption_name(parameter.consumption),
+            )
+            .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+            write_conversions(output, *parameter)?;
+            write!(output, "}}").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+        }
+        write!(
+            output,
+            "] result={} application_plan={} result_cardinality=",
+            descriptor.result.name(),
+            descriptor.application_plan.id.numeric(),
+        )
+        .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+        write_result_cardinality(output, descriptor.application_plan.result_cardinality)?;
+        write!(output, " work=").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+        write_work_admission(output, descriptor.application_plan.resources.work)?;
+        writeln!(output, " kernel={}", scalar_kernel_name(descriptor.kernel),)
+            .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+    }
+    output
+        .flush()
+        .map_err(|_| InternalRegistryDiagnosticError::FlushFailed)
+}
+
+fn write_conversions(
+    output: &mut impl Write,
+    parameter: OperandDescriptor,
+) -> Result<(), InternalRegistryDiagnosticError> {
+    let mut first = true;
+    for actual in [ScalarType::Bool, ScalarType::Int, ScalarType::Double] {
+        let Some(selected) = conversion(actual, parameter.element_type) else {
+            continue;
+        };
+        if parameter.consumption == OperandConsumption::WholeVector
+            && selected != Conversion::Identity
+        {
+            continue;
+        }
+        if !first {
+            write!(output, ",").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+        }
+        write!(output, "{}:{}", actual.name(), conversion_name(selected))
+            .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
+        first = false;
+    }
+    Ok(())
+}
+
+const fn conversion_name(value: Conversion) -> &'static str {
+    match value {
+        Conversion::Identity => "identity",
+        Conversion::PromoteIntToDouble => "promote_int_to_double",
+    }
+}
+
+const fn operand_consumption_name(value: OperandConsumption) -> &'static str {
+    match value {
+        OperandConsumption::Elementwise => "elementwise",
+        OperandConsumption::WholeVector => "whole_vector",
+    }
+}
+
+fn write_result_cardinality(
+    output: &mut impl Write,
+    value: ResultCardinality,
+) -> Result<(), InternalRegistryDiagnosticError> {
+    match value {
+        ResultCardinality::Elementwise => write!(output, "elementwise"),
+        ResultCardinality::Scalar => write!(output, "scalar"),
+        ResultCardinality::DynamicVector => write!(output, "dynamic_vector"),
+        ResultCardinality::PreserveOperand(position) => {
+            write!(output, "preserve_operand({position})")
+        }
+        ResultCardinality::OperandPlusOne(position) => {
+            write!(output, "operand_plus_one({position})")
+        }
+    }
+    .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)
+}
+
+fn write_work_admission(
+    output: &mut impl Write,
+    value: WorkAdmission,
+) -> Result<(), InternalRegistryDiagnosticError> {
+    match value {
+        WorkAdmission::Constant(work) => write!(output, "constant({work})"),
+        WorkAdmission::ResultCardinality => write!(output, "result_cardinality"),
+        WorkAdmission::OperandCardinality(position) => {
+            write!(output, "operand_cardinality({position})")
+        }
+    }
+    .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)
+}
+
+const fn structural_behavior_name(value: StructuralBehavior) -> &'static str {
+    match value {
+        StructuralBehavior::Elementwise => "elementwise",
+        StructuralBehavior::Iota => "iota",
+        StructuralBehavior::VectorLength => "vector_length",
+        StructuralBehavior::VectorSort => "vector_sort",
+        StructuralBehavior::VectorSum => "vector_sum",
+    }
+}
+
+const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
+    match value {
+        ScalarKernel::IncInt => "inc_int",
+        ScalarKernel::IncDouble => "inc_double",
+        ScalarKernel::DecInt => "dec_int",
+        ScalarKernel::DecDouble => "dec_double",
+        ScalarKernel::NegInt => "neg_int",
+        ScalarKernel::NegDouble => "neg_double",
+        ScalarKernel::AbsInt => "abs_int",
+        ScalarKernel::AbsDouble => "abs_double",
+        ScalarKernel::AddInt => "add_int",
+        ScalarKernel::AddDouble => "add_double",
+        ScalarKernel::SubInt => "sub_int",
+        ScalarKernel::SubDouble => "sub_double",
+        ScalarKernel::MulInt => "mul_int",
+        ScalarKernel::MulDouble => "mul_double",
+        ScalarKernel::DivInt => "div_int",
+        ScalarKernel::DivDouble => "div_double",
+        ScalarKernel::EqualsBool => "equals_bool",
+        ScalarKernel::EqualsInt => "equals_int",
+        ScalarKernel::EqualsDouble => "equals_double",
+        ScalarKernel::NotEqualsBool => "not_equals_bool",
+        ScalarKernel::NotEqualsInt => "not_equals_int",
+        ScalarKernel::NotEqualsDouble => "not_equals_double",
+        ScalarKernel::NotBool => "not_bool",
+        ScalarKernel::AndBool => "and_bool",
+        ScalarKernel::OrBool => "or_bool",
+        ScalarKernel::OddInt => "odd_int",
+        ScalarKernel::EvenInt => "even_int",
+        ScalarKernel::IsPositiveInt => "is_positive_int",
+        ScalarKernel::IsPositiveDouble => "is_positive_double",
+        ScalarKernel::IsNegativeInt => "is_negative_int",
+        ScalarKernel::IsNegativeDouble => "is_negative_double",
+        ScalarKernel::LessThanInt => "less_than_int",
+        ScalarKernel::LessThanDouble => "less_than_double",
+        ScalarKernel::GreaterThanInt => "greater_than_int",
+        ScalarKernel::GreaterThanDouble => "greater_than_double",
+        ScalarKernel::IotaInt => "iota_int",
+        ScalarKernel::LengthBoolVector => "length_bool_vector",
+        ScalarKernel::LengthIntVector => "length_int_vector",
+        ScalarKernel::LengthDoubleVector => "length_double_vector",
+        ScalarKernel::SortBoolVector => "sort_bool_vector",
+        ScalarKernel::SortIntVector => "sort_int_vector",
+        ScalarKernel::SortDoubleVector => "sort_double_vector",
+        ScalarKernel::SumIntVector => "sum_int_vector",
+        ScalarKernel::SumDoubleVector => "sum_double_vector",
+    }
+}
+
 #[allow(dead_code)]
 fn validate_registry(registry: &[SemanticDescriptor]) -> Result<(), RegistryValidationError> {
     validate_registry_with_application_plans(registry, APPLICATION_PLANS)
@@ -1027,6 +1290,232 @@ fn valid_application_plan(descriptor: &SemanticDescriptor) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+
+    struct FailingWriter {
+        remaining: Option<usize>,
+        bytes: Vec<u8>,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let Some(remaining) = self.remaining else {
+                self.bytes.extend_from_slice(bytes);
+                return Ok(bytes.len());
+            };
+            if remaining == 0 {
+                return Err(io::Error::other("injected write failure"));
+            }
+            let count = remaining.min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..count]);
+            self.remaining = Some(remaining - count);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn registry_diagnostics(registry: &[SemanticDescriptor]) -> String {
+        let mut output = Vec::new();
+        write_registry_diagnostics(
+            registry,
+            &mut output,
+            InternalRegistryDiagnosticFailureInjection::none(),
+        )
+        .expect("valid registry diagnostics");
+        String::from_utf8(output).expect("diagnostics UTF-8")
+    }
+
+    #[test]
+    fn internal_diagnostics_are_complete_grouped_and_stably_ordered() {
+        let output = registry_diagnostics(SEMANTIC_REGISTRY);
+        assert!(output.starts_with(
+            "Faraweave semantic registry (internal human-readable diagnostics; format is unstable)\n"
+        ));
+        assert!(!output.contains('\r'));
+        assert!(output.ends_with('\n'));
+
+        let primitive_lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("primitive "))
+            .collect();
+        let signature_lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("  signature "))
+            .collect();
+        assert_eq!(primitive_lines.len(), usize::from(PRIMITIVE_COUNT));
+        assert_eq!(signature_lines.len(), usize::from(SIGNATURE_COUNT));
+        for primitive_id in 1..=PRIMITIVE_COUNT {
+            let descriptor = SEMANTIC_REGISTRY
+                .iter()
+                .find(|descriptor| descriptor.primitive_id.numeric() == primitive_id)
+                .expect("validated primitive");
+            let expected = format!(
+                "primitive id={primitive_id} name={} behavior={}",
+                descriptor.primitive_name,
+                structural_behavior_name(descriptor.behavior)
+            );
+            assert_eq!(
+                primitive_lines
+                    .iter()
+                    .filter(|line| **line == expected)
+                    .count(),
+                1,
+            );
+        }
+        let mut descriptors = SEMANTIC_REGISTRY.iter().collect::<Vec<_>>();
+        descriptors.sort_unstable_by_key(|descriptor| descriptor.signature_id.numeric());
+        for (descriptor, line) in descriptors.into_iter().zip(signature_lines) {
+            let marker = format!(
+                "  signature id={} implementation={} ",
+                descriptor.signature_id.numeric(),
+                descriptor.implementation_id.numeric()
+            );
+            assert!(line.starts_with(&marker));
+            assert!(line.contains(&format!(" result={} ", descriptor.result.name())));
+            assert!(line.contains(&format!(
+                " application_plan={} ",
+                descriptor.application_plan.id.numeric()
+            )));
+            assert!(line.ends_with(&format!(
+                " kernel={}",
+                scalar_kernel_name(descriptor.kernel)
+            )));
+            for (index, parameter) in descriptor.parameters.iter().enumerate() {
+                assert!(line.contains(&format!(
+                    "{}:accepted={},lift={}",
+                    index + 1,
+                    parameter.element_type.name(),
+                    operand_consumption_name(parameter.consumption)
+                )));
+            }
+            let mut cardinality = Vec::new();
+            write_result_cardinality(
+                &mut cardinality,
+                descriptor.application_plan.result_cardinality,
+            )
+            .expect("cardinality diagnostic");
+            let cardinality = String::from_utf8(cardinality).expect("cardinality UTF-8");
+            assert!(line.contains(&format!(" result_cardinality={cardinality} ")));
+            let mut work = Vec::new();
+            write_work_admission(&mut work, descriptor.application_plan.resources.work)
+                .expect("work diagnostic");
+            let work = String::from_utf8(work).expect("work UTF-8");
+            assert!(line.contains(&format!(" work={work} ")));
+        }
+        assert!(output.contains(
+            "accepted=Double,lift=elementwise,actual={Int:promote_int_to_double,Double:identity}"
+        ));
+        assert!(output.contains(
+            "primitive id=19 name=iota behavior=iota\n  signature id=34 implementation=34 \
+             parameters=[1:accepted=Int,lift=elementwise,actual={Int:identity}] result=Int \
+             application_plan=2 result_cardinality=dynamic_vector work=result_cardinality \
+             kernel=iota_int\n"
+        ));
+        assert!(output.contains(
+            "primitive id=21 name=length behavior=vector_length\n  signature id=37 \
+             implementation=37 parameters=[1:accepted=Bool,lift=whole_vector,\
+             actual={Bool:identity}] result=Int application_plan=3 result_cardinality=scalar \
+             work=constant(1) kernel=length_bool_vector\n  signature id=38 implementation=38 \
+             parameters=[1:accepted=Int,lift=whole_vector,actual={Int:identity}] result=Int \
+             application_plan=3 result_cardinality=scalar work=constant(1) \
+             kernel=length_int_vector\n  signature id=39 implementation=39 \
+             parameters=[1:accepted=Double,lift=whole_vector,actual={Double:identity}] result=Int \
+             application_plan=3 result_cardinality=scalar work=constant(1) \
+             kernel=length_double_vector\n"
+        ));
+        assert!(output.lines().all(|line| {
+            !line.contains("lift=whole_vector") || !line.contains("promote_int_to_double")
+        }));
+
+        let mut reversed = SEMANTIC_REGISTRY.to_vec();
+        reversed.reverse();
+        assert_eq!(registry_diagnostics(&reversed), output);
+    }
+
+    #[test]
+    fn internal_diagnostics_reject_empty_and_invalid_registries_before_output() {
+        let mut empty_output = b"unchanged".to_vec();
+        assert_eq!(
+            write_registry_diagnostics(
+                &[],
+                &mut empty_output,
+                InternalRegistryDiagnosticFailureInjection::none(),
+            ),
+            Err(InternalRegistryDiagnosticError::InvalidRegistry)
+        );
+        assert_eq!(empty_output, b"unchanged");
+
+        let mut invalid = SEMANTIC_REGISTRY.to_vec();
+        invalid[1].signature_id = invalid[0].signature_id;
+        let mut invalid_output = b"unchanged".to_vec();
+        assert_eq!(
+            write_registry_diagnostics(
+                &invalid,
+                &mut invalid_output,
+                InternalRegistryDiagnosticFailureInjection::none(),
+            ),
+            Err(InternalRegistryDiagnosticError::InvalidRegistry)
+        );
+        assert_eq!(invalid_output, b"unchanged");
+    }
+
+    #[test]
+    fn internal_diagnostic_allocation_refusal_precedes_output() {
+        let mut output = b"unchanged".to_vec();
+        assert_eq!(
+            write_registry_diagnostics(
+                SEMANTIC_REGISTRY,
+                &mut output,
+                InternalRegistryDiagnosticFailureInjection::refuse_reservation(),
+            ),
+            Err(InternalRegistryDiagnosticError::AllocationUnavailable)
+        );
+        assert_eq!(output, b"unchanged");
+    }
+
+    #[test]
+    fn internal_diagnostic_write_and_flush_failures_are_recoverable() {
+        let mut write_failure = FailingWriter {
+            remaining: Some(17),
+            bytes: Vec::new(),
+            fail_flush: false,
+        };
+        assert_eq!(
+            write_internal_registry_diagnostics(&mut write_failure),
+            Err(InternalRegistryDiagnosticError::WriteFailed)
+        );
+        assert_eq!(write_failure.bytes.len(), 17);
+
+        let mut flush_failure = FailingWriter {
+            remaining: None,
+            bytes: Vec::new(),
+            fail_flush: true,
+        };
+        assert_eq!(
+            write_internal_registry_diagnostics(&mut flush_failure),
+            Err(InternalRegistryDiagnosticError::FlushFailed)
+        );
+        assert!(!flush_failure.bytes.is_empty());
+
+        let mut redirected = Vec::new();
+        assert_eq!(write_internal_registry_diagnostics(&mut redirected), Ok(()));
+        assert_eq!(
+            String::from_utf8(redirected)
+                .expect("redirected diagnostics UTF-8")
+                .lines()
+                .filter(|line| line.starts_with("primitive "))
+                .count(),
+            usize::from(PRIMITIVE_COUNT)
+        );
+    }
 
     #[test]
     fn production_registry_is_complete_and_numeric_lookups_are_checked() {
