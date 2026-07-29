@@ -1,0 +1,3 @@
+# Issue #34 — bounded REPL history
+
+Each process-local REPL session retains every nonempty submitted line exactly after LF or CRLF removal, including space/tab-only input, failed expressions, and `.history` commands; `.history` is recorded before it prints absolute session entry numbers. The oldest entries are evicted deterministically to retain at most 100 entries and 65,536 UTF-8 bytes, while oversized input or allocation refusal is reported and the session continues without retaining that line. History is never persisted, `.clear` and navigation are not added, and a new process starts again at entry 1.
