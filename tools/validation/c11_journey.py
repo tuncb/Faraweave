@@ -379,7 +379,7 @@ def main() -> None:
             (
                 ROOT / "tests/fixtures/parameterized-artifact-success.bennu",
                 ["3", "2.5", "true"],
-                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n6\n5.5\nfalse\n",
+                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n6\n(0 1 3 6)\n5.5\nfalse\n",
             ),
             (
                 ROOT / "tests/fixtures/parameterized-artifact-double.bennu",
@@ -585,6 +585,18 @@ int main(int argc, char **argv) {
             (
                 "foldl-div-zero",
                 "foldl[@div 8 (2 0 4)]\n",
+                7,
+                b"DomainError: div failed: division_by_zero at result index 1\n",
+            ),
+            (
+                "scanl-overflow",
+                "scanl[@add 9223372036854775807 (1)]\n",
+                7,
+                b"DomainError: add failed: integer_overflow at result index 0\n",
+            ),
+            (
+                "scanl-div-zero",
+                "scanl[@div 8 (2 0 4)]\n",
                 7,
                 b"DomainError: div failed: division_by_zero at result index 1\n",
             ),
@@ -817,7 +829,7 @@ int main(int argc, char **argv) {
         )
         require(
             normalize_newlines(native_result.stdout)
-            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n6\n5.5\nfalse\n",
+            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n6\n(0 1 3 6)\n5.5\nfalse\n",
             "native build output",
         )
         artifact = work / "native-build.fwir"

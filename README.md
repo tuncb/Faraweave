@@ -26,6 +26,7 @@ structural tuples. The public primitives are:
 | Boolean reduction | `any_of` |
 | Boolean reduction | `none_of` |
 | Explicit-initializer reduction | `foldl` |
+| Seed-inclusive scan | `scanl` |
 
 Calls use adjacent brackets (`sub[10 2.5]`) or right-associative prefix syntax
 (`inc iota 3`). Vectors use parentheses: `(1 2 3)`, `(false true)`,
@@ -86,6 +87,12 @@ invoking the reducer for an empty vector, and charges the full vector length as
 work before the first step. Reducer overloads and the only permitted
 initializer promotion (`Int` to `Double`) are fixed during lowering; no backend
 performs runtime name lookup.
+
+`scanl[@add init vector]` uses the same closed reducer selection but returns
+every accumulator, starting with the converted initializer. Its result length
+is the checked input length plus one, so an empty vector returns a one-element
+vector; output bytes and complete input-length work are admitted together
+before the seed is written or any reducer step runs.
 
 The accepted [architecture](doc/architecture.md) and
 [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md) define
@@ -272,9 +279,9 @@ bracket calls, checked Int64 arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit
 currying, functions, effects, reductions other than `sum`, `all_of`, `any_of`,
-`none_of`, and explicit-initializer `foldl`,
+`none_of`, explicit-initializer `foldl`, and seed-inclusive `scanl`,
 multidimensional arrays, or container-wide operations other than `length`,
-`sort`, `sum`, `all_of`, `any_of`, `none_of`, and `foldl`.
+`sort`, `sum`, `all_of`, `any_of`, `none_of`, `foldl`, and `scanl`.
 
 Rust enums and vectors replace C++ tagged/plain records at the public boundary.
 Ordinary syntax remains visibly separated by parse, resolution, analysis, and

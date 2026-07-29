@@ -268,6 +268,13 @@ mod tests {
             ("foldl[@and true (true false true)]", "false"),
             ("foldl[@sub 20 (3 4 5)]", "8"),
             ("foldl[@add 1 (2.5 3.5)]", "7.0"),
+            ("scanl[@and true Bool()]", "(true)"),
+            (
+                "scanl[@and true (true false true)]",
+                "(true true false false)",
+            ),
+            ("scanl[@sub 20 (3 4 5)]", "(20 17 13 8)"),
+            ("scanl[@add 1 (2.5 3.5)]", "(1.0 3.5 7.0)"),
             ("equals[1 1.0]", "true"),
             ("not_equals[1 2]", "true"),
             ("not[false]", "true"),

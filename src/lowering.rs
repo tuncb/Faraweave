@@ -242,7 +242,7 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
 }
 
 fn operation_reference_position(consumer: &str, zero_based_argument: usize) -> bool {
-    consumer == "foldl" && zero_based_argument == 0
+    matches!(consumer, "foldl" | "scanl") && zero_based_argument == 0
 }
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
@@ -325,7 +325,7 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
             )?));
         }
     };
-    let reference_arguments = usize::from(name == "foldl");
+    let reference_arguments = usize::from(matches!(name, "foldl" | "scanl"));
     if descriptors(primitive).any(|descriptor| {
         descriptor.parameters.len().checked_add(reference_arguments) == Some(actual)
     }) {
@@ -1080,8 +1080,8 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
-        if name == "foldl" {
-            return self.lower_foldl(arguments, name_span, origin, location);
+        if matches!(name, "foldl" | "scanl") {
+            return self.lower_reducer_consumer(name, arguments, name_span, origin, location);
         }
         let primitive_origin = self.push_origin(name_span)?;
         let mut lowered = Vec::new();
@@ -1117,18 +1117,24 @@ impl Lowerer {
         self.lower_selected_call(name, primitive_origin, origin, location, operands, None)
     }
 
-    fn lower_foldl(
+    fn lower_reducer_consumer(
         &mut self,
+        name: &str,
         arguments: &[Expr],
         name_span: SourceSpan,
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
         let [reference_expression, initializer, vector] = arguments else {
+            let message = if name == "scanl" {
+                "scanl requires a reducer reference, initializer, and vector"
+            } else {
+                "foldl requires a reducer reference, initializer, and vector"
+            };
             return Err(LowerError::Source(Error::new(
                 ErrorKind::ArityError,
                 location,
-                "foldl requires a reducer reference, initializer, and vector",
+                message,
             )));
         };
         let ExprKind::OperationReference {
@@ -1136,10 +1142,15 @@ impl Lowerer {
             name_span: reducer_name_span,
         } = &reference_expression.kind
         else {
+            let message = if name == "scanl" {
+                "scanl argument 1 must be a built-in operation reference"
+            } else {
+                "foldl argument 1 must be a built-in operation reference"
+            };
             return Err(LowerError::Source(Error::at_span(
                 ErrorKind::TypeError,
                 reference_expression.span,
-                "foldl argument 1 must be a built-in operation reference",
+                message,
             )));
         };
         let primitive_origin = self.push_origin(name_span)?;
@@ -1155,7 +1166,7 @@ impl Lowerer {
         operands.push(CallOperand::Whole(initializer));
         operands.push(CallOperand::Whole(vector));
         self.lower_selected_call(
-            "foldl",
+            name,
             primitive_origin,
             origin,
             location,
@@ -3008,6 +3019,85 @@ mod tests {
     }
 
     #[test]
+    fn scanl_records_reducer_identity_initializer_conversion_and_plus_one_plan() {
+        let program = must_compile(
+            "parameters[n Int]\n\
+             scanl[@sub 20 (3 4 5)]\n\
+             scanl[@add 0 iota[n]]\n\
+             scanl[@add 1 Double()]\n",
+        );
+        let raw = program.as_raw();
+        assert_eq!(
+            raw.operation_references
+                .iter()
+                .map(|reference| (
+                    reference.primitive_id,
+                    reference.signature_id,
+                    reference.implementation_id,
+                ))
+                .collect::<Vec<_>>(),
+            [(6, 11, 11), (5, 9, 9), (5, 10, 10)]
+        );
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 28,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3, apply.4))
+                .collect::<Vec<_>>(),
+            [
+                (52, 52, 10, Some(crate::OperationReferenceIndex(0))),
+                (52, 52, 10, Some(crate::OperationReferenceIndex(1))),
+                (53, 53, 10, Some(crate::OperationReferenceIndex(2))),
+            ]
+        );
+        assert!(
+            applies
+                .iter()
+                .all(|apply| apply.5 == LiftMode::ContainerVector)
+        );
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| apply.0.cardinality)
+                .collect::<Vec<_>>(),
+            [
+                Some(Cardinality::StaticVector(4)),
+                Some(Cardinality::DynamicVector),
+                Some(Cardinality::StaticVector(1)),
+            ]
+        );
+        let final_edges =
+            &raw.edges[applies[2].0.edges.start as usize..applies[2].0.edges.start as usize + 2];
+        assert_eq!(
+            final_edges[0].conversion,
+            crate::Conversion::PromoteIntToDouble
+        );
+        assert_eq!(final_edges[1].conversion, crate::Conversion::Identity);
+    }
+
+    #[test]
     fn prefix_spread_preserves_immediate_element_metadata() {
         let program = must_compile("add [1 (2 3)]\n");
         let raw = program.as_raw();
@@ -3414,10 +3504,11 @@ mod tests {
              any_of[(true false)]\n\
              none_of[(true false)]\n\
              foldl[@sub 10 (1 2)]\n\
+             scanl[@sub 10 (1 2)]\n\
              add [1 2]\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 9_622_858_128_876_183_874);
+        assert_eq!(debug_digest(&matrix), 2_540_857_452_231_284_986);
 
         let depth = 256;
         let mut deep = String::new();
