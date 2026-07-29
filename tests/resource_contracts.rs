@@ -1,8 +1,9 @@
 use faraweave::{
-    AllocationFailureInjection, ArgumentErrorReason, Error, ErrorKind, EvaluationConfiguration,
-    ExecutionProfile, ParameterErrorReason, ResourceErrorReason, ResourceLimits, Value,
-    emit_c_source_with_configuration, evaluate_expression, evaluate_expression_with_configuration,
-    evaluate_source, evaluate_source_with_arguments, evaluate_source_with_configuration,
+    AllocationFailureInjection, ArgumentErrorReason, DomainErrorReason, Error, ErrorKind,
+    EvaluationConfiguration, ExecutionProfile, ParameterErrorReason, ResourceErrorReason,
+    ResourceLimits, Value, emit_c_source_with_configuration, evaluate_expression,
+    evaluate_expression_with_configuration, evaluate_source, evaluate_source_with_arguments,
+    evaluate_source_with_configuration,
 };
 use std::sync::Mutex;
 
@@ -18,9 +19,144 @@ struct ObservedResourceEvent {
 }
 
 static RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static LENGTH_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static SORT_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static SUM_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static ALL_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static ANY_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static NONE_OF_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static FOLDL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static SCANL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static SCANL_FAULT_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_length_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = LENGTH_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_sort_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = SORT_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_sum_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = SUM_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_all_of_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = ALL_OF_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_any_of_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = ANY_OF_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_none_of_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = NONE_OF_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_foldl_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = FOLDL_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_scanl_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = SCANL_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_scanl_fault_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = SCANL_FAULT_RESOURCE_EVENTS.lock() {
         events.push(ObservedResourceEvent {
             kind: event.kind,
             producer: event.producer.to_owned(),
@@ -416,6 +552,909 @@ fn failure_usage_is_post_cleanup_and_work_remains_monotonic() {
     assert_eq!(usage.live_evaluation_bytes, 0);
     assert_eq!(usage.work_units, 1);
     assert_eq!(usage.allocation_attempts, 2);
+}
+
+#[test]
+fn div_admission_precedes_domain_and_failure_cleanup_is_exact() {
+    let scalar = evaluate_expression("div[1 0]").expect_err("scalar division domain");
+    assert_eq!(scalar.kind, ErrorKind::DomainError);
+    assert_eq!(
+        scalar.domain.as_ref().map(|context| context.reason),
+        Some(DomainErrorReason::DivisionByZero)
+    );
+    assert_eq!(
+        scalar.usage,
+        Some(faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 0,
+            work_units: 1,
+            allocation_attempts: 0,
+        })
+    );
+
+    let lifted = evaluate_expression("div[(8 9) (2 0)]").expect_err("lifted division domain");
+    assert_eq!(lifted.kind, ErrorKind::DomainError);
+    assert_eq!(
+        lifted
+            .domain
+            .as_ref()
+            .and_then(|context| context.element_index),
+        Some(1)
+    );
+    assert_eq!(
+        lifted.usage,
+        Some(faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 48,
+            work_units: 2,
+            allocation_attempts: 3,
+        })
+    );
+
+    let work = evaluate_expression_with_configuration(
+        "div[(8 9) (2 0)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(64),
+            max_live_evaluation_bytes: Some(64),
+            max_work_units: Some(1),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("work refusal precedes division domain");
+    assert_eq!(work.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&work).limit_kind, Some("max_work_units"));
+    assert!(work.domain.is_none());
+
+    let allocation = evaluate_expression_with_configuration(
+        "div[(8 9) (2 0)]",
+        EvaluationConfiguration {
+            profile: ExecutionProfile::TrustedLocalV2,
+            limits: ResourceLimits::default(),
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(2),
+            },
+        },
+    )
+    .expect_err("result allocation refusal precedes division domain");
+    assert_eq!(allocation.kind, ErrorKind::ResourceError);
+    assert_eq!(
+        resource(&allocation).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(resource(&allocation).allocation_ordinal, Some(2));
+    assert!(allocation.domain.is_none());
+}
+
+#[test]
+fn length_charges_constant_work_borrows_input_and_has_no_result_allocation() {
+    LENGTH_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let result = faraweave::evaluate_expression_with_observer(
+        "length[(1 2 3)]",
+        EvaluationConfiguration::default(),
+        observe_length_resource_event,
+    )
+    .expect("vector length");
+    assert_eq!(result.value, Value::Int(3));
+    assert_eq!(
+        result.usage,
+        faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 24,
+            work_units: 1,
+            allocation_attempts: 1,
+        }
+    );
+    let events = LENGTH_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[0].bytes, Some(24));
+    assert_eq!(events[0].ordinal, Some(0));
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].producer, "length");
+    assert_eq!(events[1].bytes, None);
+    assert_eq!(events[1].work, 1);
+    assert_eq!(events[1].ordinal, None);
+    assert_eq!(events[1].usage.live_evaluation_bytes, 24);
+    assert_eq!(events[1].usage.work_units, 1);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 0);
+    assert_eq!(events[2].usage.work_units, 1);
+
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "length[(1 2 3)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("length performs no second allocation");
+    assert_eq!(no_result_allocation.value, Value::Int(3));
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let input_refusal = evaluate_expression_with_configuration(
+        "length[(1 2 3)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("input allocation refusal");
+    assert_eq!(input_refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(
+        resource(&input_refusal).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(input_refusal.usage.expect("refusal usage").work_units, 0);
+
+    let work_refusal = evaluate_expression_with_configuration(
+        "length[(1 2 3)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(24),
+            max_work_units: Some(0),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("constant work refusal");
+    assert_eq!(work_refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&work_refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&work_refusal).refused_charge, Some(1));
+    let usage = work_refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn sort_admits_owned_output_with_input_live_and_cleans_up_refused_output() {
+    SORT_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let result = faraweave::evaluate_expression_with_observer(
+        "sort[(4 1 3 2)]",
+        EvaluationConfiguration::default(),
+        observe_sort_resource_event,
+    )
+    .expect("vector sort");
+    assert_eq!(result.value, Value::IntVector(vec![1, 2, 3, 4]));
+    assert_eq!(
+        result.usage,
+        faraweave::ResourceUsage {
+            live_evaluation_bytes: 32,
+            peak_live_evaluation_bytes: 64,
+            work_units: 4,
+            allocation_attempts: 2,
+        }
+    );
+    let events = SORT_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[0].bytes, Some(32));
+    assert_eq!(events[0].ordinal, Some(0));
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].producer, "sort");
+    assert_eq!(events[1].bytes, Some(32));
+    assert_eq!(events[1].work, 4);
+    assert_eq!(events[1].ordinal, Some(1));
+    assert_eq!(events[1].usage.live_evaluation_bytes, 64);
+    assert_eq!(events[1].usage.peak_live_evaluation_bytes, 64);
+    assert_eq!(events[1].usage.work_units, 4);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 32);
+
+    SORT_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let refusal = faraweave::evaluate_expression_with_observer(
+        "sort[(4 1 3 2)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+        observe_sort_resource_event,
+    )
+    .expect_err("sort output allocation refusal");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(
+        resource(&refusal).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(resource(&refusal).allocation_ordinal, Some(1));
+    let events = SORT_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Refusal);
+    assert_eq!(events[1].producer, "sort");
+    assert_eq!(events[1].bytes, Some(32));
+    assert_eq!(events[1].work, 4);
+    assert_eq!(
+        events[1].refusal,
+        Some(ResourceErrorReason::AllocationUnavailable)
+    );
+    assert_eq!(events[1].usage.live_evaluation_bytes, 32);
+    assert_eq!(events[1].usage.work_units, 0);
+    assert_eq!(events[1].usage.allocation_attempts, 2);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 0);
+    assert_eq!(refusal.usage.expect("post-cleanup usage"), events[2].usage);
+
+    let empty = evaluate_expression_with_configuration(
+        "sort[Int()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty input and output have no allocation ordinal");
+    assert_eq!(empty.value, Value::IntVector(Vec::new()));
+    assert_eq!(empty.usage.live_evaluation_bytes, 0);
+    assert_eq!(empty.usage.peak_live_evaluation_bytes, 0);
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+}
+
+#[test]
+fn sort_large_bounded_input_has_linear_semantic_work_and_exact_limit_seam() {
+    let success = evaluate_expression_with_configuration(
+        "sort iota 4096",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32_768),
+            max_live_evaluation_bytes: Some(65_536),
+            max_work_units: Some(8_192),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect("bounded large sort");
+    assert_eq!(success.value.len(), 4_096);
+    assert_eq!(success.usage.peak_live_evaluation_bytes, 65_536);
+    assert_eq!(success.usage.work_units, 8_192);
+    assert_eq!(success.usage.allocation_attempts, 2);
+
+    let refusal = evaluate_expression_with_configuration(
+        "sort iota 4096",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32_768),
+            max_live_evaluation_bytes: Some(65_536),
+            max_work_units: Some(8_191),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("one work unit below sort schedule");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(4_096));
+    assert_eq!(resource(&refusal).refused_charge, Some(4_096));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 4_096);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn sum_charges_full_work_before_reduction_and_allocates_no_result() {
+    SUM_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let result = faraweave::evaluate_expression_with_observer(
+        "sum[(1 2 3)]",
+        EvaluationConfiguration::default(),
+        observe_sum_resource_event,
+    )
+    .expect("vector sum");
+    assert_eq!(result.value, Value::Int(6));
+    assert_eq!(
+        result.usage,
+        faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 24,
+            work_units: 3,
+            allocation_attempts: 1,
+        }
+    );
+    let events = SUM_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[0].bytes, Some(24));
+    assert_eq!(events[0].ordinal, Some(0));
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].producer, "sum");
+    assert_eq!(events[1].bytes, None);
+    assert_eq!(events[1].work, 3);
+    assert_eq!(events[1].ordinal, None);
+    assert_eq!(events[1].usage.live_evaluation_bytes, 24);
+    assert_eq!(events[1].usage.work_units, 3);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 0);
+    assert_eq!(events[2].usage.work_units, 3);
+
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "sum[(1 2 3)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("sum performs no result allocation");
+    assert_eq!(no_result_allocation.value, Value::Int(6));
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let empty = evaluate_expression_with_configuration(
+        "sum[Double()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty sum has no allocation ordinal");
+    assert_eq!(empty.value, Value::Double(0.0));
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+
+    let work_refusal = evaluate_expression_with_configuration(
+        "sum[(1 2 3)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(24),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("full sum work refusal");
+    assert_eq!(work_refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&work_refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&work_refusal).refused_charge, Some(3));
+    let usage = work_refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn sum_overflow_retains_admitted_work_and_large_dynamic_limits_are_exact() {
+    let overflow = evaluate_expression_with_configuration(
+        "sum[(9223372036854775807 1 -1)]",
+        EvaluationConfiguration::default(),
+    )
+    .expect_err("sum overflow");
+    assert_eq!(overflow.kind, ErrorKind::DomainError);
+    assert_eq!(
+        overflow.message,
+        "sum failed: integer_overflow at result index 1"
+    );
+    let usage = overflow.usage.expect("overflow cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 3);
+    assert_eq!(usage.allocation_attempts, 1);
+
+    let success = evaluate_expression_with_configuration(
+        "sum iota 4096",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32_768),
+            max_live_evaluation_bytes: Some(32_768),
+            max_work_units: Some(8_192),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect("bounded large sum");
+    assert_eq!(success.value, Value::Int(8_390_656));
+    assert_eq!(success.usage.live_evaluation_bytes, 0);
+    assert_eq!(success.usage.peak_live_evaluation_bytes, 32_768);
+    assert_eq!(success.usage.work_units, 8_192);
+    assert_eq!(success.usage.allocation_attempts, 1);
+
+    let refusal = evaluate_expression_with_configuration(
+        "sum iota 4096",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32_768),
+            max_live_evaluation_bytes: Some(32_768),
+            max_work_units: Some(8_191),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("one work unit below sum schedule");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(4_096));
+    assert_eq!(resource(&refusal).refused_charge, Some(4_096));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 4_096);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn all_of_work_and_observer_trace_are_independent_of_the_decisive_position() {
+    let mut reference_events = None;
+    for source in [
+        "all_of[(true true true true)]",
+        "all_of[(false true true true)]",
+        "all_of[(true false true true)]",
+        "all_of[(true true false true)]",
+        "all_of[(true true true false)]",
+    ] {
+        ALL_OF_RESOURCE_EVENTS.lock().expect("event lock").clear();
+        let result = faraweave::evaluate_expression_with_observer(
+            source,
+            EvaluationConfiguration::default(),
+            observe_all_of_resource_event,
+        )
+        .expect("all_of reduction");
+        assert_eq!(result.usage.work_units, 4, "{source}");
+        assert_eq!(result.usage.allocation_attempts, 1, "{source}");
+        let events = ALL_OF_RESOURCE_EVENTS.lock().expect("event lock").clone();
+        assert_eq!(events.len(), 3, "{source}");
+        assert_eq!(events[0].producer, "vector_literal", "{source}");
+        assert_eq!(events[1].producer, "all_of", "{source}");
+        assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+        assert_eq!(events[1].bytes, None);
+        assert_eq!(events[1].work, 4);
+        assert_eq!(events[1].ordinal, None);
+        assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+        if let Some(reference) = &reference_events {
+            assert_eq!(&events, reference, "{source}");
+        } else {
+            reference_events = Some(events);
+        }
+    }
+}
+
+#[test]
+fn all_of_empty_allocation_and_work_refusal_precedence_are_exact() {
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "all_of[(false true true)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("all_of performs no result allocation");
+    assert_eq!(no_result_allocation.value, Value::Bool(false));
+    assert_eq!(no_result_allocation.usage.work_units, 3);
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let empty = evaluate_expression_with_configuration(
+        "all_of[Bool()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty all_of has no allocation ordinal");
+    assert_eq!(empty.value, Value::Bool(true));
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+
+    let refusal = evaluate_expression_with_configuration(
+        "all_of[(false true true)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(3),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("full all_of work refusal");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(0));
+    assert_eq!(resource(&refusal).refused_charge, Some(3));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn any_of_work_and_observer_trace_are_independent_of_the_decisive_position() {
+    let mut reference_events = None;
+    for source in [
+        "any_of[(false false false false)]",
+        "any_of[(true false false false)]",
+        "any_of[(false true false false)]",
+        "any_of[(false false true false)]",
+        "any_of[(false false false true)]",
+    ] {
+        ANY_OF_RESOURCE_EVENTS.lock().expect("event lock").clear();
+        let result = faraweave::evaluate_expression_with_observer(
+            source,
+            EvaluationConfiguration::default(),
+            observe_any_of_resource_event,
+        )
+        .expect("any_of reduction");
+        assert_eq!(result.usage.work_units, 4, "{source}");
+        assert_eq!(result.usage.allocation_attempts, 1, "{source}");
+        let events = ANY_OF_RESOURCE_EVENTS.lock().expect("event lock").clone();
+        assert_eq!(events.len(), 3, "{source}");
+        assert_eq!(events[0].producer, "vector_literal", "{source}");
+        assert_eq!(events[1].producer, "any_of", "{source}");
+        assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+        assert_eq!(events[1].bytes, None);
+        assert_eq!(events[1].work, 4);
+        assert_eq!(events[1].ordinal, None);
+        assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+        if let Some(reference) = &reference_events {
+            assert_eq!(&events, reference, "{source}");
+        } else {
+            reference_events = Some(events);
+        }
+    }
+}
+
+#[test]
+fn any_of_empty_allocation_and_work_refusal_precedence_are_exact() {
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "any_of[(true false false)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("any_of performs no result allocation");
+    assert_eq!(no_result_allocation.value, Value::Bool(true));
+    assert_eq!(no_result_allocation.usage.work_units, 3);
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let empty = evaluate_expression_with_configuration(
+        "any_of[Bool()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty any_of has no allocation ordinal");
+    assert_eq!(empty.value, Value::Bool(false));
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+
+    let refusal = evaluate_expression_with_configuration(
+        "any_of[(true false false)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(3),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("full any_of work refusal");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(0));
+    assert_eq!(resource(&refusal).refused_charge, Some(3));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn none_of_work_and_observer_trace_use_its_identity_at_every_decisive_position() {
+    let mut reference_events = None;
+    for source in [
+        "none_of[(false false false false)]",
+        "none_of[(true false false false)]",
+        "none_of[(false true false false)]",
+        "none_of[(false false true false)]",
+        "none_of[(false false false true)]",
+    ] {
+        NONE_OF_RESOURCE_EVENTS.lock().expect("event lock").clear();
+        let result = faraweave::evaluate_expression_with_observer(
+            source,
+            EvaluationConfiguration::default(),
+            observe_none_of_resource_event,
+        )
+        .expect("none_of reduction");
+        assert_eq!(result.usage.work_units, 4, "{source}");
+        assert_eq!(result.usage.allocation_attempts, 1, "{source}");
+        let events = NONE_OF_RESOURCE_EVENTS.lock().expect("event lock").clone();
+        assert_eq!(events.len(), 3, "{source}");
+        assert_eq!(events[0].producer, "vector_literal", "{source}");
+        assert_eq!(events[1].producer, "none_of", "{source}");
+        assert_ne!(events[1].producer, "any_of", "{source}");
+        assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+        assert_eq!(events[1].bytes, None);
+        assert_eq!(events[1].work, 4);
+        assert_eq!(events[1].ordinal, None);
+        assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+        if let Some(reference) = &reference_events {
+            assert_eq!(&events, reference, "{source}");
+        } else {
+            reference_events = Some(events);
+        }
+    }
+}
+
+#[test]
+fn none_of_empty_allocation_and_work_refusal_precedence_are_exact() {
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "none_of[(true false false)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("none_of performs no result allocation");
+    assert_eq!(no_result_allocation.value, Value::Bool(false));
+    assert_eq!(no_result_allocation.usage.work_units, 3);
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let empty = evaluate_expression_with_configuration(
+        "none_of[Bool()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty none_of has no allocation ordinal");
+    assert_eq!(empty.value, Value::Bool(true));
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+
+    let refusal = evaluate_expression_with_configuration(
+        "none_of[(true false false)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(3),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("full none_of work refusal");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(refusal.primitive.as_deref(), Some("none_of"));
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(0));
+    assert_eq!(resource(&refusal).refused_charge, Some(3));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly() {
+    for source in [
+        "foldl[@sub 20 (3 4 5)]",
+        "foldl[@add 0 (3 4 5)]",
+        "foldl[@div 60 (3 4 5)]",
+    ] {
+        FOLDL_RESOURCE_EVENTS.lock().expect("event lock").clear();
+        let result = faraweave::evaluate_expression_with_observer(
+            source,
+            EvaluationConfiguration::default(),
+            observe_foldl_resource_event,
+        )
+        .expect("foldl reduction");
+        assert_eq!(result.usage.work_units, 3, "{source}");
+        assert_eq!(result.usage.allocation_attempts, 1, "{source}");
+        let events = FOLDL_RESOURCE_EVENTS.lock().expect("event lock").clone();
+        assert_eq!(events.len(), 3, "{source}");
+        assert_eq!(events[0].producer, "vector_literal", "{source}");
+        assert_eq!(events[0].bytes, Some(24), "{source}");
+        assert_eq!(events[1].producer, "foldl", "{source}");
+        assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+        assert_eq!(events[1].bytes, None, "{source}");
+        assert_eq!(events[1].work, 3, "{source}");
+        assert_eq!(events[1].ordinal, None, "{source}");
+        assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    }
+
+    FOLDL_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let fault = faraweave::evaluate_expression_with_observer(
+        "foldl[@div 10 (0 2)]",
+        EvaluationConfiguration::default(),
+        observe_foldl_resource_event,
+    )
+    .expect_err("first reducer step faults");
+    assert_eq!(fault.kind, ErrorKind::DomainError);
+    let usage = fault.usage.expect("post-cleanup foldl usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 2);
+    assert_eq!(usage.allocation_attempts, 1);
+    let events = FOLDL_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].producer, "foldl");
+    assert_eq!(events[1].work, 2);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 0);
+}
+
+#[test]
+fn foldl_empty_allocation_and_work_refusal_precedence_are_exact() {
+    let no_result_allocation = evaluate_expression_with_configuration(
+        "foldl[@add 0 (1 2 3)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("foldl performs no result allocation");
+    assert_eq!(no_result_allocation.value, Value::Int(6));
+    assert_eq!(no_result_allocation.usage.work_units, 3);
+    assert_eq!(no_result_allocation.usage.allocation_attempts, 1);
+
+    let empty = evaluate_expression_with_configuration(
+        "foldl[@div 7 Int()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty foldl has no allocation ordinal");
+    assert_eq!(empty.value, Value::Int(7));
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 0);
+
+    let refusal = evaluate_expression_with_configuration(
+        "foldl[@div 10 (0)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(8),
+            max_work_units: Some(0),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("foldl work refusal precedes reducer fault");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    assert_eq!(refusal.primitive.as_deref(), Some("foldl"));
+    assert_eq!(resource(&refusal).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&refusal).usage_before, Some(0));
+    assert_eq!(resource(&refusal).refused_charge, Some(1));
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
+}
+
+#[test]
+fn scanl_admits_n_plus_one_output_before_population_with_input_live() {
+    SCANL_RESOURCE_EVENTS.lock().expect("event lock").clear();
+    let result = faraweave::evaluate_expression_with_observer(
+        "scanl[@sub 20 (3 4 5)]",
+        EvaluationConfiguration::default(),
+        observe_scanl_resource_event,
+    )
+    .expect("scanl reduction");
+    assert_eq!(result.value, Value::IntVector(vec![20, 17, 13, 8]));
+    assert_eq!(result.usage.live_evaluation_bytes, 32);
+    assert_eq!(result.usage.peak_live_evaluation_bytes, 56);
+    assert_eq!(result.usage.work_units, 3);
+    assert_eq!(result.usage.allocation_attempts, 2);
+    let events = SCANL_RESOURCE_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[0].bytes, Some(24));
+    assert_eq!(events[0].ordinal, Some(0));
+    assert_eq!(events[1].producer, "scanl");
+    assert_eq!(events[1].kind, faraweave::ResourceEventKind::Admission);
+    assert_eq!(events[1].bytes, Some(32));
+    assert_eq!(events[1].work, 3);
+    assert_eq!(events[1].ordinal, Some(1));
+    assert_eq!(events[1].usage.live_evaluation_bytes, 56);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].bytes, Some(24));
+    assert_eq!(events[2].usage.live_evaluation_bytes, 32);
+
+    let empty = evaluate_expression_with_configuration(
+        "scanl[@add 7 Int()]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("empty scan allocates only its one-element output");
+    assert_eq!(empty.value, Value::IntVector(vec![7]));
+    assert_eq!(empty.usage.live_evaluation_bytes, 8);
+    assert_eq!(empty.usage.work_units, 0);
+    assert_eq!(empty.usage.allocation_attempts, 1);
+}
+
+#[test]
+fn scanl_fault_releases_output_before_input_and_retains_full_work() {
+    SCANL_FAULT_RESOURCE_EVENTS
+        .lock()
+        .expect("event lock")
+        .clear();
+    let fault = faraweave::evaluate_expression_with_observer(
+        "scanl[@div 10 (0 2)]",
+        EvaluationConfiguration::default(),
+        observe_scanl_fault_resource_event,
+    )
+    .expect_err("first reducer step faults after output allocation");
+    assert_eq!(fault.kind, ErrorKind::DomainError);
+    assert_eq!(
+        fault
+            .domain
+            .as_ref()
+            .and_then(|domain| domain.element_index),
+        Some(0)
+    );
+    let usage = fault.usage.expect("post-cleanup scanl usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.peak_live_evaluation_bytes, 40);
+    assert_eq!(usage.work_units, 2);
+    assert_eq!(usage.allocation_attempts, 2);
+    let events = SCANL_FAULT_RESOURCE_EVENTS
+        .lock()
+        .expect("event lock")
+        .clone();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].producer, "vector_literal");
+    assert_eq!(events[1].producer, "scanl");
+    assert_eq!(events[1].bytes, Some(24));
+    assert_eq!(events[1].work, 2);
+    assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[2].bytes, Some(24));
+    assert_eq!(events[2].usage.live_evaluation_bytes, 16);
+    assert_eq!(events[3].kind, faraweave::ResourceEventKind::Release);
+    assert_eq!(events[3].bytes, Some(16));
+    assert_eq!(events[3].usage.live_evaluation_bytes, 0);
+}
+
+#[test]
+fn scanl_output_allocation_and_work_refusals_precede_reducer_steps() {
+    let allocation = evaluate_expression_with_configuration(
+        "scanl[@div 10 (0 2)]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("scan output allocation refusal");
+    assert_eq!(allocation.kind, ErrorKind::ResourceError);
+    assert_eq!(allocation.primitive.as_deref(), Some("scanl"));
+    assert_eq!(
+        resource(&allocation).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(resource(&allocation).requested_elements, Some(3));
+    assert_eq!(resource(&allocation).requested_bytes, Some(24));
+    let usage = allocation.usage.expect("post-cleanup allocation usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 2);
+
+    let work = evaluate_expression_with_configuration(
+        "scanl[@div 10 (0 2 3)]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(32),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("full scan work refusal");
+    assert_eq!(work.kind, ErrorKind::ResourceError);
+    assert_eq!(work.primitive.as_deref(), Some("scanl"));
+    assert_eq!(resource(&work).limit_kind, Some("max_work_units"));
+    assert_eq!(resource(&work).usage_before, Some(0));
+    assert_eq!(resource(&work).refused_charge, Some(3));
+    let usage = work.usage.expect("post-cleanup work usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.work_units, 0);
+    assert_eq!(usage.allocation_attempts, 1);
 }
 
 #[test]

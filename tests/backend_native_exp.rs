@@ -126,9 +126,9 @@ fn exp_uses_contiguous_ids_double_selection_lifting_and_feature_seven() {
     assert_eq!(
         selections,
         vec![
-            (30, 36, 36, LiftMode::Scalar, ScalarType::Double),
-            (30, 36, 36, LiftMode::Scalar, ScalarType::Double),
-            (30, 36, 36, LiftMode::Vector, ScalarType::Double),
+            (30, 55, 55, LiftMode::Scalar, ScalarType::Double),
+            (30, 55, 55, LiftMode::Scalar, ScalarType::Double),
+            (30, 55, 55, LiftMode::Vector, ScalarType::Double),
         ]
     );
     assert_eq!(raw.edges[0].conversion, Conversion::Identity);
@@ -320,8 +320,8 @@ fn exp_fwir_roundtrip_and_malformed_identities_are_checked() {
             node.kind,
             NodeKind::SelectedApply {
                 primitive_id: 30,
-                signature_id: 36,
-                implementation_id: 36,
+                signature_id: 55,
+                implementation_id: 55,
                 ..
             }
         )
@@ -370,6 +370,6 @@ fn exp_emitted_c_calls_math_h_exp_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=exp(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_exp(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_36("));
-    assert!(source.contains("static int fw_impl_36("));
+    assert!(source.contains("static int fw_kernel_55("));
+    assert!(source.contains("static int fw_impl_55("));
 }
