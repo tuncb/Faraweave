@@ -10,7 +10,7 @@ in order and prints one result per line.
 | [`tuples.faraweave`](tuples.faraweave) | Heterogeneous and nested tuples, plus one-level tuple spreading |
 | [`fanout.faraweave`](fanout.faraweave) | Reusing one operand across several left-to-right branches |
 | [`reductions.faraweave`](reductions.faraweave) | Numeric and Boolean reductions, folds, and seed-inclusive scans |
-| [`math-functions.faraweave`](math-functions.faraweave) | Backend-native scalar and vector math |
+| [`math-functions.faraweave`](math-functions.faraweave) | Host-math scalar and vector functions |
 | [`parameters.faraweave`](parameters.faraweave) | Declaring and using typed command-line inputs |
 | [`rewrite.faraweave`](rewrite.faraweave) | A compact tour of scalar and vector expressions |
 

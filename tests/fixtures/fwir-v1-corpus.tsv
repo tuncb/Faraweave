@@ -1,4 +1,4 @@
 artifact	path	bytes	fnv1a64	surfaces
-empty	spec/examples/fwir-v1-empty.hex	64	3231a03867dc8791	decode,reencode,inspect,interpret,emit-c,native
-scalar-true	spec/examples/fwir-v1-scalar-true.hex	422	b40a9af104fc364a	decode,reencode,inspect,interpret,emit-c,native
-complete	spec/examples/fwir-v1-complete.hex	4413	6e0588b19cf3bf7b	decode,reencode,inspect,interpret,emit-c,native
+empty	spec/examples/fwir-v1-empty.hex	64	3231a03867dc8791	decode,reencode,inspect,interpret
+scalar-true	spec/examples/fwir-v1-scalar-true.hex	422	b40a9af104fc364a	decode,reencode,inspect,interpret
+complete	spec/examples/fwir-v1-complete.hex	4413	6e0588b19cf3bf7b	decode,reencode,inspect,interpret

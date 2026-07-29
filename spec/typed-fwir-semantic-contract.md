@@ -7,7 +7,7 @@ in-memory Faraweave Intermediate Representation (FWIR). It is accepted by
 [issue #2](https://github.com/tuncb/Faraweave/issues/2) and its
 [decision record](../decisions/issue-2-typed-fwir-semantic-boundary.md).
 
-**Scope:** FWIR as the immutable, verified input to all execution backends.
+**Scope:** FWIR as the immutable, verified input to the Rust interpreter.
 Exact serialized bytes, field widths, numeric identity assignments, and a
 public format compatibility promise are deferred to their owning issues.
 
@@ -27,11 +27,9 @@ UTF-8 source
   -> RawProgram verification
   -> VerifiedProgram
        -> direct interpretation
-       -> deterministic strict-C11 generation
-       -> native build
 ```
 
-`VerifiedProgram` is the only backend semantic input. A backend must not
+`VerifiedProgram` is the only interpreter semantic input. The interpreter must not
 consult the parser AST, source call syntax, source primitive names for
 dispatch, or a primitive overload table; all information needed to execute,
 diagnose, account, clean up, and return every current construct is present in
@@ -40,7 +38,7 @@ the verified program and the separately supplied execution policy.
 The canonical semantics are results, structured failures and their winner
 order, source provenance, logical ownership, allocation/work/live accounting,
 release events, and root order. Host storage layout, register allocation,
-generated symbol spelling, and other physically unobservable choices are not
+internal symbol spelling and other physically unobservable choices are not
 canonical.
 
 ## 2. Abstract program records (`FWIR-SEM-002`)
@@ -66,7 +64,7 @@ but this contract does not choose an integer width, byte order, Rust layout,
 discriminant, or serialized order.
 
 The module must not contain host pointers, borrowed source strings, `usize`
-values as a portability promise, backend handles, allocator identities, or
+values as a portability promise, execution handles, allocator identities, or
 parser nodes. Diagnostic names are retained data and never execution
 identities.
 
@@ -152,14 +150,14 @@ use, when the live bytes are released. A zero-length vector still performs the
 zero-byte admission and produces an owned, typed empty result, but has no live
 charge, allocation attempt/ordinal, or reservation release. These accounting
 facts are part of `FWIR-SEM-005` and follow the canonical request order and
-events in `FWIR-SEM-014`; a backend may elide physical storage only while
+events in `FWIR-SEM-014`; the interpreter may elide physical storage only while
 preserving them exactly.
 
 Tuple literals are node constructions, not opaque tuple constants, because
 their element evaluation, provenance, ownership transfer, table admission,
 allocation ordinal, and cleanup are observable. Compact parser forms such as a
 deep tuple or unary chain lower to ordinary semantic nodes and do not create
-backend-specific constant or node kinds.
+interpreter-specific constant or node kinds.
 
 The mandatory feature set is the union of semantic capabilities required by
 the module, including tuple/profile-v2, fan-out, and any identity or node family
@@ -216,7 +214,7 @@ ownership are not valid programs.
 
 ## 7. Complete lowering decisions (`FWIR-SEM-007`)
 
-Lowering must record every backend-relevant decision exactly once:
+Lowering must record every execution-relevant decision exactly once:
 
 1. parameter slot for every parameter reference;
 2. complete result type and leaf cardinality for every node;
@@ -240,7 +238,7 @@ Lowering must record every backend-relevant decision exactly once:
 Container-wide signatures additionally record one stable application-plan ID
 whose registry meaning fixes whole-vector versus elementwise operand
 consumption, scalar/vector result-cardinality behavior, and deterministic work
-admission. Backends consume that verified identity directly.
+admission. The interpreter consumes that verified identity directly.
 
 The stable conversion classes for the current language are:
 
@@ -258,7 +256,7 @@ order as the deterministic tie-breaker. The stable numeric values for
 primitive, signature, and implementation identities are owned by issue #3;
 the semantic distinction and requirement to record them are fixed here.
 
-Backends dispatch the selected implementation identity directly. They must not
+The interpreter dispatches the selected implementation identity directly. It must not
 repeat arity validation, overload search, conversion selection, result-type
 inference, cardinality inference, static anchor selection, or tuple-spread
 classification during normal execution.
@@ -358,10 +356,10 @@ work are admitted together before population, and a fault releases the output
 before reverse input cleanup while retaining work.
 
 These exact units, combined result requests, and commit points are part of
-`FWIR-SEM-008`, not backend cost estimates. Together with `FWIR-SEM-005` and
-`FWIR-SEM-014`, they prevent an interpreter, generated runtime, or other
-backend from selecting different work-limit failures, allocation ordinals, or
-resource events for the same verified program and execution policy.
+`FWIR-SEM-008`, not implementation cost estimates. Together with
+`FWIR-SEM-005` and `FWIR-SEM-014`, they prevent interpreter changes from
+selecting different work-limit failures, allocation ordinals, or resource
+events for the same verified program and execution policy.
 
 Integer arithmetic is checked. `div[Int Int]` truncates toward zero, rejects a
 zero divisor with structured `DivisionByZero`, and rejects `Int::MIN / -1`
@@ -369,13 +367,13 @@ with the existing `IntegerOverflow`; a lifted failure retains the converted
 operands and lowest failing result index. Binary64 division is successful for
 zero divisors and follows the same strict behavior as other binary64
 arithmetic: canonical NaN, signed zero and infinity, and gradual underflow.
-These kernel semantics belong to the selected implementation identity; a
-backend must not infer them from the primitive source name.
+These kernel semantics belong to the selected implementation identity; the
+interpreter must not infer them from the primitive source name.
 
 The identities reserved by the
 [backend-native math v1 policy](backend-native-math-v1.md) are the sole narrow
 exception to exact finite-result bit parity. Their portable special values,
-operation-specific finite envelopes, direct Rust/C calls, mandatory feature,
+operation-specific finite envelopes, direct Rust calls, mandatory feature,
 floating-state isolation, and exact surrounding nonnumeric behavior are
 normative parts of `FWIR-SEM-008`.
 
@@ -536,7 +534,7 @@ the existing construct-specific reason tie-breakers. Name resolution covers all
 roots and branches before feature/profile preflight and primitive arity, so an
 unknown primitive is never hidden by a predicted runtime or profile failure.
 Once names resolve, a v1 tuple-profile refusal wins before arity, type, shape,
-argument, or execution work, as on the current source and backend surfaces.
+argument or execution work, as on the current source surfaces.
 
 Dependency analysis visits roots in source order and expressions in
 left-to-right postorder. A fan-out operand precedes its branches; branches are
@@ -593,7 +591,7 @@ logical last use; allocation-attempt count is monotonic.
 
 The vector-constant rules in `FWIR-SEM-005` and the ordinary
 `SelectedApply`/`iota` work rules in `FWIR-SEM-008` are canonical inputs to this
-request sequence. Backends must not split, combine, defer, omit, or add those
+request sequence. The interpreter must not split, combine, defer, omit, or add those
 requests in a way that changes a refusal winner, committed usage, allocation
 ordinal, admission/refusal/release event, or post-cleanup usage.
 
@@ -607,8 +605,8 @@ publication starts may expose an output prefix.
 
 The module records required semantic features, types, operations, conversions,
 origins, ownership, and order. It must not bake in a caller's execution
-profile, resource limits, allocation-failure ordinal, observer, compiler,
-target, filesystem path, or output destination.
+profile, resource limits, allocation-failure ordinal, observer, target,
+filesystem path, or output destination.
 
 Execution policy is supplied when a verified module is instantiated or run:
 
@@ -626,7 +624,7 @@ canonical 16-byte immediate tuple-slot charge, semantic allocation ordinals,
 work/live accounting, and release events independently of host `sizeof` or
 physical allocation strategy.
 
-An optimization or backend policy may alter physical execution only after
+An optimization or interpreter policy may alter physical execution only after
 proving identical values, structured diagnostics, dynamic winner order,
 logical admissions, ordinals, work, live/peak accounting, releases, formatting,
 and output transaction behavior. Version 1 FWIR performs no optimization that
@@ -641,12 +639,12 @@ There are three trust boundaries:
    verifier.
 2. **Raw producer:** a builder or future decoder yields `RawProgram`; its
    indexes, ranges, identities, metadata, and ownership are untrusted.
-3. **Verified consumer:** interpreters, emitters, inspectors, and serializers
-   receive only an immutable `VerifiedProgram`.
+3. **Verified consumer:** the interpreter, inspectors, and serializers receive
+   only an immutable `VerifiedProgram`.
 
 The public API must make `VerifiedProgram` impossible to construct without
 successful verification. Verification must be iterative, checked, deterministic,
-and complete before argument binding, resource creation, backend dispatch, or
+and complete before argument binding, resource creation, execution, or
 publication.
 
 The verifier checks in this category order:
@@ -669,7 +667,7 @@ source-program failure.
 
 Invalid source returns its source semantic error and produces no partial raw or
 verified program. A malformed raw program returns no `VerifiedProgram` and is
-never executed "defensively" by letting backend runtime checks rediscover its
+never executed "defensively" by letting interpreter runtime checks rediscover its
 invariants.
 
 ## 17. Construct completeness (`FWIR-SEM-017`)
@@ -681,8 +679,8 @@ Every current parser expression maps without preserving parser-only variants:
 | Scalar literal | Constant node with exact scalar payload. |
 | Homogeneous vector literal / typed empty vector | Constant node with element type, payload, and `StaticVector(n)`. |
 | Tuple literal | Ordered `TupleConstruct`; each element is lowered independently. |
-| DeepTuple | Iteratively expanded ordinary tuple types/constructions; no backend-only opcode is required. |
-| UnaryChain | Ordered ordinary `SelectedApply` nodes; no backend-only chain opcode is required. |
+| DeepTuple | Iteratively expanded ordinary tuple types/constructions; no interpreter-only opcode is required. |
+| UnaryChain | Ordered ordinary `SelectedApply` nodes; no interpreter-only chain opcode is required. |
 | Parameter(index) | `ParameterBorrow` with checked slot. |
 | Direct Call | `SelectedApply` with one semantic edge per source argument. |
 | Prefix Call | `SelectedApply` with one direct edge or explicit one-level tuple-element borrow edges. |
@@ -699,7 +697,7 @@ diagnostic descriptor references replace them.
 
 This mapping is complete for the current language. Adding a new source
 construct, type, conversion, ownership mode, or dynamic operation requires a
-new mandatory feature and an amendment to this contract before a backend may
+new mandatory feature and an amendment to this contract before the interpreter may
 accept it.
 
 ### 17.1 Stable built-in operation references
@@ -717,8 +715,8 @@ Lowering considers only closed registered `Elementwise` descriptors, applies
 the ordinary identity-before-Int-promotion cost rule, rejects unknown names,
 unsupported structural behavior, incompatible signatures, and equal-cost
 ambiguity, then records the selected primitive, signature, and implementation
-IDs and the reference origin. Backends dispatch the recorded implementation
-identity; they never retain or look up `name` at runtime.
+IDs and the reference origin. The interpreter dispatches the recorded
+implementation identity; it never retains or looks up `name` at runtime.
 
 For `foldl` and `scanl`, the consumer constrains both reducer parameters and
 its result to the selected container element type. The SelectedApply records the zero-based
@@ -766,21 +764,21 @@ maps every wire field and invariant in
 
 | Requirement | Final evidence |
 | --- | --- |
-| `FWIR-SEM-001` | `python:tools/validation/contracts.py::validate_product_cutover`<br>`rust:tests/fwir_public_contracts.rs::public_source_artifact_execution_c_and_resource_traces_are_differential` |
+| `FWIR-SEM-001` | `python:tools/validation/contracts.py::validate_product_cutover`<br>`rust:tests/fwir_public_contracts.rs::public_source_and_decoded_artifact_execution_and_resource_traces_match` |
 | `FWIR-SEM-002` | `rust:src/typed_program.rs::valid_fixtures_cover_every_node_and_edge_family`<br>`rust:src/typed_program.rs::verifier_category_winners_follow_the_normative_order` |
 | `FWIR-SEM-003` | `rust:tests/parity_contracts.rs::typed_public_api_parameter_contract`<br>`rust:tests/cli_contracts.rs::cli_parameters_and_diagnostics_contract` |
 | `FWIR-SEM-004` | `rust:tests/parity_contracts.rs::s16_empty_singleton_promotion_and_shape_contracts`<br>`rust:tests/parity_contracts.rs::deep_structural_values_and_types_format_and_drop_iteratively` |
 | `FWIR-SEM-005` | `rust:tests/parity_contracts.rs::canonical_binary64_format_boundaries`<br>`rust:tests/resource_contracts.rs::typed_api_rejects_noncanonical_nan_without_normalizing_it`<br>`rust:tests/resource_contracts.rs::resource_observer_reports_commit_refusal_and_cleanup_order` |
 | `FWIR-SEM-006` | `rust:src/parser.rs::parses_literals_calls_tuples_parameters_and_fanout`<br>`rust:tests/parity_contracts.rs::deep_unary_programs_use_iterative_parse_analysis_and_evaluation` |
-| `FWIR-SEM-007` | `rust:src/semantic_registry.rs::production_registry_is_complete_and_numeric_lookups_are_checked`<br>`rust:src/c_emitter.rs::every_selected_id_emits_direct_dispatch_without_type_redispatch` |
-| `FWIR-SEM-008` | `rust:tests/parity_contracts.rs::checked_arithmetic_has_no_partial_result`<br>`rust:tests/parity_contracts.rs::div_integer_faults_and_strict_binary64_are_exact`<br>`rust:tests/parity_contracts.rs::length_accepts_all_vector_types_empty_and_dynamic_cardinalities`<br>`rust:tests/parity_contracts.rs::sort_covers_exhaustive_small_bools_integer_edges_and_total_double_order`<br>`rust:tests/parity_contracts.rs::sum_int_overflow_reports_the_first_reduction_step_and_operands`<br>`rust:tests/parity_contracts.rs::sum_double_is_left_to_right_strict_and_preserves_special_value_bits`<br>`rust:tests/parity_contracts.rs::all_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_false_position`<br>`rust:tests/parity_contracts.rs::any_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`<br>`rust:tests/parity_contracts.rs::none_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`<br>`rust:tests/parity_contracts.rs::foldl_accepts_bool_int_double_empty_dynamic_and_non_associative_reducers`<br>`rust:tests/parity_contracts.rs::foldl_reports_the_leftmost_reducer_fault_with_step_operands_and_reference_origin`<br>`rust:tests/parity_contracts.rs::scanl_is_seed_inclusive_for_all_types_empty_dynamic_and_non_associative_inputs`<br>`rust:tests/parity_contracts.rs::scanl_reports_the_leftmost_reducer_fault_and_initialized_prefix`<br>`rust:tests/resource_contracts.rs::vector_tuple_and_work_limits_cover_zero_exact_and_one_past`<br>`rust:tests/resource_contracts.rs::div_admission_precedes_domain_and_failure_cleanup_is_exact`<br>`rust:tests/resource_contracts.rs::length_charges_constant_work_borrows_input_and_has_no_result_allocation`<br>`rust:tests/resource_contracts.rs::sort_admits_owned_output_with_input_live_and_cleans_up_refused_output`<br>`rust:tests/resource_contracts.rs::sum_charges_full_work_before_reduction_and_allocates_no_result`<br>`rust:tests/resource_contracts.rs::all_of_work_and_observer_trace_are_independent_of_the_decisive_position`<br>`rust:tests/resource_contracts.rs::any_of_work_and_observer_trace_are_independent_of_the_decisive_position`<br>`rust:tests/resource_contracts.rs::none_of_work_and_observer_trace_use_its_identity_at_every_decisive_position`<br>`rust:tests/resource_contracts.rs::foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly`<br>`rust:tests/resource_contracts.rs::scanl_admits_n_plus_one_output_before_population_with_input_live`<br>`rust:tests/resource_contracts.rs::scanl_fault_releases_output_before_input_and_retains_full_work`<br>`rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_rust_reference_vectors_meet_policy`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_special_values_and_rounding_are_exact`<br>`command:strict-c11-journey` |
+| `FWIR-SEM-007` | `rust:src/semantic_registry.rs::production_registry_is_complete_and_numeric_lookups_are_checked`<br>`rust:src/interpreter.rs::every_selected_implementation_executes_by_stable_id` |
+| `FWIR-SEM-008` | `rust:tests/parity_contracts.rs::checked_arithmetic_has_no_partial_result`<br>`rust:tests/parity_contracts.rs::div_integer_faults_and_strict_binary64_are_exact`<br>`rust:tests/parity_contracts.rs::length_accepts_all_vector_types_empty_and_dynamic_cardinalities`<br>`rust:tests/parity_contracts.rs::sort_covers_exhaustive_small_bools_integer_edges_and_total_double_order`<br>`rust:tests/parity_contracts.rs::sum_int_overflow_reports_the_first_reduction_step_and_operands`<br>`rust:tests/parity_contracts.rs::sum_double_is_left_to_right_strict_and_preserves_special_value_bits`<br>`rust:tests/parity_contracts.rs::all_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_false_position`<br>`rust:tests/parity_contracts.rs::any_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`<br>`rust:tests/parity_contracts.rs::none_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`<br>`rust:tests/parity_contracts.rs::foldl_accepts_bool_int_double_empty_dynamic_and_non_associative_reducers`<br>`rust:tests/parity_contracts.rs::foldl_reports_the_leftmost_reducer_fault_with_step_operands_and_reference_origin`<br>`rust:tests/parity_contracts.rs::scanl_is_seed_inclusive_for_all_types_empty_dynamic_and_non_associative_inputs`<br>`rust:tests/parity_contracts.rs::scanl_reports_the_leftmost_reducer_fault_and_initialized_prefix`<br>`rust:tests/resource_contracts.rs::vector_tuple_and_work_limits_cover_zero_exact_and_one_past`<br>`rust:tests/resource_contracts.rs::div_admission_precedes_domain_and_failure_cleanup_is_exact`<br>`rust:tests/resource_contracts.rs::length_charges_constant_work_borrows_input_and_has_no_result_allocation`<br>`rust:tests/resource_contracts.rs::sort_admits_owned_output_with_input_live_and_cleans_up_refused_output`<br>`rust:tests/resource_contracts.rs::sum_charges_full_work_before_reduction_and_allocates_no_result`<br>`rust:tests/resource_contracts.rs::all_of_work_and_observer_trace_are_independent_of_the_decisive_position`<br>`rust:tests/resource_contracts.rs::any_of_work_and_observer_trace_are_independent_of_the_decisive_position`<br>`rust:tests/resource_contracts.rs::none_of_work_and_observer_trace_use_its_identity_at_every_decisive_position`<br>`rust:tests/resource_contracts.rs::foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly`<br>`rust:tests/resource_contracts.rs::scanl_admits_n_plus_one_output_before_population_with_input_live`<br>`rust:tests/resource_contracts.rs::scanl_fault_releases_output_before_input_and_retains_full_work`<br>`rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_rust_reference_vectors_meet_policy`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_special_values_and_rounding_are_exact` |
 | `FWIR-SEM-009` | `rust:tests/parity_contracts.rs::tup_structural_format_spread_and_direct_preservation`<br>`rust:src/evaluator.rs::lifting_and_tuples_are_canonical` |
 | `FWIR-SEM-010` | `rust:tests/resource_contracts.rs::tuple_allocation_ordinals_exclude_empty_tables_and_cleanup_failures`<br>`rust:tests/resource_contracts.rs::live_limit_observes_children_before_outer_tuple_admission`<br>`rust:tests/parity_contracts.rs::deep_structural_values_and_types_format_and_drop_iteratively` |
-| `FWIR-SEM-011` | `rust:tests/parity_contracts.rs::fan_stable_id_matrix`<br>`rust:src/lowering.rs::fan_out_prefix_placeholder_borrows_prepare_and_preserves_elements`<br>`rust:src/c_emitter.rs::public_generated_c_matches_direct_ir_for_success_and_failure_corpus` |
+| `FWIR-SEM-011` | `rust:tests/parity_contracts.rs::fan_stable_id_matrix`<br>`rust:src/lowering.rs::fan_out_prefix_placeholder_borrows_prepare_and_preserves_elements` |
 | `FWIR-SEM-012` | `rust:tests/resource_contracts.rs::parameter_header_reason_and_span_contract_is_structured`<br>`rust:tests/golden_corpus.rs::authored_section_15_and_16_failure_golden_corpus`<br>`rust:tests/cli_contracts.rs::cli_parameters_and_diagnostics_contract` |
-| `FWIR-SEM-013` | `rust:tests/resource_contracts.rs::profile_configuration_precedes_source_and_backend_analysis`<br>`rust:src/lowering.rs::whole_program_static_precedence_is_arity_then_type_then_shape` |
-| `FWIR-SEM-014` | `rust:tests/resource_contracts.rs::refusal_precedence_is_vector_then_live_then_work_then_allocation`<br>`rust:tests/resource_contracts.rs::failure_usage_is_post_cleanup_and_work_remains_monotonic`<br>`rust:tests/fwir_public_contracts.rs::public_source_artifact_execution_c_and_resource_traces_are_differential` |
-| `FWIR-SEM-015` | `rust:tests/parity_contracts.rs::resource_profiles_limits_and_ordinals`<br>`rust:tests/resource_contracts.rs::generated_runtime_embeds_profile_and_verified_primitive_selection` |
+| `FWIR-SEM-013` | `rust:tests/resource_contracts.rs::profile_configuration_precedes_source_analysis_and_interpreter_execution`<br>`rust:src/lowering.rs::whole_program_static_precedence_is_arity_then_type_then_shape` |
+| `FWIR-SEM-014` | `rust:tests/resource_contracts.rs::refusal_precedence_is_vector_then_live_then_work_then_allocation`<br>`rust:tests/resource_contracts.rs::failure_usage_is_post_cleanup_and_work_remains_monotonic`<br>`rust:tests/fwir_public_contracts.rs::public_source_and_decoded_artifact_execution_and_resource_traces_match` |
+| `FWIR-SEM-015` | `rust:tests/parity_contracts.rs::resource_profiles_limits_and_ordinals`<br>`rust:src/interpreter.rs::every_selected_implementation_executes_by_stable_id` |
 | `FWIR-SEM-016` | `rust:src/typed_program.rs::identity_result_root_and_feature_invariants_are_rejected`<br>`rust:tests/fwir_conformance.rs::deterministic_mutation_corpus_is_rejected_without_panic_or_partial_program` |
 | `FWIR-SEM-017` | `rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:src/evaluator.rs::evaluates_complete_primitive_surface`<br>`rust:tests/fwir_public_contracts.rs::foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities`<br>`rust:tests/fwir_public_contracts.rs::scanl_roundtrips_reducer_links_plus_one_shape_and_direct_dispatch` |
 | `FWIR-SEM-018` | `rust:tests/fwir_conformance.rs::same_major_optional_compatibility_and_mandatory_rejection_are_exact`<br>`rust:tests/fwir_conformance.rs::canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral` |
@@ -804,5 +802,5 @@ in-memory layout as an ABI.
 
 No implementation issue may weaken results, diagnostics, precedence,
 provenance, resource events, ownership, releases, formatting, or publication
-in order to simplify a backend. Any extension requires an explicit semantic
+in order to simplify the interpreter. Any extension requires an explicit semantic
 feature, compatibility rule, decision record, and conformance evidence.

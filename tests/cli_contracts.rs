@@ -36,14 +36,21 @@ fn cli_help_version_and_unknown_contracts() {
     let help = String::from_utf8(help.stdout).expect("utf8");
     assert!(help.contains("Usage: faraweave"));
     assert!(help.contains("interactive Faraweave session"));
-    for command in [
-        "compile-ir",
-        "inspect-ir",
-        "run-ir",
-        "emit-c-ir",
-        "build-ir",
-    ] {
+    for command in ["compile-ir", "inspect-ir", "run-ir"] {
         assert!(help.contains(command), "{command}");
+    }
+    for removed in ["emit-c", "emit-c-ir", "build", "build-ir"] {
+        assert!(!help.contains(removed), "{removed}");
+        let output = Command::new(binary())
+            .arg(removed)
+            .output()
+            .expect("removed command");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            output.stderr,
+            format!("error: unknown subcommand '{removed}'\n").as_bytes()
+        );
     }
 
     let unknown = Command::new(binary())
@@ -68,7 +75,6 @@ fn cli_explicit_fwir_lifecycle_is_deterministic_and_phase_separated() {
     fs::create_dir_all(&directory).expect("mkdir");
     let source = directory.join("logical source.anything");
     let artifact = directory.join("program.data");
-    let c_output = directory.join("program.c");
     fs::write(
         &source,
         "parameters[n Int]\n-0.0\ninc[n]\nfanout[iota[n] {inc[_]} {add[_ 10]}]\n",
@@ -114,20 +120,6 @@ fn cli_explicit_fwir_lifecycle_is_deterministic_and_phase_separated() {
     assert!(run.status.success(), "{:?}", run.stderr);
     assert_eq!(run.stdout, b"-0.0\n4\n[(2 3 4) (11 12 13)]\n");
 
-    let emitted = Command::new(binary())
-        .arg("emit-c-ir")
-        .arg(&artifact)
-        .args(["-o"])
-        .arg(&c_output)
-        .output()
-        .expect("emit C from IR");
-    assert!(emitted.status.success(), "{:?}", emitted.stderr);
-    assert!(
-        fs::read_to_string(&c_output)
-            .expect("C")
-            .contains("/* VerifiedProgram-driven definitions. */")
-    );
-
     let overflow = Command::new(binary())
         .arg("run-ir")
         .arg(&artifact)
@@ -168,7 +160,7 @@ fn cli_explicit_fwir_lifecycle_is_deterministic_and_phase_separated() {
 }
 
 #[test]
-fn cli_fwir_outputs_reject_aliases_and_preserve_destinations_on_every_failure() {
+fn cli_compile_ir_rejects_aliases_and_preserves_destinations_on_failure() {
     let directory = unique("fwir-transactions");
     fs::create_dir_all(&directory).expect("mkdir");
     let source = directory.join("source.faraweave");
@@ -214,20 +206,6 @@ fn cli_fwir_outputs_reject_aliases_and_preserve_destinations_on_every_failure() 
         );
     }
 
-    let artifact_before = fs::read(&artifact).expect("artifact bytes");
-    let ir_alias = Command::new(binary())
-        .arg("emit-c-ir")
-        .arg(&artifact)
-        .args(["-o"])
-        .arg(&artifact)
-        .output()
-        .expect("artifact alias");
-    assert!(!ir_alias.status.success());
-    assert_eq!(
-        fs::read(&artifact).expect("artifact preserved"),
-        artifact_before
-    );
-
     let invalid_source = directory.join("invalid.faraweave");
     let compile_destination = directory.join("existing.fwir");
     fs::write(&invalid_source, "inc[").expect("invalid source");
@@ -243,41 +221,6 @@ fn cli_fwir_outputs_reject_aliases_and_preserve_destinations_on_every_failure() 
     assert_eq!(
         fs::read(&compile_destination).expect("compile destination"),
         b"keep-compile"
-    );
-
-    let malformed = directory.join("malformed.fwir");
-    let c_destination = directory.join("existing.c");
-    fs::write(&malformed, b"bad").expect("malformed");
-    fs::write(&c_destination, b"keep-c").expect("sentinel");
-    let invalid_emit = Command::new(binary())
-        .arg("emit-c-ir")
-        .arg(&malformed)
-        .args(["-o"])
-        .arg(&c_destination)
-        .output()
-        .expect("invalid emit");
-    assert!(!invalid_emit.status.success());
-    assert_eq!(fs::read(&c_destination).expect("C destination"), b"keep-c");
-
-    let native_destination = directory.join(if cfg!(windows) {
-        "existing.exe"
-    } else {
-        "existing"
-    });
-    fs::write(&native_destination, b"keep-native").expect("native sentinel");
-    let failed_build = Command::new(binary())
-        .arg("build-ir")
-        .arg(&artifact)
-        .args(["-o"])
-        .arg(&native_destination)
-        .args(["--cc", "faraweave-compiler-that-does-not-exist"])
-        .env_remove("CC")
-        .output()
-        .expect("compiler failure");
-    assert!(!failed_build.status.success());
-    assert_eq!(
-        fs::read(&native_destination).expect("native destination"),
-        b"keep-native"
     );
 
     fs::remove_dir_all(directory).expect("cleanup");
@@ -628,51 +571,10 @@ fn cli_parameters_and_diagnostics_contract() {
 }
 
 #[test]
-fn cli_emit_c_is_deterministic_and_alias_safe() {
-    let directory = unique("emit");
-    fs::create_dir_all(&directory).expect("mkdir");
-    let source = directory.join("input.faraweave");
-    let left = directory.join("left.c");
-    let right = directory.join("right.c");
-    fs::write(&source, "add[1 iota[3]]\n").expect("source");
-    for output in [&left, &right] {
-        let result = Command::new(binary())
-            .arg("emit-c")
-            .arg(&source)
-            .arg("-o")
-            .arg(output)
-            .output()
-            .expect("emit");
-        assert!(result.status.success(), "{:?}", result.stderr);
-    }
-    assert_eq!(
-        fs::read(&left).expect("left"),
-        fs::read(&right).expect("right")
-    );
-    assert!(
-        fs::read_to_string(&left)
-            .expect("emitted source")
-            .contains("/* VerifiedProgram-driven definitions. */")
-    );
-    let original = fs::read(&source).expect("original");
-    let alias = Command::new(binary())
-        .arg("emit-c")
-        .arg(&source)
-        .arg("-o")
-        .arg(&source)
-        .output()
-        .expect("alias");
-    assert!(!alias.status.success());
-    assert_eq!(fs::read(&source).expect("preserved"), original);
-    fs::remove_dir_all(directory).expect("cleanup");
-}
-
-#[test]
-fn cli_deep_tuple_journeys_do_not_depend_on_host_recursion() {
+fn cli_deep_tuple_interpretation_does_not_depend_on_host_recursion() {
     let directory = unique("deep-tuple");
     fs::create_dir_all(&directory).expect("mkdir");
     let source_path = directory.join("deep.faraweave");
-    let emitted_path = directory.join("deep.c");
     let depth = 512;
     let source = format!("{}1{}\n", "[".repeat(depth), "]".repeat(depth));
     fs::write(&source_path, &source).expect("deep source");
@@ -685,25 +587,6 @@ fn cli_deep_tuple_journeys_do_not_depend_on_host_recursion() {
     assert!(evaluated.status.success(), "{:?}", evaluated.stderr);
     assert_eq!(evaluated.stdout, source.as_bytes());
     assert!(evaluated.stderr.is_empty());
-
-    let emitted = Command::new(binary())
-        .arg("emit-c")
-        .arg(&source_path)
-        .arg("-o")
-        .arg(&emitted_path)
-        .output()
-        .expect("deep emitter process");
-    assert!(emitted.status.success(), "{:?}", emitted.stderr);
-    assert!(emitted.stdout.is_empty());
-    assert!(emitted.stderr.is_empty());
-    let c_source = fs::read_to_string(&emitted_path).expect("emitted C");
-    assert_eq!(
-        c_source
-            .matches("fw_make_tuple(out, 1U, \"tuple_literal\"")
-            .count(),
-        depth
-    );
-    assert!(!c_source.contains(&"[".repeat(depth)));
 
     fs::write(
         &source_path,
@@ -727,11 +610,11 @@ fn cli_deep_tuple_journeys_do_not_depend_on_host_recursion() {
 }
 
 #[test]
-fn cli_unicode_space_paths_lexical_aliases_and_failure_cleanup() {
+fn cli_unicode_space_paths_roundtrip_through_verified_fwir() {
     let directory = unique("unicode-space").join("nested path ü");
     fs::create_dir_all(&directory).expect("mkdir");
     let source = directory.join("program source.faraweave");
-    let emitted = directory.join("generated output.c");
+    let artifact = directory.join("verified program.fwir");
     fs::write(&source, "add[1 2]\n").expect("source");
 
     let run = Command::new(binary())
@@ -742,64 +625,22 @@ fn cli_unicode_space_paths_lexical_aliases_and_failure_cleanup() {
     assert!(run.status.success(), "{:?}", run.stderr);
     assert_eq!(run.stdout, b"3\n");
 
-    let emit = Command::new(binary())
-        .arg("emit-c")
+    let compile = Command::new(binary())
+        .arg("compile-ir")
         .arg(&source)
         .arg("-o")
-        .arg(&emitted)
+        .arg(&artifact)
         .output()
-        .expect("unicode emit");
-    assert!(emit.status.success(), "{:?}", emit.stderr);
-    assert!(emitted.exists());
-
-    let lexical_alias = directory
-        .join("child")
-        .join("..")
-        .join("program source.faraweave");
-    let original = fs::read(&source).expect("original source");
-    let alias = Command::new(binary())
-        .arg("emit-c")
-        .arg(&source)
-        .arg("-o")
-        .arg(&lexical_alias)
+        .expect("unicode compile");
+    assert!(compile.status.success(), "{:?}", compile.stderr);
+    assert!(artifact.exists());
+    let run_ir = Command::new(binary())
+        .arg("run-ir")
+        .arg(&artifact)
         .output()
-        .expect("lexical alias");
-    assert!(!alias.status.success());
-    assert_eq!(fs::read(&source).expect("preserved source"), original);
-
-    let native = directory.join(if cfg!(windows) {
-        "existing native.exe"
-    } else {
-        "existing native"
-    });
-    fs::write(&native, b"preserve-me").expect("native sentinel");
-    let failed = Command::new(binary())
-        .arg("build")
-        .arg(&source)
-        .arg("-o")
-        .arg(&native)
-        .arg("--cc")
-        .arg("faraweave-compiler-that-does-not-exist")
-        .env_remove("CC")
-        .output()
-        .expect("failed native build");
-    assert!(!failed.status.success());
-    assert!(failed.stdout.is_empty());
-    assert_eq!(fs::read(&native).expect("preserved native"), b"preserve-me");
-    let leftovers: Vec<_> = fs::read_dir(&directory)
-        .expect("directory listing")
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".existing native")
-        })
-        .collect();
-    assert!(
-        leftovers.is_empty(),
-        "temporary files escaped: {leftovers:?}"
-    );
+        .expect("unicode run IR");
+    assert!(run_ir.status.success(), "{:?}", run_ir.stderr);
+    assert_eq!(run_ir.stdout, b"3\n");
 
     let missing = Command::new(binary())
         .arg("run")
@@ -815,7 +656,7 @@ fn cli_unicode_space_paths_lexical_aliases_and_failure_cleanup() {
     );
 
     let directory_output = Command::new(binary())
-        .arg("emit-c")
+        .arg("compile-ir")
         .arg(&source)
         .arg("-o")
         .arg(&directory)
@@ -862,16 +703,6 @@ fn cli_windows_long_path_journey() {
         .expect("long-path run IR");
     assert!(run_ir.status.success(), "{:?}", run_ir.stderr);
     assert_eq!(run_ir.stdout, b"42\n");
-    let emitted = directory.join("program.c");
-    let emit_ir = Command::new(binary())
-        .arg("emit-c-ir")
-        .arg(&artifact)
-        .args(["-o"])
-        .arg(&emitted)
-        .output()
-        .expect("long-path emit IR");
-    assert!(emit_ir.status.success(), "{:?}", emit_ir.stderr);
-    assert!(emitted.exists());
     fs::remove_dir_all(base).expect("long-path cleanup");
 }
 

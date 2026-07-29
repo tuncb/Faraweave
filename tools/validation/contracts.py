@@ -33,6 +33,7 @@ def static_contracts() -> None:
     validate_release_workflows()
     validate_fwir_conformance()
     validate_product_cutover()
+    validate_interpreter_only_documentation()
 
 
 def validate_main_workflow(main: str) -> None:
@@ -167,16 +168,14 @@ def validate_fwir_conformance() -> None:
             ),
             f"FWIR corpus host metadata: {name}",
         )
-        required_surfaces = {
+        interpreter_surfaces = {
             "decode",
             "reencode",
             "inspect",
             "interpret",
-            "emit-c",
-            "native",
         }
         require(
-            required_surfaces <= set(surfaces.split(",")),
+            set(surfaces.split(",")) == interpreter_surfaces,
             f"FWIR corpus surfaces: {name}",
         )
 
@@ -237,8 +236,9 @@ def validate_product_cutover() -> None:
     lowering = production_source("src/lowering.rs")
     evaluator = production_source("src/evaluator.rs")
     interpreter = production_source("src/interpreter.rs")
-    emitter = production_source("src/c_emitter.rs")
     api = production_source("src/fwir_api.rs")
+    library = production_source("src/lib.rs")
+    cli = production_source("src/main.rs")
     cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
     production_tree = "\n".join(
         production_source(str(path.relative_to(ROOT)).replace("\\", "/"))
@@ -279,11 +279,31 @@ def validate_product_cutover() -> None:
         "program: &VerifiedProgram" in interpreter,
         "interpreter does not require VerifiedProgram",
     )
+    for removed in ("src/c_emitter.rs", "src/native_builder.rs"):
+        require(not (ROOT / removed).exists(), f"removed backend source remains: {removed}")
     require(
-        "emit_verified_c_program(" in emitter
-        and "program: &VerifiedProgram" in emitter
-        and "emit_c_from_verified_program(" in api,
-        "C/native generation does not route through verified IR",
+        not (ROOT / "tools/validation/c11_journey.py").exists()
+        and (ROOT / "tools/validation/interpreter_journey.py").is_file(),
+        "interpreter-only validation journey",
+    )
+    require(
+        "evaluate_verified_program(" in api
+        and "program: &VerifiedProgram" in api,
+        "public artifact execution does not route through the verified interpreter",
+    )
+    for token in (
+        "emit_c_source",
+        "emit_c_from_verified_program",
+        "build_native",
+        "NativeBuild",
+        "CEmitter",
+    ):
+        require(token not in production_tree, f"removed backend API remains: {token}")
+    for token in ("mod c_emitter", "mod native_builder", "emit_c_", "build_native"):
+        require(token not in library, f"removed library surface remains: {token}")
+    require(
+        re.search(r'"(?:emit-c|emit-c-ir|build|build-ir)"', cli) is None,
+        "removed CLI command remains",
     )
     for relative, source, forbidden in (
         (
@@ -296,26 +316,48 @@ def validate_product_cutover() -> None:
             interpreter,
             ("evaluate_expr(", "select_call(", "primitive_from_name(", "ExprKind"),
         ),
-        (
-            "src/c_emitter.rs",
-            emitter,
-            (
-                "struct CGenerator",
-                "emit_parameterized_program(",
-                "emit_constant_program(",
-                "runtime_failure_program(",
-                "static_expression_type(",
-                "known_vector_length(",
-                "primitive_tag(",
-                "evaluate_source_with_configuration(",
-                "static int fw_apply(",
-                "fw_apply_scalar",
-                "FW_INC",
-            ),
-        ),
     ):
         for token in forbidden:
             require(token not in source, f"legacy backend token {token} in {relative}")
+
+
+def validate_interpreter_only_documentation() -> None:
+    active_documents = [
+        "README.md",
+        "doc/architecture.md",
+        "examples/README.md",
+        "spec/backend-native-math-v1.md",
+        "spec/container-wide-application-plans.md",
+        "spec/fwir-v1-encoding-measurements.md",
+        "spec/fwir-v1-encoding.md",
+        "spec/typed-fwir-semantic-contract.md",
+    ]
+    forbidden = (
+        "emit-c",
+        "emit-c-ir",
+        "build-ir",
+        "strict C11",
+        "strict-C11",
+        "generated C",
+        "C compiler",
+        "C emitter",
+        "C/native",
+        "native backend",
+        "native builder",
+        "native executable",
+        "cross-backend",
+        "src/c_emitter.rs",
+        "src/native_builder.rs",
+        "emit_c_",
+        "build_native",
+    )
+    for relative in active_documents:
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for token in forbidden:
+            require(
+                token.casefold() not in text.casefold(),
+                f"active documentation retains {token}: {relative}",
+            )
 
 def package(target: str) -> None:
     require(target in {"linux-x64", "windows-x64", "macos-arm64"}, "unknown target")
@@ -451,7 +493,7 @@ def main() -> None:
                 "REPL output-device failure diagnostic",
             )
         subprocess.run(
-            [sys.executable, str(ROOT / "tools/validation/c11_journey.py")],
+            [sys.executable, str(ROOT / "tools/validation/interpreter_journey.py")],
             cwd=ROOT,
             check=True,
         )

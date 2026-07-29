@@ -1,9 +1,9 @@
 use faraweave::{
     DomainErrorReason, EvaluationConfiguration, Feature, FwirDecodeLimits, FwirEncodeOptions,
     LiftMode, NodeKind, ResourceErrorReason, Value, compile_source_to_fwir,
-    compile_source_to_fwir_with_name, compile_source_to_verified_program, decode_fwir,
-    emit_c_from_verified_program, encode_fwir, evaluate_verified_program_with_arguments,
-    evaluate_verified_program_with_observer, inspect_fwir,
+    compile_source_to_fwir_with_name, compile_source_to_verified_program, decode_fwir, encode_fwir,
+    evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
+    inspect_fwir,
 };
 use std::sync::Mutex;
 
@@ -42,7 +42,7 @@ fn take_events() -> Vec<ObservedEvent> {
 }
 
 #[test]
-fn public_source_artifact_execution_c_and_resource_traces_are_differential() {
+fn public_source_and_decoded_artifact_execution_and_resource_traces_match() {
     let source = "parameters[n Int]\nfanout[iota[n] {inc[_]} {add[_ 10]}]\n";
     let program =
         compile_source_to_verified_program(source, "logical/input.faraweave").expect("compile");
@@ -86,12 +86,6 @@ fn public_source_artifact_execution_c_and_resource_traces_are_differential() {
     assert_eq!(direct_observed, loaded_observed);
     assert_eq!(direct_events, loaded_events);
 
-    let direct_c =
-        emit_c_from_verified_program(&program, EvaluationConfiguration::default()).expect("C");
-    let loaded_c = emit_c_from_verified_program(&decoded, EvaluationConfiguration::default())
-        .expect("decoded C");
-    assert_eq!(direct_c, loaded_c);
-
     let direct_error = evaluate_verified_program_with_arguments(
         &program,
         &["9223372036854775807"],
@@ -108,7 +102,7 @@ fn public_source_artifact_execution_c_and_resource_traces_are_differential() {
 }
 
 #[test]
-fn line_comments_preserve_source_length_and_lower_to_c() {
+fn line_comments_preserve_source_length_and_interpreter_result() {
     let source = "# prologue 🦀\r\ninc[# argument\n1]# eof";
     let program =
         compile_source_to_verified_program(source, "comments.faraweave").expect("compile comments");
@@ -116,9 +110,10 @@ fn line_comments_preserve_source_length_and_lower_to_c() {
         program.as_raw().source_units[0].byte_length,
         u32::try_from(source.len()).expect("fixture length")
     );
-    let emitted =
-        emit_c_from_verified_program(&program, EvaluationConfiguration::default()).expect("emit C");
-    assert!(emitted.source.contains("Strict C11"));
+    let result =
+        evaluate_verified_program_with_arguments(&program, &[], EvaluationConfiguration::default())
+            .expect("interpret comments");
+    assert_eq!(result.formatted, ["2"]);
 }
 
 #[test]
@@ -148,7 +143,7 @@ fn public_compile_errors_and_argument_errors_preserve_phase_and_provenance() {
 }
 
 #[test]
-fn div_identity_domain_and_c_emission_survive_fwir_roundtrip() {
+fn div_identity_and_domain_error_survive_fwir_roundtrip() {
     let source = "div[(8 9 10) (2 0 5)]\n";
     let program =
         compile_source_to_verified_program(source, "division.faraweave").expect("compile div");
@@ -177,12 +172,6 @@ fn div_identity_domain_and_c_emission_survive_fwir_roundtrip() {
             .and_then(|context| context.element_index),
         Some(1)
     );
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    assert!(emitted.source.contains("static int fw_kernel_35("));
-    assert!(emitted.source.contains("fw_selected_division_by_zero"));
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]
@@ -247,24 +236,6 @@ fn length_container_plan_roundtrips_and_dispatches_by_verified_identity() {
     .expect("decoded length");
     assert_eq!(loaded, direct);
     assert_eq!(direct.formatted, ["2", "3", "0", "4"]);
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    for implementation in 37..=39 {
-        assert!(
-            emitted
-                .source
-                .contains(&format!("static int fw_impl_{implementation}("))
-        );
-    }
-    assert_eq!(
-        emitted
-            .source
-            .matches("return fw_apply_selected_length(")
-            .count(),
-        3
-    );
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]
@@ -337,26 +308,6 @@ fn sort_container_plan_roundtrips_and_dispatches_by_verified_identity() {
             "(1 2 3 4)",
         ]
     );
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    for implementation in 40..=42 {
-        assert!(
-            emitted
-                .source
-                .contains(&format!("static int fw_impl_{implementation}("))
-        );
-    }
-    assert_eq!(
-        emitted
-            .source
-            .matches("return fw_apply_selected_sort(")
-            .count(),
-        3
-    );
-    assert!(emitted.source.contains("fw_double_order_key(values[left])"));
-    assert!(!emitted.source.contains("qsort("));
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]
@@ -421,36 +372,6 @@ fn sum_container_plan_roundtrips_and_dispatches_by_verified_identity() {
     .expect("decoded sum");
     assert_eq!(loaded, direct);
     assert_eq!(direct.formatted, ["6", "3.0", "0", "0.0", "10"]);
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    for implementation in 43..=44 {
-        assert!(
-            emitted
-                .source
-                .contains(&format!("static int fw_impl_{implementation}("))
-        );
-    }
-    assert_eq!(
-        emitted
-            .source
-            .matches("return fw_apply_selected_sum_int(")
-            .count(),
-        1
-    );
-    assert_eq!(
-        emitted
-            .source
-            .matches("return fw_apply_selected_sum_double(")
-            .count(),
-        1
-    );
-    assert!(
-        emitted
-            .source
-            .contains("total=fw_double_arithmetic(total,values[index],FW_DOUBLE_ADD)")
-    );
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]
@@ -513,23 +434,6 @@ fn all_of_container_plan_roundtrips_and_dispatches_by_verified_identity() {
     .expect("decoded all_of");
     assert_eq!(loaded, direct);
     assert_eq!(direct.formatted, ["true", "false", "true"]);
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    assert!(emitted.source.contains("static int fw_impl_45("));
-    assert_eq!(
-        emitted
-            .source
-            .matches("return fw_apply_selected_all_of(")
-            .count(),
-        1
-    );
-    assert!(
-        emitted
-            .source
-            .contains("if(!fw_charge_work(args[0].len,name,line,column))return 0;")
-    );
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]
@@ -592,23 +496,6 @@ fn any_of_container_plan_roundtrips_and_dispatches_by_verified_identity() {
     .expect("decoded any_of");
     assert_eq!(loaded, direct);
     assert_eq!(direct.formatted, ["false", "false", "true"]);
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    assert!(emitted.source.contains("static int fw_impl_46("));
-    assert_eq!(
-        emitted
-            .source
-            .matches("return fw_apply_selected_any_of(")
-            .count(),
-        1
-    );
-    assert!(
-        emitted
-            .source
-            .contains("if(!fw_charge_work(args[0].len,name,line,column))return 0;")
-    );
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]
@@ -671,23 +558,6 @@ fn none_of_container_plan_roundtrips_and_dispatches_by_its_own_verified_identity
     .expect("decoded none_of");
     assert_eq!(loaded, direct);
     assert_eq!(direct.formatted, ["true", "true", "false"]);
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    assert!(emitted.source.contains("static int fw_impl_47("));
-    assert_eq!(
-        emitted
-            .source
-            .matches("return fw_apply_selected_none_of(")
-            .count(),
-        1
-    );
-    assert!(
-        emitted
-            .source
-            .contains("return fw_apply_selected_none_of(\"none_of\",args,out,line,column)")
-    );
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]
@@ -778,18 +648,6 @@ fn foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities() {
     .expect("decoded foldl");
     assert_eq!(loaded, direct);
     assert_eq!(direct.formatted, ["10", "8", "10", "1.0"]);
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    assert!(emitted.source.contains("static int fw_impl_49_opr_0("));
-    assert!(emitted.source.contains("static int fw_impl_49_opr_1("));
-    assert!(emitted.source.contains("static int fw_impl_50_opr_3("));
-    assert!(
-        emitted
-            .source
-            .contains("fw_apply_selected_foldl(fw_kernel_11")
-    );
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]
@@ -887,17 +745,6 @@ fn scanl_roundtrips_reducer_links_plus_one_shape_and_direct_dispatch() {
         direct.formatted,
         ["(10)", "(20 17 13 8)", "(0 1 3 6 10)", "(1.0)"]
     );
-
-    let emitted =
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
-    assert!(emitted.source.contains("static int fw_impl_52_opr_0("));
-    assert!(emitted.source.contains("static int fw_impl_53_opr_3("));
-    assert!(
-        emitted
-            .source
-            .contains("fw_apply_selected_scanl(fw_kernel_11")
-    );
-    assert!(!emitted.source.contains("strcmp(name"));
 }
 
 #[test]

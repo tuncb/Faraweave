@@ -3,8 +3,8 @@
 Faraweave 0.1.0 is a standalone Rust implementation of the data-oriented
 language defined by the current Bennu specifications at source commit
 `d0adce00a67446f2883e24029682d54b9809b0d7`. Bennu was used only as a
-development-time differential oracle; the shipped library, executable, emitted
-C, and native artifacts neither invoke nor require it.
+development-time differential oracle; the shipped library and executable
+neither invoke nor require it.
 
 The language has rank-0 `Bool`, signed 64-bit `Int`, and IEEE-754 binary64
 `Double` scalars; homogeneous rank-1 vectors; and immutable heterogeneous
@@ -18,7 +18,7 @@ structural tuples. The public primitives are:
 | Integer predicates | `odd`, `even` |
 | Numeric predicates | `is_positive`, `is_negative` |
 | Numeric ordering | `less_than`, `greater_than` |
-| Backend-native numeric unary | `sqrt`, `exp`, `log` (natural logarithm), `log10`, `sin`, `cos`, `tan`, `floor`, `ceil`, `trunc` |
+| Host-math numeric unary | `sqrt`, `exp`, `log` (natural logarithm), `log10`, `sin`, `cos`, `tan`, `floor`, `ceil`, `trunc` |
 | Structural constructor | `iota` |
 | Container query | `length` |
 | Container transform | `sort` |
@@ -97,25 +97,26 @@ before the seed is written or any reducer step runs.
 
 `sqrt`, `exp`, natural logarithm `log`, base-10 logarithm `log10`, `sin`,
 `cos`, `tan`, `floor`, `ceil`, and `trunc` accept Double scalars and vectors, with the existing
-Int-to-Double promotion, and call the corresponding platform Rust or C math function
-directly. Their portable special values are exact; finite `sqrt` results use a
+Int-to-Double promotion, and call the corresponding Rust standard-library math
+function directly. Their portable special values are exact; finite `sqrt` results use a
 checked-reference envelope of at most one ULP, finite `exp`, `log`, or `log10`
 results use at most four ULPs, and finite `sin` or `cos` results use at most
 eight ULPs or absolute error 2^-48; finite `tan` results use at most sixteen
 ULPs or absolute error 2^-46. Finite `floor`, `ceil`, and `trunc` results are exact,
 including values around 2^52; large Int inputs are converted to Double before the call.
 Large-argument range reduction for the trigonometric operations is
-deliberately backend-native. Types, shapes, resources, diagnostics, and all
+deliberately host-math-native. Types, shapes, resources, diagnostics, and all
 nonnumeric observations remain exact.
 The complete
 exception and reproducibility rules are the
-[backend-native math v1 policy](spec/backend-native-math-v1.md).
+[host-math policy](spec/backend-native-math-v1.md). Its stable FWIR feature
+name, `BackendNativeMathV1`, does not denote a separate execution backend.
 
 The accepted [architecture](doc/architecture.md) and
 [typed FWIR semantic contract](spec/typed-fwir-semantic-contract.md) define
-one verified boundary shared by the interpreter and generated-C/native
-backends. [FWIR v1](spec/fwir-v1-encoding.md) is the stable canonical artifact
-format for that boundary.
+one verified boundary consumed by the Rust interpreter. [FWIR
+v1](spec/fwir-v1-encoding.md) is the stable canonical artifact format for that
+boundary.
 
 ## Build and use
 
@@ -126,13 +127,9 @@ cargo build --release
 cargo run -- --version
 cargo run -- repl
 cargo run -- run examples/rewrite.faraweave
-cargo run -- emit-c examples/rewrite.faraweave -o rewrite.c
-cargo run -- build examples/rewrite.faraweave -o rewrite
 cargo run -- compile-ir examples/rewrite.faraweave -o rewrite.fwir
 cargo run -- inspect-ir rewrite.fwir
 cargo run -- run-ir rewrite.fwir
-cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
-cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
 More runnable programs are collected in the
@@ -163,27 +160,19 @@ ignoring surrounding ASCII spaces or tabs; arguments, prefixes, and trailing
 source comments do not match the command. End-of-file also ends the session
 successfully.
 
-`emit-c` writes deterministic self-contained strict C11. `build` selects the C
-compiler in this order: explicit `--cc`, `CC`, then `cc` on Unix or `cl.exe` on
-Windows. Compiler values are executable names or paths, not shell fragments.
-Both commands reject source/output aliases, prepare privately, clean temporary
-files after failure, and replace the destination only at publication.
-
 FWIR commands are explicit: `compile-ir` is the only source-to-artifact
-boundary, while `inspect-ir`, `run-ir`, `emit-c-ir`, and `build-ir` accept only
-canonical artifacts that fully decode and verify first. `run-ir` accepts
-parameters after `--`, and `build-ir` accepts the same optional `--cc
-<compiler>` selection as `build`; no command infers source versus FWIR from a
-file extension. Inspection text is deterministic and includes exact binary64
-bits plus the canonical bytes, but it is not executable FWIR.
+boundary, while `inspect-ir` and `run-ir` accept only canonical artifacts that
+fully decode and verify first. `run-ir` accepts parameters after `--`; no
+command infers source versus FWIR from a file extension. Inspection text is
+deterministic and includes exact binary64 bits plus the canonical bytes, but it
+is not executable FWIR.
 
 The library exposes the same phase boundaries through
 `compile_source_to_verified_program`, `compile_source_to_fwir`, `encode_fwir`,
 bounded `decode_fwir`, `inspect_fwir`,
-`evaluate_verified_program_with_arguments`, `emit_c_from_verified_program`,
-and `build_native_from_verified_program`. Named compilation retains a logical
-source name inside the artifact so later execution diagnostics do not depend
-on the artifact's filesystem path.
+and `evaluate_verified_program_with_arguments`. Named compilation retains a
+logical source name inside the artifact so later execution diagnostics do not
+depend on the artifact's filesystem path.
 
 FWIR v1 commits to physical formats 1.0 and 1.1, semantic contract 1.1,
 `.fwir`, and the documented API and CLI spellings. The canonical
@@ -204,9 +193,9 @@ and third-party producer support is not promised.
 
 Artifacts are deterministic but not confidential: they can expose diagnostic
 source names, literal values, graph structure, provenance spans, and producer
-metadata. Decoding is bounded, checked, and fully verified, but it is not a
-sandbox; apply limits to untrusted bytes, do not put secrets in artifacts, and
-run generated C or native executables only under an appropriate trust policy.
+metadata. Decoding is bounded, checked, and fully verified, but execution is
+not a sandbox; apply limits to untrusted bytes and do not put secrets in
+artifacts.
 The complete compatibility, unsupported-feature, security, and identity rules
 are normative in the [FWIR v1 specification](spec/fwir-v1-encoding.md).
 
@@ -240,10 +229,9 @@ errors precede binding, and all decoding precedes execution.
 Library APIs return structured `Error` values with one-based byte locations.
 CLI diagnostics retain stable category names and Faraweave-prefixed argument,
 formatting, and output records, including exact pending/accepted byte counts
-for runner output-device failures. Source evaluation, runner formatting, stdout
-publication, C-file publication, and native replacement are all-or-nothing
-apart from an unavoidable external output-device failure after publication
-begins.
+for runner output-device failures. Source evaluation, runner formatting, and
+stdout publication are all-or-nothing apart from an unavoidable external
+output-device failure after publication begins.
 
 The default `trusted-local-v2` profile has no arbitrary policy caps but retains
 checked sizing and complete-allocation guarantees. `bounded-v2` supports
@@ -269,9 +257,8 @@ python tools/release/provenance.py --help
 ```
 
 The supported release targets are Ubuntu 24.04 x64, Windows 2022 x64, and
-macOS 15 arm64. Only `faraweave build` needs an external C11 compiler. The
-complete focused/review/full/strict/sanitize/QA ladder and host-specific
-adaptations are documented in [doc/validation-ladder.md](doc/validation-ladder.md).
+macOS 15 arm64. Building, testing, and validating Faraweave requires only the
+pinned Rust toolchain and Python; no external language compiler is required.
 
 Canonical example artifacts are inventoried in
 [spec/examples](spec/examples/README.md); their exact byte identities and
@@ -310,5 +297,5 @@ use compact iterative chains so parser, analysis, evaluation, formatting, and
 cleanup do not depend on the host call stack. Checked allocation seams, logical
 ownership, resource charges, and failure ordering remain explicit. Cargo
 replaces CMake; Rust drop is not treated as permission to weaken logical
-release accounting. Platform-specific C/PE/sanitizer checks are adapted as
-recorded in [doc/porting-manifest.md](doc/porting-manifest.md).
+release accounting. Platform-specific package identity and executable-format
+checks remain part of CI.

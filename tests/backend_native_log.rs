@@ -2,9 +2,8 @@ use faraweave::{
     AllocationFailureInjection, Cardinality, Conversion, ErrorKind, EvaluationConfiguration,
     ExecutionProfile, Feature, FwirDecodeErrorKind, FwirDecodeLimits, FwirEncodeOptions, Invariant,
     LiftMode, NodeKind, ResourceErrorReason, ResourceLimits, ScalarType, Value, VerifyError,
-    compile_source_to_fwir, compile_source_to_verified_program, decode_fwir, emit_c_source,
-    encode_fwir, evaluate_expression, evaluate_expression_with_configuration,
-    evaluate_source_with_arguments,
+    compile_source_to_fwir, compile_source_to_verified_program, decode_fwir, encode_fwir,
+    evaluate_expression, evaluate_expression_with_configuration, evaluate_source_with_arguments,
 };
 
 const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
@@ -427,16 +426,4 @@ fn log_fwir_roundtrip_malformed_identities_and_version_are_checked() {
             if malformed.invariant == Invariant::UnsupportedVersion
                 && malformed.field == "semantic_version"
     ));
-}
-
-#[test]
-fn log_emitted_c_calls_math_h_log_directly() {
-    let source = emit_c_source("log[(1.0 2.0)]\n")
-        .expect("log C emission")
-        .source;
-    assert!(source.contains("#include <math.h>"));
-    assert!(source.contains("result=log(input);"));
-    assert!(source.contains("fw_set_double(out,fw_backend_native_log(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_56("));
-    assert!(source.contains("static int fw_impl_56("));
 }

@@ -2,10 +2,9 @@ mod repl_terminal;
 
 use faraweave::{
     ArgumentErrorContext, CompileFwirError, Error, ErrorKind, FwirDecodeLimits, FwirEncodeOptions,
-    NativeBuildRequest, VERSION, build_native, build_native_from_verified_program,
-    compile_source_to_fwir_with_name, decode_fwir, emit_c_from_verified_program, emit_c_source,
-    evaluate_expression, evaluate_runner_source, evaluate_verified_program_with_arguments,
-    format_value, inspect_fwir, publish_file_atomically, write_internal_registry_diagnostics,
+    VERSION, compile_source_to_fwir_with_name, decode_fwir, evaluate_expression,
+    evaluate_runner_source, evaluate_verified_program_with_arguments, format_value, inspect_fwir,
+    write_internal_registry_diagnostics,
 };
 use std::env;
 use std::ffi::OsString;
@@ -23,18 +22,12 @@ const HELP: &str = "Usage: faraweave <command> [arguments]\n\
                      \x20 repl    Start an interactive Faraweave session\n\
                      \x20 run <source> [-- <arguments...>]\n\
                      \x20         Run a Faraweave source file\n\
-                     \x20 emit-c  Emit C source for a Faraweave source file\n\
-                     \x20 build   Build a Faraweave source file\n\
                      \x20 compile-ir <source> -o <artifact.fwir>\n\
                      \x20         Compile source to canonical FWIR v1\n\
                      \x20 inspect-ir <artifact.fwir>\n\
                      \x20         Inspect a verified FWIR artifact\n\
                      \x20 run-ir <artifact.fwir> [-- <arguments...>]\n\
-                     \x20         Run a verified FWIR artifact\n\
-                     \x20 emit-c-ir <artifact.fwir> -o <output.c>\n\
-                     \x20         Emit C from a verified FWIR artifact\n\
-                     \x20 build-ir <artifact.fwir> -o <output> [--cc <compiler>]\n\
-                     \x20         Build a verified FWIR artifact\n";
+                     \x20         Run a verified FWIR artifact\n";
 const REPL_HISTORY_MAX_ENTRIES: usize = 100;
 const REPL_HISTORY_MAX_BYTES: usize = 65_536;
 
@@ -68,13 +61,9 @@ fn run_cli(arguments: Vec<OsString>) -> Result<(), ()> {
             }
         }
         "run" => run_command(&arguments),
-        "emit-c" => emit_c_command(&arguments),
-        "build" => build_command(&arguments),
         "compile-ir" => compile_ir_command(&arguments),
         "inspect-ir" => inspect_ir_command(&arguments),
         "run-ir" => run_ir_command(&arguments),
-        "emit-c-ir" => emit_c_ir_command(&arguments),
-        "build-ir" => build_ir_command(&arguments),
         unknown => {
             eprintln!("error: unknown subcommand '{unknown}'");
             Err(())
@@ -215,57 +204,6 @@ fn collect_command_line_arguments(
     Ok(decoded)
 }
 
-fn emit_c_ir_command(arguments: &[OsString]) -> Result<(), ()> {
-    if arguments.len() != 5 || arguments.get(3).and_then(|value| value.to_str()) != Some("-o") {
-        eprintln!("error: expected 'emit-c-ir <artifact.fwir> -o <output.c>'");
-        return Err(());
-    }
-    let artifact_path = Path::new(&arguments[2]);
-    let output_path = Path::new(&arguments[4]);
-    reject_alias(artifact_path, output_path)?;
-    let program = read_verified_artifact(artifact_path)?;
-    let emitted =
-        emit_c_from_verified_program(&program, faraweave::EvaluationConfiguration::default())
-            .map_err(|error| {
-                report_error(logical_source_name(&program), &error);
-            })?;
-    write_atomically(output_path, emitted.source.as_bytes()).map_err(|message| {
-        eprintln!("{}:1:1: file error: {message}", output_path.display());
-    })
-}
-
-fn build_ir_command(arguments: &[OsString]) -> Result<(), ()> {
-    if !matches!(arguments.len(), 5 | 7)
-        || arguments.get(3).and_then(|value| value.to_str()) != Some("-o")
-        || (arguments.len() == 7
-            && arguments.get(5).and_then(|value| value.to_str()) != Some("--cc"))
-    {
-        eprintln!("error: expected 'build-ir <artifact.fwir> -o <output> [--cc <compiler>]'");
-        return Err(());
-    }
-    let artifact_path = Path::new(&arguments[2]);
-    let output_path = Path::new(&arguments[4]);
-    reject_alias(artifact_path, output_path)?;
-    let program = read_verified_artifact(artifact_path)?;
-    let explicit = arguments.get(6).and_then(|value| value.to_str());
-    if arguments.len() == 7 && explicit.is_none_or(str::is_empty) {
-        eprintln!("error: --cc requires a nonempty compiler");
-        return Err(());
-    }
-    let environment = env::var("CC").ok();
-    build_native_from_verified_program(
-        &program,
-        output_path,
-        explicit,
-        environment.as_deref(),
-        faraweave::EvaluationConfiguration::default(),
-    )
-    .map(|_| ())
-    .map_err(|error| {
-        report_error(logical_source_name(&program), &error);
-    })
-}
-
 fn run_command(arguments: &[OsString]) -> Result<(), ()> {
     if arguments.len() == 2 {
         eprintln!("error: expected one source path after 'run'");
@@ -301,65 +239,6 @@ fn run_command(arguments: &[OsString]) -> Result<(), ()> {
             Err(())
         }
     }
-}
-
-fn emit_c_command(arguments: &[OsString]) -> Result<(), ()> {
-    if arguments.len() == 2 {
-        eprintln!("error: expected a source path after 'emit-c'");
-        return Err(());
-    }
-    if arguments.len() != 5 || arguments.get(3).and_then(|value| value.to_str()) != Some("-o") {
-        eprintln!("error: expected 'emit-c <source> -o <output>'");
-        return Err(());
-    }
-    let source_path = Path::new(&arguments[2]);
-    let output_path = Path::new(&arguments[4]);
-    reject_alias(source_path, output_path)?;
-    let source = read_source(source_path)?;
-    let emitted = emit_c_source(&source).map_err(|error| {
-        report_error(&source_path.to_string_lossy(), &error);
-    })?;
-    write_atomically(output_path, emitted.source.as_bytes()).map_err(|message| {
-        eprintln!("{}:1:1: file error: {message}", output_path.display());
-    })
-}
-
-fn build_command(arguments: &[OsString]) -> Result<(), ()> {
-    if arguments.len() == 2 {
-        eprintln!("error: expected a source path after 'build'");
-        return Err(());
-    }
-    if !matches!(arguments.len(), 5 | 7)
-        || arguments.get(3).and_then(|value| value.to_str()) != Some("-o")
-        || (arguments.len() == 7
-            && arguments.get(5).and_then(|value| value.to_str()) != Some("--cc"))
-    {
-        eprintln!("error: expected 'build <source> -o <output> [--cc <compiler>]'");
-        return Err(());
-    }
-    let source_path = Path::new(&arguments[2]);
-    let output_path = Path::new(&arguments[4]);
-    reject_alias(source_path, output_path)?;
-    let source = read_source(source_path)?;
-    let emitted = emit_c_source(&source).map_err(|error| {
-        report_error(&source_path.to_string_lossy(), &error);
-    })?;
-    let explicit = arguments.get(6).and_then(|value| value.to_str());
-    if arguments.len() == 7 && explicit.is_none_or(str::is_empty) {
-        eprintln!("error: --cc requires a nonempty compiler");
-        return Err(());
-    }
-    let environment = env::var("CC").ok();
-    build_native(&NativeBuildRequest {
-        c_source: &emitted.source,
-        output_path,
-        explicit_compiler: explicit,
-        environment_compiler: environment.as_deref(),
-    })
-    .map(|_| ())
-    .map_err(|error| {
-        eprintln!("error: native build: {}", error.message);
-    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -872,6 +751,60 @@ fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), &'static str> {
     })();
     let _ = fs::remove_file(temporary);
     result
+}
+
+fn publish_file_atomically(temporary: &Path, output: &Path) -> io::Result<()> {
+    if !output.exists() {
+        return fs::rename(temporary, output);
+    }
+    replace_existing_file(temporary, output)
+}
+
+#[cfg(not(windows))]
+fn replace_existing_file(temporary: &Path, output: &Path) -> io::Result<()> {
+    fs::rename(temporary, output)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn replace_existing_file(temporary: &Path, output: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut core::ffi::c_void,
+            reserved: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut output_wide: Vec<u16> = output.as_os_str().encode_wide().collect();
+    let mut temporary_wide: Vec<u16> = temporary.as_os_str().encode_wide().collect();
+    output_wide.push(0);
+    temporary_wide.push(0);
+    // SAFETY: both path buffers are NUL-terminated and live for the call; the
+    // optional backup, exclusion, and reserved pointers are permitted to be
+    // null by ReplaceFileW. Both files were resolved by the caller.
+    let replaced = unsafe {
+        ReplaceFileW(
+            output_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            ptr::null(),
+            1,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn publish_stdout(bytes: &[u8]) -> Result<(), ()> {

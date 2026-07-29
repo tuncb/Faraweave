@@ -45,7 +45,6 @@ pub enum ErrorKind {
     FormattingError,
     OutputError,
     FileError,
-    NativeBuildError,
 }
 
 impl ErrorKind {
@@ -70,7 +69,6 @@ impl ErrorKind {
             Self::FormattingError => "FormattingError",
             Self::OutputError => "OutputError",
             Self::FileError => "file error",
-            Self::NativeBuildError => "native build",
         }
     }
 }
