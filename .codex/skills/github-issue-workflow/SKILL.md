@@ -41,7 +41,6 @@ For each ready issue:
 3. Create the branch from current `origin/main`. If the branch or worktree already exists, inspect and safely resume it instead of duplicating or overwriting it.
 4. Create one issue-lead agent for that issue. Give it the issue, acceptance criteria, worktree path, branch, dependency context, repository constraints, and validation expectations. Treat the lead as that issue's implementation agent when agent slots are constrained.
 5. Require every descendant in that issue's agent tree to run Git and file commands against the exact issue worktree. Do not let agents from another issue tree edit it.
-6. Reserve enough concurrency for review, fix, and QA children. Have ready issue leads implement concurrently when possible. When a lead spawns a child, release or pause the lead's active slot while the child works, then resume the same lead to preserve tree ownership.
 
 The issue lead owns the following child-agent lifecycle. Keep implementation, review, fixes, and QA within that issue's agent tree.
 
@@ -168,7 +167,7 @@ The QA agent must:
 8. On Linux, confirm the C11 journey's ASan/UBSan and `/dev/full` paths ran. On Windows, confirm PE identity and long-path package checks ran. On macOS arm64, confirm native execution and archive checks ran. List other-platform checks as assigned to GitHub CI, not locally passed.
 9. If a required command fails, preserve its exact output and reproduce it once. When the failure appears unrelated, run the same command in a separate clean worktree at the recorded `origin/main` commit. Classify it as regression, pre-existing baseline failure, missing host prerequisite, or flaky/infrastructure failure; never hide it or change the issue branch without evidence.
 10. Report an acceptance-criterion matrix, exact commands and exit codes, host/tool versions, artifacts inspected, platform exclusions, reproducible failures, and final pass/fail. QA passes only when all criteria and all applicable required commands pass.
-11. Remove the temporary QA worktree and QA branch only after resolving their absolute paths, confirming they are under `D:\.worktree`, and confirming no needed uncommitted artifacts remain.
+11. Remove the temporary QA worktree and QA branch only after resolving their absolute paths and confirming no needed uncommitted artifacts remain.
 
 If QA fails, fix and commit the issue-branch changes with a fix agent, rerun focused checks, obtain an independent review of the updated complete diff, update from current `origin/main`, and repeat isolated QA. Do not advance the queue until QA passes or a genuine blocker needs user input.
 
@@ -196,7 +195,7 @@ After QA passes:
 8. Verify the PR actually merged into `main` and the linked issue is closed. If the closing keyword did not close it, close the issue explicitly with a reference to the merged PR.
 9. Fetch the updated `origin/main`, release newly unblocked implementation work, and promote the next reviewed issue under the ready-queue policy.
 
-After a successful merge, remove the issue worktree and local issue branch only when both are clean, the absolute worktree path is confirmed under `D:\.worktree`, and the branch is confirmed merged. Preserve the remote branch according to repository policy.
+After a successful merge, remove the issue worktree and local issue branch only when both are clean, and the branch is confirmed merged. Preserve the remote branch according to repository policy.
 
 ## Report
 
