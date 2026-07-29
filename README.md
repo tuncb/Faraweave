@@ -18,7 +18,7 @@ structural tuples. The public primitives are:
 | Integer predicates | `odd`, `even` |
 | Numeric predicates | `is_positive`, `is_negative` |
 | Numeric ordering | `less_than`, `greater_than` |
-| Backend-native numeric unary | `sqrt`, `exp`, `log` (natural logarithm), `log10`, `sin`, `cos`, `tan` |
+| Backend-native numeric unary | `sqrt`, `exp`, `log` (natural logarithm), `log10`, `sin`, `cos`, `tan`, `floor` |
 | Structural constructor | `iota` |
 | Container query | `length` |
 | Container transform | `sort` |
@@ -96,13 +96,15 @@ vector; output bytes and complete input-length work are admitted together
 before the seed is written or any reducer step runs.
 
 `sqrt`, `exp`, natural logarithm `log`, base-10 logarithm `log10`, `sin`,
-`cos`, and `tan` accept Double scalars and vectors, with the existing Int-to-Double
-promotion, and call the corresponding platform Rust or C math function
+`cos`, `tan`, and `floor` accept Double scalars and vectors, with the existing
+Int-to-Double promotion, and call the corresponding platform Rust or C math function
 directly. Their portable special values are exact; finite `sqrt` results use a
 checked-reference envelope of at most one ULP, finite `exp`, `log`, or `log10`
 results use at most four ULPs, and finite `sin` or `cos` results use at most
 eight ULPs or absolute error 2^-48; finite `tan` results use at most sixteen
-ULPs or absolute error 2^-46. Large-argument range reduction is
+ULPs or absolute error 2^-46. Finite `floor` results are exact, including
+values around 2^52; large Int inputs are converted to Double before the call.
+Large-argument range reduction for the trigonometric operations is
 deliberately backend-native. Types, shapes, resources, diagnostics, and all
 nonnumeric observations remain exact.
 The complete

@@ -501,6 +501,9 @@ impl<'a> IrCGenerator<'a> {
             ScalarKernel::TanDouble => {
                 "fw_set_double(out,fw_backend_native_tan(args[0].d));return 1;"
             }
+            ScalarKernel::FloorDouble => {
+                "fw_set_double(out,fw_backend_native_floor(args[0].d));return 1;"
+            }
             ScalarKernel::LengthBoolVector
             | ScalarKernel::LengthIntVector
             | ScalarKernel::LengthDoubleVector
@@ -1259,6 +1262,14 @@ static double fw_backend_native_tan(double value) {
   return fw_double_is_nan(result)
       ?fw_double_from_bits(UINT64_C(0x7ff8000000000000)):result;
 }
+static double fw_backend_native_floor(double value) {
+  FWStrictEnvironment environment;volatile double input=value,result=0.0;
+  fw_begin_strict_environment(&environment);
+  result=floor(input);
+  fw_restore_strict_environment(&environment);
+  return fw_double_is_nan(result)
+      ?fw_double_from_bits(UINT64_C(0x7ff8000000000000)):result;
+}
 static void fw_set_bool(FWV *out, int value) {
   (void)memset(out, 0, sizeof(*out)); out->b = value != 0;
 }
@@ -1795,6 +1806,7 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   (void)fw_backend_native_sin;
   (void)fw_backend_native_cos;
   (void)fw_backend_native_tan;
+  (void)fw_backend_native_floor;
   (void)fw_double_equal;
   (void)fw_double_less_than;
   (void)fw_set_int;
@@ -2024,7 +2036,7 @@ mod ir_tests {
              none_of[(true false)]\nfoldl[@and true (true false)]\n\
              foldl[@sub 10 (1 2)]\nfoldl[@add 1 (2.0 3.0)]\n\
              scanl[@and true (true false)]\nscanl[@sub 10 (1 2)]\n\
-             scanl[@add 1 (2.0 3.0)]\nsqrt[4.0]\nexp[1.0]\nlog[1.0]\nlog10[1.0]\nsin[1.0]\ncos[1.0]\ntan[1.0]\n",
+             scanl[@add 1 (2.0 3.0)]\nsqrt[4.0]\nexp[1.0]\nlog[1.0]\nlog10[1.0]\nsin[1.0]\ncos[1.0]\ntan[1.0]\nfloor[1.5]\n",
         );
         for implementation in (1..=36).filter(|implementation| *implementation != 34) {
             assert!(
@@ -2050,6 +2062,8 @@ mod ir_tests {
         assert!(source.contains("fw_apply_selected(fw_kernel_59,"));
         assert!(source.contains("static int fw_kernel_60("));
         assert!(source.contains("fw_apply_selected(fw_kernel_60,"));
+        assert!(source.contains("static int fw_kernel_61("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_61,"));
         assert!(source.contains("static int fw_impl_34("));
         assert!(source.contains("return fw_apply_selected_iota(\"iota\""));
         for implementation in 37..=39 {

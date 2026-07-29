@@ -778,6 +778,9 @@ fn invoke_kernel(
         (ScalarKernel::TanDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_tan(*value)))
         }
+        (ScalarKernel::FloorDouble, [Value::Double(value)]) => {
+            Some(Value::Double(strict_float::backend_native_floor(*value)))
+        }
         (
             ScalarKernel::DivInt
             | ScalarKernel::LengthBoolVector
