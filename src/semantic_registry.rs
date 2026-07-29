@@ -130,6 +130,7 @@ pub(crate) enum ScalarKernel {
     GreaterThanInt,
     GreaterThanDouble,
     IotaInt,
+    SqrtDouble,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,9 +217,9 @@ impl InternalRegistryDiagnosticFailureInjection {
     }
 }
 
-const PRIMITIVE_COUNT: u16 = 28;
-const SIGNATURE_COUNT: u16 = 53;
-const IMPLEMENTATION_COUNT: u16 = 53;
+const PRIMITIVE_COUNT: u16 = 29;
+const SIGNATURE_COUNT: u16 = 54;
+const IMPLEMENTATION_COUNT: u16 = 54;
 const APPLICATION_PLAN_COUNT: u16 = 10;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
@@ -919,6 +920,17 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         SCANL_PLAN,
         ScanlDouble
     ),
+    descriptor!(
+        29,
+        "sqrt",
+        54,
+        54,
+        DOUBLE1,
+        Double,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        SqrtDouble
+    ),
 ];
 
 impl PrimitiveId {
@@ -1246,6 +1258,7 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::ScanlBool => "scanl_bool",
         ScalarKernel::ScanlInt => "scanl_int",
         ScalarKernel::ScanlDouble => "scanl_double",
+        ScalarKernel::SqrtDouble => "sqrt_double",
     }
 }
 
@@ -1730,6 +1743,7 @@ mod tests {
             (28, "scanl"),
             (28, "scanl"),
             (28, "scanl"),
+            (29, "sqrt"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1943,6 +1957,14 @@ mod tests {
                 })
         );
         assert_eq!(
+            signature_from_numeric(54).map(|descriptor| descriptor.primitive_name),
+            Ok("sqrt")
+        );
+        assert_eq!(
+            implementation_from_numeric(54).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::SqrtDouble)
+        );
+        assert_eq!(
             primitive_from_name("missing"),
             Err(RegistryLookupError::PrimitiveName)
         );
@@ -1951,11 +1973,11 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(54),
+            signature_from_numeric(55),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(54),
+            implementation_from_numeric(55),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
