@@ -1,0 +1,3 @@
+# Issue #38 — stable built-in operation references
+
+Reserve adjacent `@name` syntax and lower accepted references to stable primitive, signature, and implementation IDs in `OPRF` section 18; runtime name lookup and first-class function values are excluded. Operation references require semantic minor 1 and mandatory feature ID 6, while feature 5 and section 17 remain owned by issue #36. Because no current higher-order primitive has an accepted reference position, issue #38 rejects every source placement and supplies only the reusable resolver, verifier, codec, and ID-dispatch foundation for #46 and #47.

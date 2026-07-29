@@ -1147,7 +1147,7 @@ def main() -> None:
             (
                 ROOT / "tests/fixtures/parameterized-artifact-success.bennu",
                 ["3", "2.5", "true"],
-                b"3\n2.5\ntrue\n(1 2 3)\n5.5\nfalse\n",
+                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n6\n(0 1 3 6)\n5.5\nfalse\n",
             ),
             (
                 ROOT / "tests/fixtures/parameterized-artifact-double.bennu",
@@ -1335,7 +1335,7 @@ def main() -> None:
                     generated_main in generated_source,
                     f"{operation} generated main declaration",
                 )
-                hostile_source.write_text(
+                hostile_generated_source = (
                     generated_source.replace(
                         generated_main,
                         "static int fw_generated_main(int argc, char **argv) {",
@@ -1360,17 +1360,22 @@ int main(int argc, char **argv) {
   int result;
   __asm__ volatile("mrs %0, fpcr":"=r"(original_control));
   __asm__ volatile("mrs %0, fpsr":"=r"(original_status));
-  requested_control=original_control|
-      UINT64_C(0x00009f00)|UINT64_C(0x00c00000)|UINT64_C(0x03000000);
+  requested_control=(original_control&~UINT64_C(0x00009f00))|
+      UINT64_C(0x00c00000)|UINT64_C(0x03000000);
   requested_status=original_status|UINT64_C(0x0000009f);
-  __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(requested_control):"memory");
+  __asm__ volatile("msr fpcr, %0\\n\\tisb"::"r"(requested_control):"memory");
   __asm__ volatile("msr fpsr, %0"::"r"(requested_status):"memory");
   __asm__ volatile("mrs %0, fpcr":"=r"(hostile_control));
   __asm__ volatile("mrs %0, fpsr":"=r"(hostile_status));
+  if((hostile_control&UINT64_C(0x00009f00))!=0U){
+    __asm__ volatile("msr fpcr, %0\\n\\tisb"::"r"(original_control):"memory");
+    __asm__ volatile("msr fpsr, %0"::"r"(original_status):"memory");
+    return 1;
+  }
   result=fw_generated_main(argc,argv);
   __asm__ volatile("mrs %0, fpcr":"=r"(restored_control));
   __asm__ volatile("mrs %0, fpsr":"=r"(restored_status));
-  __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(original_control):"memory");
+  __asm__ volatile("msr fpcr, %0\\n\\tisb"::"r"(original_control):"memory");
   __asm__ volatile("msr fpsr, %0"::"r"(original_status):"memory");
   if(result!=0)return result;
   if((hostile_control&(UINT64_C(0x00c00000)|UINT64_C(0x03000000)))!=
@@ -1383,7 +1388,43 @@ int main(int argc, char **argv) {
   return fw_generated_main(argc,argv);
 #endif
 }
-""",
+"""
+                )
+                require(
+                    '"msr fpcr, %0\\n\\tisb"' in hostile_generated_source,
+                    "sqrt hostile C wrapper escaped FPCR instruction separator",
+                )
+                require(
+                    '"msr fpcr, %0\n' not in hostile_generated_source,
+                    "sqrt hostile C wrapper contains a literal newline in an asm string",
+                )
+                require(
+                    "requested_control=(original_control&~UINT64_C(0x00009f00))|"
+                    in hostile_generated_source,
+                    "sqrt hostile C wrapper must clear AArch64 exception enables",
+                )
+                require(
+                    "if((hostile_control&UINT64_C(0x00009f00))!=0U){"
+                    in hostile_generated_source,
+                    "sqrt hostile C wrapper must reject a trapping FPCR",
+                )
+                require(
+                    hostile_generated_source.find(
+                        "if((hostile_control&UINT64_C(0x00009f00))!=0U){"
+                    )
+                    < hostile_generated_source.rfind(
+                        "result=fw_generated_main(argc,argv);"
+                    ),
+                    "sqrt hostile C wrapper must reject traps before FP execution",
+                )
+                require(
+                    "return restored_control==hostile_control&&"
+                    "restored_status==hostile_status?0:1;"
+                    in hostile_generated_source,
+                    "sqrt hostile C wrapper must require exact state restoration",
+                )
+                hostile_source.write_text(
+                    hostile_generated_source,
                     encoding="utf-8",
                 )
                 compile_c(
@@ -1450,6 +1491,59 @@ int main(int argc, char **argv) {
                         hostile_output == CEIL_OUTPUT,
                         "ceil hostile generated-C output is not exact and canonical",
                     )
+            if index == 0:
+                hostile_source = work / "fixture-hostile-fp.c"
+                hostile_native = work / f"fixture-hostile-fp{suffix}"
+                generated_source = emitted.read_text(encoding="utf-8")
+                require(
+                    "int main(int argc, char **argv)" in generated_source,
+                    "generated main signature for hostile FP journey",
+                )
+                hostile_source.write_text(
+                    generated_source.replace(
+                        "int main(int argc, char **argv)",
+                        "int fw_generated_main(int argc, char **argv)",
+                        1,
+                    )
+                    + r"""
+int main(int argc, char **argv) {
+#if defined(__x86_64__) || defined(_M_X64)
+  unsigned int original=_mm_getcsr();
+  unsigned int hostile=(original|0x0040U|0x4000U|0x8000U|0x1f80U)&~0x003fU;
+  unsigned int restored;int result;
+  _mm_setcsr(hostile);result=fw_generated_main(argc,argv);restored=_mm_getcsr();
+  _mm_setcsr(original);
+  if(result!=0)return result;
+  return restored==hostile?0:2;
+#elif defined(__aarch64__)
+  uint64_t original=UINT64_C(0),hostile,restored=UINT64_C(0);int result;
+  __asm__ volatile("mrs %0, fpcr":"=r"(original));
+  hostile=(original&~UINT64_C(0x00009f00))|UINT64_C(0x01c00000);
+  __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(hostile):"memory");
+  result=fw_generated_main(argc,argv);
+  __asm__ volatile("mrs %0, fpcr":"=r"(restored));
+  __asm__ volatile("msr fpcr, %0\n\tisb"::"r"(original):"memory");
+  if(result!=0)return result;
+  return restored==hostile?0:2;
+#else
+#error "Faraweave requires an x86-64 or AArch64 floating-point environment"
+#endif
+}
+""",
+                    encoding="ascii",
+                )
+                compile_c(compiler, environment, hostile_source, hostile_native)
+                hostile_result = run(
+                    [str(hostile_native)],
+                    environment=environment,
+                )
+                require(
+                    normalize_newlines(hostile_result.stdout)
+                    == normalize_newlines(expected)
+                    and not hostile_result.stderr,
+                    "hostile FP generated-C journey: "
+                    f"stdout={hostile_result.stdout!r} stderr={hostile_result.stderr!r}",
+                )
             if index == 0 and platform.system() == "Linux":
                 sanitized = work / "fixture-sanitized"
                 compile_c_sanitized(compiler, environment, emitted, sanitized)
@@ -1492,6 +1586,117 @@ int main(int argc, char **argv) {
                     == expected_failure,
                     "output-device failure diagnostic",
                 )
+
+        for name, source_text, expected_column, expected_reason in [
+            (
+                "div-zero",
+                "div[(8 9 10) (2 0 5)]\n",
+                1,
+                b"DomainError: div failed: division_by_zero at result index 1\n",
+            ),
+            (
+                "div-overflow",
+                "div[-9223372036854775808 -1]\n",
+                1,
+                b"DomainError: div failed: integer_overflow\n",
+            ),
+            (
+                "sum-overflow",
+                "sum[(9223372036854775807 1 -1)]\n",
+                1,
+                b"DomainError: sum failed: integer_overflow at result index 1\n",
+            ),
+            (
+                "foldl-overflow",
+                "foldl[@add 9223372036854775807 (1)]\n",
+                7,
+                b"DomainError: add failed: integer_overflow at result index 0\n",
+            ),
+            (
+                "foldl-div-zero",
+                "foldl[@div 8 (2 0 4)]\n",
+                7,
+                b"DomainError: div failed: division_by_zero at result index 1\n",
+            ),
+            (
+                "scanl-overflow",
+                "scanl[@add 9223372036854775807 (1)]\n",
+                7,
+                b"DomainError: add failed: integer_overflow at result index 0\n",
+            ),
+            (
+                "scanl-div-zero",
+                "scanl[@div 8 (2 0 4)]\n",
+                7,
+                b"DomainError: div failed: division_by_zero at result index 1\n",
+            ),
+        ]:
+            fixture = work / f"{name}.bennu"
+            artifact = work / f"{name}.fwir"
+            emitted = work / f"{name}.c"
+            emitted_ir = work / f"{name}-ir.c"
+            native = work / f"{name}{suffix}"
+            fixture.write_text(source_text, encoding="ascii")
+            run(
+                [str(executable), "compile-ir", str(fixture), "-o", str(artifact)],
+                environment=environment,
+            )
+            run(
+                [str(executable), "emit-c", str(fixture), "-o", str(emitted)],
+                environment=environment,
+            )
+            run(
+                [
+                    str(executable),
+                    "emit-c-ir",
+                    str(artifact),
+                    "-o",
+                    str(emitted_ir),
+                ],
+                environment=environment,
+            )
+            require(
+                emitted.read_bytes() == emitted_ir.read_bytes(),
+                f"{name} source/artifact C mismatch",
+            )
+            compile_c(compiler, environment, emitted, native)
+            evaluator = run(
+                [str(executable), "run", str(fixture)],
+                environment=environment,
+                expected=None,
+            )
+            artifact_runner = run(
+                [str(executable), "run-ir", str(artifact)],
+                environment=environment,
+                expected=None,
+            )
+            generated = run([str(native)], environment=environment, expected=None)
+            require(
+                evaluator.returncode
+                == artifact_runner.returncode
+                == generated.returncode
+                == 1,
+                f"{name} failure exit",
+            )
+            require(
+                not evaluator.stdout
+                and not artifact_runner.stdout
+                and not generated.stdout,
+                f"{name} failure stdout",
+            )
+            require(
+                evaluator.stderr == artifact_runner.stderr,
+                f"{name} source/artifact diagnostic mismatch: "
+                f"evaluator={evaluator.stderr!r} artifact={artifact_runner.stderr!r}",
+            )
+            require(
+                evaluator.stderr.endswith(
+                    f":1:{expected_column}: ".encode() + expected_reason
+                )
+                and generated.stderr
+                == f"<generated>:1:{expected_column}: ".encode() + expected_reason,
+                f"{name} exact diagnostic reason",
+            )
 
         canonical_fixtures = [
             ("empty", [], b""),
@@ -1654,7 +1859,7 @@ int main(int argc, char **argv) {
         )
         require(
             normalize_newlines(native_result.stdout)
-            == b"3\n2.5\ntrue\n(1 2 3)\n5.5\nfalse\n",
+            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n6\n(0 1 3 6)\n5.5\nfalse\n",
             "native build output",
         )
         artifact = work / "native-build.fwir"

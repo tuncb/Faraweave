@@ -116,29 +116,29 @@ fn ceil_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
         selections,
         vec![
             (
-                43,
-                43,
+                62,
+                62,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::Identity,
             ),
             (
-                43,
-                43,
+                62,
+                62,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                43,
-                43,
+                62,
+                62,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                43,
-                43,
+                62,
+                62,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
@@ -386,7 +386,7 @@ fn ceil_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     );
 
     let node = ceil_node(&bytes);
-    for (relative, replacement) in [(24, 36_u32), (28, 42), (32, 42)] {
+    for (relative, replacement) in [(24, 36_u32), (28, 61), (32, 61)] {
         let mut malformed = bytes.clone();
         malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
         let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
@@ -440,6 +440,6 @@ fn ceil_emitted_c_calls_math_h_ceil_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=ceil(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_ceil(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_43("));
-    assert!(source.contains("static int fw_impl_43("));
+    assert!(source.contains("static int fw_kernel_62("));
+    assert!(source.contains("static int fw_impl_62("));
 }
