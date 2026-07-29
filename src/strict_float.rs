@@ -254,6 +254,23 @@ pub(crate) fn backend_native_ceil(value: f64) -> f64 {
     canonicalize(result)
 }
 
+pub(crate) fn backend_native_trunc(value: f64) -> f64 {
+    // SAFETY: `StrictEnvironment` saves the complete supported host state,
+    // installs masked round-to-nearest with gradual underflow, and restores the
+    // saved bytes in `Drop`. The volatile input/result keep the direct
+    // `f64::trunc` call inside that guard.
+    let result = unsafe {
+        let environment = StrictEnvironment::begin();
+        let strict_value = core::ptr::read_volatile(&value);
+        let mut strict_result = f64::trunc(strict_value);
+        let result = core::ptr::read_volatile(&strict_result);
+        core::ptr::write_volatile(&mut strict_result, 0.0);
+        drop(environment);
+        result
+    };
+    canonicalize(result)
+}
+
 pub(crate) fn negate(value: f64) -> f64 {
     canonicalize(f64::from_bits(value.to_bits() ^ SIGN_MASK))
 }
@@ -720,6 +737,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backend_native_trunc_preserves_zeros_infinities_and_canonical_nan() {
+        for (input, expected) in [
+            (0x0000_0000_0000_0000, 0x0000_0000_0000_0000),
+            (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+            (0x7ff0_0000_0000_0000, 0x7ff0_0000_0000_0000),
+            (0xfff0_0000_0000_0000, 0xfff0_0000_0000_0000),
+            (0x7ff8_0000_0000_0000, CANONICAL_NAN_BITS),
+        ] {
+            assert_eq!(
+                backend_native_trunc(f64::from_bits(input)).to_bits(),
+                expected
+            );
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn hostile_x86_environment_is_ignored_and_exactly_restored() {
@@ -762,6 +795,8 @@ mod tests {
                 backend_native_floor(f64::from_bits(0x8000_0000_0000_0001)).to_bits();
             let reference_ceil =
                 backend_native_ceil(f64::from_bits(0x0000_0000_0000_0001)).to_bits();
+            let reference_trunc =
+                backend_native_trunc(f64::from_bits(0x8000_0000_0000_0001)).to_bits();
             let original = read_mxcsr();
             let hostile = (original | 0x0040 | 0x4000 | 0x8000 | 0x1f80) & !0x003f;
             write_mxcsr(hostile);
@@ -784,6 +819,9 @@ mod tests {
             let after_floor = read_mxcsr();
             let ceil_result = backend_native_ceil(f64::from_bits(0x0000_0000_0000_0001)).to_bits();
             let after_ceil = read_mxcsr();
+            let trunc_result =
+                backend_native_trunc(f64::from_bits(0x8000_0000_0000_0001)).to_bits();
+            let after_trunc = read_mxcsr();
             let result = arithmetic(
                 f64::from_bits(0x0000_0000_0000_0002),
                 2.0,
@@ -810,6 +848,8 @@ mod tests {
             assert_eq!(after_floor, hostile);
             assert_eq!(ceil_result, reference_ceil);
             assert_eq!(after_ceil, hostile);
+            assert_eq!(trunc_result, reference_trunc);
+            assert_eq!(after_trunc, hostile);
             assert_eq!(result, 0x0000_0000_0000_0001);
             assert_eq!(restored, hostile);
         }
@@ -862,6 +902,8 @@ mod tests {
                 backend_native_floor(f64::from_bits(0x8000_0000_0000_0001)).to_bits();
             let reference_ceil =
                 backend_native_ceil(f64::from_bits(0x0000_0000_0000_0001)).to_bits();
+            let reference_trunc =
+                backend_native_trunc(f64::from_bits(0x8000_0000_0000_0001)).to_bits();
             let reference_arithmetic = arithmetic(
                 f64::from_bits(0x0000_0000_0000_0001),
                 2.0,
@@ -903,6 +945,9 @@ mod tests {
             let after_floor = read_environment();
             let ceil_result = backend_native_ceil(f64::from_bits(0x0000_0000_0000_0001)).to_bits();
             let after_ceil = read_environment();
+            let trunc_result =
+                backend_native_trunc(f64::from_bits(0x8000_0000_0000_0001)).to_bits();
+            let after_trunc = read_environment();
             let arithmetic_result = arithmetic(
                 f64::from_bits(0x0000_0000_0000_0001),
                 2.0,
@@ -933,6 +978,8 @@ mod tests {
             assert_eq!(after_floor, hostile);
             assert_eq!(ceil_result, reference_ceil);
             assert_eq!(after_ceil, hostile);
+            assert_eq!(trunc_result, reference_trunc);
+            assert_eq!(after_trunc, hostile);
             assert_eq!(arithmetic_result, reference_arithmetic);
             assert_eq!(after_arithmetic, hostile);
         }

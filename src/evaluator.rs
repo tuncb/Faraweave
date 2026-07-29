@@ -296,6 +296,7 @@ mod tests {
             ("tan[-0.0]", "-0.0"),
             ("floor[-0.5]", "-1.0"),
             ("ceil[-0.5]", "-0.0"),
+            ("trunc[-0.5]", "-0.0"),
         ];
         for (source, expected) in cases {
             let value = evaluate_expression(source).expect(source).value;
