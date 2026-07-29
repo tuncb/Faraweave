@@ -140,29 +140,29 @@ fn tan_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
         selections,
         vec![
             (
-                41,
-                41,
+                60,
+                60,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::Identity,
             ),
             (
-                41,
-                41,
+                60,
+                60,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                41,
-                41,
+                60,
+                60,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                41,
-                41,
+                60,
+                60,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
@@ -415,7 +415,7 @@ fn tan_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     );
 
     let node = tan_node(&bytes);
-    for (relative, replacement) in [(24, 34_u32), (28, 40), (32, 40)] {
+    for (relative, replacement) in [(24, 34_u32), (28, 59), (32, 59)] {
         let mut malformed = bytes.clone();
         malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
         let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
@@ -469,6 +469,6 @@ fn tan_emitted_c_calls_math_h_tan_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=tan(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_tan(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_41("));
-    assert!(source.contains("static int fw_impl_41("));
+    assert!(source.contains("static int fw_kernel_60("));
+    assert!(source.contains("static int fw_impl_60("));
 }

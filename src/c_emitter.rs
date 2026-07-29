@@ -3,7 +3,9 @@ use crate::parser::{
     first_tuple_location, parse, program_contains_tuple, validate_parameter_declarations,
 };
 use crate::primitive::resolve_names;
-use crate::semantic_registry::{SEMANTIC_REGISTRY, ScalarKernel, implementation_from_numeric};
+use crate::semantic_registry::{
+    SEMANTIC_REGISTRY, ScalarKernel, application_plan_from_numeric, implementation_from_numeric,
+};
 use crate::typed_program::{
     ConstantRecord, Conversion as IrConversion, Feature, IndexRange, LiftMode, Node, NodeKind,
     Origin, RawProgram, ScalarConstant, TypeRecord, ValueAccess, VerifiedProgram,
@@ -176,7 +178,7 @@ impl<'a> IrCGenerator<'a> {
 
     fn emit_selected_implementation_wrappers(&mut self) -> Result<(), Error> {
         for descriptor in SEMANTIC_REGISTRY {
-            let used = self.program.nodes.iter().any(|node| {
+            let selected = self.program.nodes.iter().any(|node| {
                 matches!(
                     node.kind,
                     NodeKind::SelectedApply {
@@ -185,7 +187,10 @@ impl<'a> IrCGenerator<'a> {
                     } if implementation_id == descriptor.implementation_id.numeric()
                 )
             });
-            if !used {
+            let referenced = self.program.operation_references.iter().any(|reference| {
+                reference.implementation_id == descriptor.implementation_id.numeric()
+            });
+            if !selected && !referenced {
                 continue;
             }
             let implementation = descriptor.implementation_id.numeric();
@@ -198,7 +203,187 @@ impl<'a> IrCGenerator<'a> {
                 .map_err(|_| emission_error())?;
                 continue;
             }
+            if matches!(
+                descriptor.kernel,
+                ScalarKernel::LengthBoolVector
+                    | ScalarKernel::LengthIntVector
+                    | ScalarKernel::LengthDoubleVector
+            ) {
+                let crate::semantic_registry::WorkAdmission::Constant(work) =
+                    descriptor.application_plan.resources.work
+                else {
+                    return Err(emission_error());
+                };
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_length({},args,out,line,column,{}U); }}",
+                    c_string(descriptor.primitive_name),
+                    work,
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
+            if matches!(
+                descriptor.kernel,
+                ScalarKernel::SortBoolVector
+                    | ScalarKernel::SortIntVector
+                    | ScalarKernel::SortDoubleVector
+            ) {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::PreserveOperand(1)
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(1)
+                {
+                    return Err(emission_error());
+                }
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_sort({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
+            if matches!(
+                descriptor.kernel,
+                ScalarKernel::SumIntVector | ScalarKernel::SumDoubleVector
+            ) {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::Scalar
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(1)
+                {
+                    return Err(emission_error());
+                }
+                let runtime = match descriptor.kernel {
+                    ScalarKernel::SumIntVector => "fw_apply_selected_sum_int",
+                    ScalarKernel::SumDoubleVector => "fw_apply_selected_sum_double",
+                    _ => return Err(emission_error()),
+                };
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return {runtime}({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
+            if descriptor.kernel == ScalarKernel::AllOfBoolVector {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::Scalar
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(1)
+                {
+                    return Err(emission_error());
+                }
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_all_of({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
+            if descriptor.kernel == ScalarKernel::AnyOfBoolVector {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::Scalar
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(1)
+                {
+                    return Err(emission_error());
+                }
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_any_of({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
+            if descriptor.kernel == ScalarKernel::NoneOfBoolVector {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::Scalar
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(1)
+                {
+                    return Err(emission_error());
+                }
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_none_of({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
+            let reducer_runtime = match descriptor.kernel {
+                ScalarKernel::FoldlBool | ScalarKernel::FoldlInt | ScalarKernel::FoldlDouble => {
+                    Some((
+                        crate::semantic_registry::ResultCardinality::Scalar,
+                        "fw_apply_selected_foldl",
+                    ))
+                }
+                ScalarKernel::ScanlBool | ScalarKernel::ScanlInt | ScalarKernel::ScanlDouble => {
+                    Some((
+                        crate::semantic_registry::ResultCardinality::OperandPlusOne(2),
+                        "fw_apply_selected_scanl",
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((result_cardinality, runtime)) = reducer_runtime {
+                if descriptor.application_plan.result_cardinality != result_cardinality
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(2)
+                {
+                    return Err(emission_error());
+                }
+                let mut emitted_references = Vec::new();
+                emitted_references
+                    .try_reserve(self.program.operation_references.len())
+                    .map_err(|_| emission_error())?;
+                for node in &self.program.nodes {
+                    let NodeKind::SelectedApply {
+                        implementation_id,
+                        operation_reference: Some(reference_index),
+                        ..
+                    } = node.kind
+                    else {
+                        continue;
+                    };
+                    if implementation_id != implementation {
+                        continue;
+                    }
+                    let reference = self
+                        .program
+                        .operation_references
+                        .get(reference_index.0 as usize)
+                        .ok_or_else(emission_error)?;
+                    if emitted_references.contains(&reference_index) {
+                        continue;
+                    }
+                    let reducer = implementation_from_numeric(reference.implementation_id)
+                        .map_err(|_| emission_error())?;
+                    let reference_origin = self.origin(reference.origin.0)?;
+                    emitted_references.push(reference_index);
+                    writeln!(
+                        self.definitions,
+                        "static int fw_impl_{implementation}_opr_{}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)lift; return {runtime}(fw_kernel_{}, {}, {}, args, out, line, column, {}U, {}U, conversions); }}",
+                        reference_index.0,
+                        reference.implementation_id,
+                        c_string(descriptor.primitive_name),
+                        c_string(reducer.primitive_name),
+                        reference_origin.span.begin.line,
+                        reference_origin.span.begin.column,
+                    )
+                    .map_err(|_| emission_error())?;
+                }
+                continue;
+            }
             self.emit_selected_kernel(implementation, descriptor.kernel)?;
+            if !selected {
+                continue;
+            }
             writeln!(
                 self.definitions,
                 "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ return fw_apply_selected(fw_kernel_{implementation}, {}, {}, args, count, out, line, column, origins, origin_count, static_anchor, shape_checks, shape_count, conversions, lift); }}",
@@ -237,6 +422,9 @@ impl<'a> IrCGenerator<'a> {
             ScalarKernel::MulInt => {
                 "int64_t a=args[0].i,b=args[1].i;if(a!=0&&((a==-1&&b==INT64_MIN)||(b==-1&&a==INT64_MIN)||(a>0&&((b>0&&a>INT64_MAX/b)||(b<0&&b<INT64_MIN/a)))||(a<0&&((b>0&&a<INT64_MIN/b)||(b<0&&a<INT64_MAX/b)))))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a*b);return 1;"
             }
+            ScalarKernel::DivInt => {
+                "int64_t a=args[0].i,b=args[1].i;if(b==INT64_C(0))return fw_selected_division_by_zero(name,line,column,index,vector_result);if(a==INT64_MIN&&b==-INT64_C(1))return fw_selected_integer_overflow(name,line,column,index,vector_result);fw_set_int(out,a/b);return 1;"
+            }
             ScalarKernel::IncDouble => {
                 "fw_set_double(out,fw_double_arithmetic(args[0].d,1.0,FW_DOUBLE_ADD));return 1;"
             }
@@ -257,6 +445,9 @@ impl<'a> IrCGenerator<'a> {
             }
             ScalarKernel::MulDouble => {
                 "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_MUL));return 1;"
+            }
+            ScalarKernel::DivDouble => {
+                "fw_set_double(out,fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_DIV));return 1;"
             }
             ScalarKernel::EqualsBool => "fw_set_bool(out,args[0].b==args[1].b);return 1;",
             ScalarKernel::EqualsInt => "fw_set_bool(out,args[0].i==args[1].i);return 1;",
@@ -313,7 +504,24 @@ impl<'a> IrCGenerator<'a> {
             ScalarKernel::FloorDouble => {
                 "fw_set_double(out,fw_backend_native_floor(args[0].d));return 1;"
             }
-            ScalarKernel::IotaInt => return Err(emission_error()),
+            ScalarKernel::LengthBoolVector
+            | ScalarKernel::LengthIntVector
+            | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::SortBoolVector
+            | ScalarKernel::SortIntVector
+            | ScalarKernel::SortDoubleVector
+            | ScalarKernel::SumIntVector
+            | ScalarKernel::SumDoubleVector
+            | ScalarKernel::AllOfBoolVector
+            | ScalarKernel::AnyOfBoolVector
+            | ScalarKernel::NoneOfBoolVector
+            | ScalarKernel::FoldlBool
+            | ScalarKernel::FoldlInt
+            | ScalarKernel::FoldlDouble
+            | ScalarKernel::ScanlBool
+            | ScalarKernel::ScanlInt
+            | ScalarKernel::ScanlDouble
+            | ScalarKernel::IotaInt => return Err(emission_error()),
         };
         writeln!(
             self.definitions,
@@ -342,12 +550,21 @@ impl<'a> IrCGenerator<'a> {
             NodeKind::PrefixSpreadPrepare => self.emit_ir_spread_prepare(node)?,
             NodeKind::SelectedApply {
                 implementation_id,
+                application_plan_id,
+                operation_reference,
                 primitive_origin: _,
                 lift,
                 result_element_type: _,
                 shape,
                 ..
-            } => self.emit_ir_selected(node, implementation_id, lift, shape)?,
+            } => self.emit_ir_selected(
+                node,
+                implementation_id,
+                application_plan_id,
+                operation_reference,
+                lift,
+                shape,
+            )?,
             NodeKind::FanOut { branches, .. } => self.emit_ir_fan_out(node, branches)?,
         }
         self.definitions.push_str("}\n");
@@ -490,10 +707,18 @@ impl<'a> IrCGenerator<'a> {
         &mut self,
         node: Node,
         implementation_id: u16,
+        application_plan_id: u16,
+        operation_reference: Option<crate::OperationReferenceIndex>,
         lift: LiftMode,
         shape: crate::ShapePlan,
     ) -> Result<(), Error> {
-        let _ = implementation_from_numeric(implementation_id).map_err(|_| emission_error())?;
+        let descriptor =
+            implementation_from_numeric(implementation_id).map_err(|_| emission_error())?;
+        let application_plan =
+            application_plan_from_numeric(application_plan_id).map_err(|_| emission_error())?;
+        if descriptor.application_plan != application_plan {
+            return Err(emission_error());
+        }
         let edges = range_slice(&self.program.edges, node.edges)?;
         let origin = self.origin(node.origin.0)?;
         writeln!(
@@ -589,9 +814,14 @@ impl<'a> IrCGenerator<'a> {
             write!(self.definitions, "{relative}U,").map_err(|_| emission_error())?;
         }
         self.definitions.push_str("0U};\n");
+        let implementation_name = if let Some(reference_index) = operation_reference {
+            format!("fw_impl_{implementation_id}_opr_{}", reference_index.0)
+        } else {
+            format!("fw_impl_{implementation_id}")
+        };
         writeln!(
             self.definitions,
-            "  ok = fw_impl_{implementation_id}(args, {}U, out, {}U, {}U, origins, {}U, {}, shape_checks, {}U, conversions, {});",
+            "  ok = {implementation_name}(args, {}U, out, {}U, {}U, origins, {}U, {}, shape_checks, {}U, conversions, {});",
             edges.len(),
             origin.span.begin.line,
             origin.span.begin.column,
@@ -604,6 +834,8 @@ impl<'a> IrCGenerator<'a> {
                 LiftMode::Scalar => 0,
                 LiftMode::Vector => 1,
                 LiftMode::DynamicVector => 2,
+                LiftMode::ContainerScalar => 3,
+                LiftMode::ContainerVector => 4,
             }
         )
         .map_err(|_| emission_error())?;
@@ -948,7 +1180,7 @@ static void fw_restore_strict_environment(const FWStrictEnvironment *environment
 #else
 #error "Faraweave requires an x86-64 or AArch64 floating-point environment"
 #endif
-enum { FW_DOUBLE_ADD=0,FW_DOUBLE_SUB=1,FW_DOUBLE_MUL=2 };
+enum { FW_DOUBLE_ADD=0,FW_DOUBLE_SUB=1,FW_DOUBLE_MUL=2,FW_DOUBLE_DIV=3 };
 static double fw_double_arithmetic(double left,double right,int operation) {
   uint64_t left_bits=fw_double_bits(left),right_bits=fw_double_bits(right);
   int signs_differ=((left_bits^right_bits)&UINT64_C(0x8000000000000000))!=0U;
@@ -958,13 +1190,17 @@ static double fw_double_arithmetic(double left,double right,int operation) {
        (operation==FW_DOUBLE_SUB&&!signs_differ)))||
      (operation==FW_DOUBLE_MUL&&
       ((fw_double_is_infinity(left)&&fw_double_is_zero(right))||
-       (fw_double_is_zero(left)&&fw_double_is_infinity(right)))))
+       (fw_double_is_zero(left)&&fw_double_is_infinity(right))))||
+     (operation==FW_DOUBLE_DIV&&
+      ((fw_double_is_zero(left)&&fw_double_is_zero(right))||
+       (fw_double_is_infinity(left)&&fw_double_is_infinity(right)))))
     return fw_double_from_bits(UINT64_C(0x7ff8000000000000));
   { FWStrictEnvironment environment;volatile double a=left,b=right,result=0.0;
     fw_begin_strict_environment(&environment);
     if(operation==FW_DOUBLE_ADD)result=a+b;
     else if(operation==FW_DOUBLE_SUB)result=a-b;
-    else result=a*b;
+    else if(operation==FW_DOUBLE_MUL)result=a*b;
+    else result=a/b;
     fw_restore_strict_environment(&environment);
     return fw_double_is_nan(result)
         ?fw_double_from_bits(UINT64_C(0x7ff8000000000000)):result;
@@ -1166,6 +1402,15 @@ static int fw_selected_integer_overflow(const char *name,size_t line,size_t colu
   }
   return fw_fail_primitive("DomainError",name,"integer_overflow",line,column);
 }
+static int fw_selected_division_by_zero(const char *name,size_t line,size_t column,
+                                        size_t index,int vector_result) {
+  if(vector_result){
+    (void)snprintf(fw_error_storage,sizeof(fw_error_storage),
+                   "%s failed: division_by_zero at result index %zu",name,index);
+    return fw_fail("DomainError",fw_error_storage,line,column);
+  }
+  return fw_fail_primitive("DomainError",name,"division_by_zero",line,column);
+}
 static FWV fw_scalar_at_selected(const FWV *value,size_t index,int conversion) {
   FWV result=fw_scalar_at(value,index);
   if(conversion!=0){int64_t integer=result.i;fw_set_double(&result,fw_int_to_double(integer));}
@@ -1215,6 +1460,161 @@ static int fw_apply_selected_iota(const char *name,const FWV *args,FWV *out,
   size_t i,length=bound>0?(size_t)bound:0U;
   if(!fw_make_vector(out,1,length,length,name,line,column))return 0;
   for(i=0U;i<length;++i)((int64_t *)out->data)[i]=(int64_t)i+1;
+  return 1;
+}
+static int fw_apply_selected_length(const char *name,const FWV *args,FWV *out,
+                                    size_t line,size_t column,size_t work) {
+  if(!fw_charge_work(work,name,line,column))return 0;
+  if((uint64_t)args[0].len>UINT64_C(9223372036854775807))
+    return fw_fail_resource(name,"size_overflow",line,column);
+  fw_set_int(out,(int64_t)args[0].len);return 1;
+}
+static int fw_sort_less(const FWV *vector,size_t left,size_t right) {
+  if(vector->type==0){
+    const unsigned char *values=(const unsigned char *)vector->data;
+    return values[left]<values[right];
+  }
+  if(vector->type==1){
+    const int64_t *values=(const int64_t *)vector->data;
+    return values[left]<values[right];
+  }
+  {
+    const double *values=(const double *)vector->data;
+    return fw_double_order_key(values[left])<fw_double_order_key(values[right]);
+  }
+}
+static void fw_sort_swap(FWV *vector,size_t left,size_t right) {
+  if(vector->type==0){
+    unsigned char *values=(unsigned char *)vector->data;
+    unsigned char temporary=values[left];values[left]=values[right];values[right]=temporary;
+  }else if(vector->type==1){
+    int64_t *values=(int64_t *)vector->data;
+    int64_t temporary=values[left];values[left]=values[right];values[right]=temporary;
+  }else{
+    double *values=(double *)vector->data;
+    uint64_t temporary,replacement;
+    (void)memcpy(&temporary,&values[left],sizeof(temporary));
+    (void)memcpy(&replacement,&values[right],sizeof(replacement));
+    (void)memcpy(&values[left],&replacement,sizeof(replacement));
+    (void)memcpy(&values[right],&temporary,sizeof(temporary));
+  }
+}
+static void fw_sort_sift_down(FWV *vector,size_t root,size_t end) {
+  while(root<=end/2U){
+    size_t child=root*2U+1U;
+    if(child>end)return;
+    if(child<end&&fw_sort_less(vector,child,child+1U))++child;
+    if(!fw_sort_less(vector,root,child))return;
+    fw_sort_swap(vector,root,child);root=child;
+  }
+}
+static void fw_sort_in_place(FWV *vector) {
+  size_t start,end;
+  if(vector->len<2U)return;
+  for(start=vector->len/2U;start>0U;){
+    --start;fw_sort_sift_down(vector,start,vector->len-1U);
+  }
+  for(end=vector->len-1U;end>0U;--end){
+    fw_sort_swap(vector,0U,end);fw_sort_sift_down(vector,0U,end-1U);
+  }
+}
+static int fw_apply_selected_sort(const char *name,const FWV *args,FWV *out,
+                                  size_t line,size_t column) {
+  size_t length=args[0].len;
+  if(!fw_make_vector(out,args[0].type,length,length,name,line,column))return 0;
+  if(length!=0U)(void)memcpy(out->data,args[0].data,out->charge);
+  fw_sort_in_place(out);return 1;
+}
+static int fw_apply_selected_sum_int(const char *name,const FWV *args,FWV *out,
+                                     size_t line,size_t column) {
+  const int64_t *values=(const int64_t *)args[0].data;
+  int64_t total=INT64_C(0);size_t index;
+  if(!fw_charge_work(args[0].len,name,line,column))return 0;
+  for(index=0U;index<args[0].len;++index){
+    int64_t value=values[index];
+    if((value>INT64_C(0)&&total>INT64_MAX-value)||
+       (value<INT64_C(0)&&total<INT64_MIN-value))
+      return fw_selected_integer_overflow(name,line,column,index,1);
+    total+=value;
+  }
+  fw_set_int(out,total);return 1;
+}
+static int fw_apply_selected_sum_double(const char *name,const FWV *args,FWV *out,
+                                        size_t line,size_t column) {
+  const double *values=(const double *)args[0].data;
+  double total=0.0;size_t index;
+  if(!fw_charge_work(args[0].len,name,line,column))return 0;
+  for(index=0U;index<args[0].len;++index)
+    total=fw_double_arithmetic(total,values[index],FW_DOUBLE_ADD);
+  fw_set_double(out,total);return 1;
+}
+static int fw_apply_selected_all_of(const char *name,const FWV *args,FWV *out,
+                                    size_t line,size_t column) {
+  const unsigned char *values=(const unsigned char *)args[0].data;
+  size_t index;
+  if(!fw_charge_work(args[0].len,name,line,column))return 0;
+  for(index=0U;index<args[0].len;++index){
+    if(values[index]==0U){fw_set_bool(out,0);return 1;}
+  }
+  fw_set_bool(out,1);return 1;
+}
+static int fw_apply_selected_any_of(const char *name,const FWV *args,FWV *out,
+                                    size_t line,size_t column) {
+  const unsigned char *values=(const unsigned char *)args[0].data;
+  size_t index;
+  if(!fw_charge_work(args[0].len,name,line,column))return 0;
+  for(index=0U;index<args[0].len;++index){
+    if(values[index]!=0U){fw_set_bool(out,1);return 1;}
+  }
+  fw_set_bool(out,0);return 1;
+}
+static int fw_apply_selected_none_of(const char *name,const FWV *args,FWV *out,
+                                     size_t line,size_t column) {
+  const unsigned char *values=(const unsigned char *)args[0].data;
+  size_t index;
+  if(!fw_charge_work(args[0].len,name,line,column))return 0;
+  for(index=0U;index<args[0].len;++index){
+    if(values[index]!=0U){fw_set_bool(out,0);return 1;}
+  }
+  fw_set_bool(out,1);return 1;
+}
+static int fw_apply_selected_foldl(FWSelectedKernel reducer,const char *name,
+                                   const char *reducer_name,const FWV *args,FWV *out,
+                                   size_t line,size_t column,size_t reducer_line,
+                                   size_t reducer_column,const int *conversions) {
+  FWV accumulator=fw_scalar_at_selected(args,0U,conversions[0]);
+  size_t index;
+  if(!fw_charge_work(args[1].len,name,line,column))return 0;
+  for(index=0U;index<args[1].len;++index){
+    FWV reducer_args[2]={{0}};FWV next={0};
+    reducer_args[0]=accumulator;
+    reducer_args[1]=fw_scalar_at(&args[1],index);
+    if(!reducer(reducer_args,&next,reducer_name,reducer_line,reducer_column,index,1))return 0;
+    accumulator=next;
+  }
+  *out=accumulator;return 1;
+}
+static int fw_apply_selected_scanl(FWSelectedKernel reducer,const char *name,
+                                   const char *reducer_name,const FWV *args,FWV *out,
+                                   size_t line,size_t column,size_t reducer_line,
+                                   size_t reducer_column,const int *conversions) {
+  FWV accumulator;size_t index,length;
+  if(args[1].len==SIZE_MAX)
+    return fw_fail_resource(name,"size_overflow",line,column);
+  length=args[1].len+1U;
+  if(!fw_make_vector(out,args[1].type,length,args[1].len,name,line,column))return 0;
+  accumulator=fw_scalar_at_selected(args,0U,conversions[0]);
+  if(!fw_put_scalar(out,0U,accumulator)){fw_free(out);return 0;}
+  for(index=0U;index<args[1].len;++index){
+    FWV reducer_args[2]={{0}};FWV next={0};
+    reducer_args[0]=accumulator;
+    reducer_args[1]=fw_scalar_at(&args[1],index);
+    if(!reducer(reducer_args,&next,reducer_name,reducer_line,reducer_column,index,1)){
+      fw_free(out);return 0;
+    }
+    accumulator=next;
+    if(!fw_put_scalar(out,index+1U,accumulator)){fw_free(out);return 0;}
+  }
   return 1;
 }
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
@@ -1385,7 +1785,17 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   size_t supplied=argc>0?(size_t)argc-1U:0U,i,initialized=0U;FWV *values=NULL;FWBuffer output={0};int decoded;
   (void)fw_apply_selected;
   (void)fw_apply_selected_iota;
+  (void)fw_apply_selected_length;
+  (void)fw_apply_selected_sort;
+  (void)fw_apply_selected_sum_int;
+  (void)fw_apply_selected_sum_double;
+  (void)fw_apply_selected_all_of;
+  (void)fw_apply_selected_any_of;
+  (void)fw_apply_selected_none_of;
+  (void)fw_apply_selected_foldl;
+  (void)fw_apply_selected_scanl;
   (void)fw_selected_integer_overflow;
+  (void)fw_selected_division_by_zero;
   (void)fw_as_double;
   (void)fw_borrow;
   (void)fw_double_arithmetic;
@@ -1432,6 +1842,13 @@ failure:
 mod ir_tests {
     use super::*;
     use crate::lowering::compile_source_with_name;
+
+    fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("fixture failed: {error:?}"),
+        }
+    }
 
     fn emit(source: &str) -> String {
         emit_with_configuration(
@@ -1603,18 +2020,25 @@ mod ir_tests {
     }
 
     #[test]
-    fn every_selected_id_emits_a_direct_kernel_symbol_without_type_redispatch() {
+    fn every_selected_id_emits_direct_dispatch_without_type_redispatch() {
         let source = emit(
             "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
              abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
-             mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
+             mul[2 3]\nmul[2.0 3.0]\ndiv[7 3]\ndiv[7.0 3.0]\n\
+             equals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
              not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
-              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
-              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
-              sqrt[4.0]\nexp[1.0]\nlog[1.0]\nlog10[1.0]\nsin[1.0]\ncos[1.0]\ntan[1.0]\nfloor[1.5]\n",
+             is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
+             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
+             length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
+             sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n\
+             sum[(1 2)]\nsum[(1.0 2.0)]\nall_of[(true false)]\nany_of[(true false)]\n\
+             none_of[(true false)]\nfoldl[@and true (true false)]\n\
+             foldl[@sub 10 (1 2)]\nfoldl[@add 1 (2.0 3.0)]\n\
+             scanl[@and true (true false)]\nscanl[@sub 10 (1 2)]\n\
+             scanl[@add 1 (2.0 3.0)]\nsqrt[4.0]\nexp[1.0]\nlog[1.0]\nlog10[1.0]\nsin[1.0]\ncos[1.0]\ntan[1.0]\nfloor[1.5]\n",
         );
-        for implementation in (1..=42).filter(|implementation| *implementation != 34) {
+        for implementation in (1..=36).filter(|implementation| *implementation != 34) {
             assert!(
                 source.contains(&format!("static int fw_kernel_{implementation}(")),
                 "missing kernel {implementation}"
@@ -1624,9 +2048,313 @@ mod ir_tests {
                 "implementation {implementation} is not direct"
             );
         }
+        assert!(source.contains("static int fw_kernel_54("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_54,"));
+        assert!(source.contains("static int fw_kernel_55("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_55,"));
+        assert!(source.contains("static int fw_kernel_56("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_56,"));
+        assert!(source.contains("static int fw_kernel_57("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_57,"));
+        assert!(source.contains("static int fw_kernel_58("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_58,"));
+        assert!(source.contains("static int fw_kernel_59("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_59,"));
+        assert!(source.contains("static int fw_kernel_60("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_60,"));
+        assert!(source.contains("static int fw_kernel_61("));
+        assert!(source.contains("fw_apply_selected(fw_kernel_61,"));
         assert!(source.contains("static int fw_impl_34("));
         assert!(source.contains("return fw_apply_selected_iota(\"iota\""));
+        for implementation in 37..=39 {
+            assert!(source.contains(&format!("static int fw_impl_{implementation}(")));
+            assert!(source.contains(&format!("fw_impl_{implementation}(const FWV *args")));
+        }
+        assert_eq!(
+            source.matches("return fw_apply_selected_length(").count(),
+            3
+        );
+        for implementation in 40..=42 {
+            assert!(source.contains(&format!("static int fw_impl_{implementation}(")));
+            assert!(source.contains(&format!("fw_impl_{implementation}(const FWV *args")));
+        }
+        assert_eq!(source.matches("return fw_apply_selected_sort(").count(), 3);
+        for implementation in 43..=44 {
+            assert!(source.contains(&format!("static int fw_impl_{implementation}(")));
+            assert!(source.contains(&format!("fw_impl_{implementation}(const FWV *args")));
+        }
+        assert_eq!(
+            source.matches("return fw_apply_selected_sum_int(").count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches("return fw_apply_selected_sum_double(")
+                .count(),
+            1
+        );
+        assert!(source.contains("static int fw_impl_45("));
+        assert!(source.contains("fw_impl_45(const FWV *args"));
+        assert_eq!(
+            source.matches("return fw_apply_selected_all_of(").count(),
+            1
+        );
+        assert!(source.contains("static int fw_impl_46("));
+        assert!(source.contains("fw_impl_46(const FWV *args"));
+        assert_eq!(
+            source.matches("return fw_apply_selected_any_of(").count(),
+            1
+        );
+        assert!(source.contains("static int fw_impl_47("));
+        assert!(source.contains("fw_impl_47(const FWV *args"));
+        assert_eq!(
+            source.matches("return fw_apply_selected_none_of(").count(),
+            1
+        );
+        for (reference, implementation, reducer) in [(0, 48, 22), (1, 49, 11), (2, 50, 10)] {
+            assert!(source.contains(&format!(
+                "static int fw_impl_{implementation}_opr_{reference}("
+            )));
+            assert!(source.contains(&format!(
+                "return fw_apply_selected_foldl(fw_kernel_{reducer},"
+            )));
+        }
+        for (reference, implementation, reducer) in [(3, 51, 22), (4, 52, 11), (5, 53, 10)] {
+            assert!(source.contains(&format!(
+                "static int fw_impl_{implementation}_opr_{reference}("
+            )));
+            assert!(source.contains(&format!(
+                "return fw_apply_selected_scanl(fw_kernel_{reducer},"
+            )));
+        }
         assert!(!source.contains("fw_apply_scalar"));
+        assert!(!source.contains("primitive=="));
+    }
+
+    #[test]
+    fn length_uses_container_dispatch_checked_conversion_and_constant_work() {
+        let source = emit("length[(true false)]\nlength[(1 2 3)]\nlength[(1.0 2.0 3.0 4.0)]\n");
+        assert!(source.contains("fw_apply_selected_length(\"length\",args,out,line,column,1U)"));
+        assert!(source.contains("if(!fw_charge_work(work,name,line,column))return 0;"));
+        let overflow = source.find("(uint64_t)args[0].len>UINT64_C(9223372036854775807)");
+        let conversion = source.find("fw_set_int(out,(int64_t)args[0].len)");
+        assert!(matches!((overflow, conversion), (Some(check), Some(cast)) if check < cast));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn sort_uses_owned_container_dispatch_total_double_order_and_linear_work() {
+        let source = emit("sort[(true false)]\nsort[(3 1 2)]\nsort[(nan 0.0 -0.0 -inf inf)]\n");
+        assert!(source.contains("return fw_apply_selected_sort(\"sort\",args,out,line,column)"));
+        assert!(source.contains("fw_make_vector(out,args[0].type,length,length,name,line,column)"));
+        assert!(source.contains("fw_double_order_key(values[left])"));
+        assert!(source.contains("memcpy(out->data,args[0].data,out->charge)"));
+        assert!(source.contains("fw_sort_sift_down"));
+        assert!(!source.contains("qsort("));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn sum_uses_left_to_right_checked_reduction_after_full_work_charge() {
+        let source = emit("sum[(1 2 3)]\nsum[(1e16 1.0 -1e16)]\n");
+        assert!(source.contains("return fw_apply_selected_sum_int(\"sum\",args,out,line,column)"));
+        assert!(
+            source.contains("return fw_apply_selected_sum_double(\"sum\",args,out,line,column)")
+        );
+        let work = source.find("fw_charge_work(args[0].len,name,line,column)");
+        let integer_loop = source.find("for(index=0U;index<args[0].len;++index)");
+        let integer_add = source.find("total+=value");
+        assert!(
+            matches!((work, integer_loop, integer_add), (Some(work), Some(loop_start), Some(add)) if work < loop_start && loop_start < add)
+        );
+        assert!(source.contains("total>INT64_MAX-value"));
+        assert!(source.contains("total<INT64_MIN-value"));
+        assert!(source.contains("total=fw_double_arithmetic(total,values[index],FW_DOUBLE_ADD)"));
+        let sum_runtime = source
+            .split("static int fw_apply_selected_sum_int")
+            .nth(1)
+            .and_then(|tail| tail.split("static int fw_apply_selected_all_of").next())
+            .unwrap_or("");
+        assert!(!sum_runtime.contains("fw_make_vector"));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn all_of_charges_full_work_before_position_independent_short_circuit() {
+        let source = emit("all_of[(true false true)]\n");
+        assert!(
+            source.contains("return fw_apply_selected_all_of(\"all_of\",args,out,line,column)")
+        );
+        let runtime = source
+            .split("static int fw_apply_selected_all_of")
+            .nth(1)
+            .and_then(|tail| tail.split("static int fw_apply_selected_any_of").next())
+            .unwrap_or("");
+        let work = runtime.find("fw_charge_work(args[0].len,name,line,column)");
+        let loop_start = runtime.find("for(index=0U;index<args[0].len;++index)");
+        let decisive = runtime.find("if(values[index]==0U)");
+        assert!(
+            matches!((work, loop_start, decisive), (Some(work), Some(loop_start), Some(decisive)) if work < loop_start && loop_start < decisive)
+        );
+        assert!(runtime.contains("fw_set_bool(out,1)"));
+        assert!(!runtime.contains("fw_make_vector"));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn any_of_charges_full_work_before_position_independent_short_circuit() {
+        let source = emit("any_of[(false true false)]\n");
+        assert!(
+            source.contains("return fw_apply_selected_any_of(\"any_of\",args,out,line,column)")
+        );
+        let runtime = source
+            .split("static int fw_apply_selected_any_of")
+            .nth(1)
+            .and_then(|tail| tail.split("static int fw_apply_selected_none_of").next())
+            .unwrap_or("");
+        let work = runtime.find("fw_charge_work(args[0].len,name,line,column)");
+        let loop_start = runtime.find("for(index=0U;index<args[0].len;++index)");
+        let decisive = runtime.find("if(values[index]!=0U)");
+        assert!(
+            matches!((work, loop_start, decisive), (Some(work), Some(loop_start), Some(decisive)) if work < loop_start && loop_start < decisive)
+        );
+        assert!(runtime.contains("fw_set_bool(out,0)"));
+        assert!(!runtime.contains("fw_make_vector"));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn none_of_has_independent_dispatch_and_charges_before_short_circuit() {
+        let source = emit("none_of[(false true false)]\n");
+        assert!(
+            source.contains("return fw_apply_selected_none_of(\"none_of\",args,out,line,column)")
+        );
+        assert!(source.contains("static int fw_impl_47("));
+        let runtime = source
+            .split("static int fw_apply_selected_none_of")
+            .nth(1)
+            .and_then(|tail| tail.split("static int fw_apply_selected_foldl").next())
+            .unwrap_or("");
+        let work = runtime.find("fw_charge_work(args[0].len,name,line,column)");
+        let loop_start = runtime.find("for(index=0U;index<args[0].len;++index)");
+        let decisive = runtime.find("if(values[index]!=0U)");
+        assert!(
+            matches!((work, loop_start, decisive), (Some(work), Some(loop_start), Some(decisive)) if work < loop_start && loop_start < decisive)
+        );
+        assert!(runtime.contains("fw_set_bool(out,1)"));
+        assert!(!runtime.contains("fw_apply_selected_any_of"));
+        assert!(!runtime.contains("fw_make_vector"));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn foldl_dispatches_the_verified_reducer_and_charges_full_work_before_steps() {
+        let source = emit(
+            "foldl[@sub 20 (3 4 5)]\n\
+             foldl[@and true Bool()]\n\
+             foldl[@add 1 (2.5 3.5)]\n",
+        );
+        assert!(source.contains("static int fw_impl_49_opr_0("));
+        assert!(source.contains(
+            "return fw_apply_selected_foldl(fw_kernel_11, \"foldl\", \"sub\", args, out"
+        ));
+        assert!(source.contains("static int fw_impl_48_opr_1("));
+        assert!(source.contains("static int fw_impl_50_opr_2("));
+        let runtime = source
+            .split("static int fw_apply_selected_foldl")
+            .nth(1)
+            .and_then(|tail| tail.split("static int fw_apply_selected_scanl").next())
+            .unwrap_or("");
+        let work = runtime.find("fw_charge_work(args[1].len,name,line,column)");
+        let loop_start = runtime.find("for(index=0U;index<args[1].len;++index)");
+        let reducer = runtime.find("if(!reducer(reducer_args,&next,reducer_name");
+        assert!(
+            matches!((work, loop_start, reducer), (Some(work), Some(loop_start), Some(reducer)) if work < loop_start && loop_start < reducer)
+        );
+        assert!(runtime.contains("accumulator=next"));
+        assert!(!runtime.contains("strcmp"));
+        assert!(!runtime.contains("fw_make_vector"));
+    }
+
+    #[test]
+    fn scanl_admits_plus_one_output_before_seed_and_cleans_it_on_reducer_fault() {
+        let source = emit(
+            "scanl[@sub 20 (3 4 5)]\n\
+             scanl[@and true Bool()]\n\
+             scanl[@add 1 (2.5 3.5)]\n",
+        );
+        assert!(source.contains("static int fw_impl_52_opr_0("));
+        assert!(source.contains(
+            "return fw_apply_selected_scanl(fw_kernel_11, \"scanl\", \"sub\", args, out"
+        ));
+        assert!(source.contains("static int fw_impl_51_opr_1("));
+        assert!(source.contains("static int fw_impl_53_opr_2("));
+        let runtime = source
+            .split("static int fw_apply_selected_scanl")
+            .nth(1)
+            .and_then(|tail| tail.split("typedef struct { char *data").next())
+            .unwrap_or("");
+        let overflow = runtime.find("if(args[1].len==SIZE_MAX)");
+        let allocation = runtime.find("fw_make_vector(out,args[1].type,length,args[1].len");
+        let seed = runtime.find("fw_put_scalar(out,0U,accumulator)");
+        let reducer = runtime.find("if(!reducer(reducer_args,&next,reducer_name");
+        assert!(matches!((overflow, allocation, seed, reducer),
+                (Some(overflow), Some(allocation), Some(seed), Some(reducer))
+                if overflow < allocation && allocation < seed && seed < reducer));
+        assert!(runtime.contains("fw_free(out);return 0;"));
+        assert!(!runtime.contains("strcmp"));
+    }
+
+    #[test]
+    fn div_kernels_guard_integer_ub_and_use_strict_binary64_division() {
+        let source = emit("div[7 3]\ndiv[7.0 3.0]\n");
+        let integer_start = source.find("static int fw_kernel_35(");
+        let integer = integer_start.map(|start| &source[start..]);
+        let zero_guard = integer.and_then(|body| body.find("b==INT64_C(0)"));
+        let overflow_guard = integer.and_then(|body| body.find("a==INT64_MIN&&b==-INT64_C(1)"));
+        let division = integer.and_then(|body| body.find("fw_set_int(out,a/b)"));
+        assert!(
+            matches!(
+                (zero_guard, overflow_guard, division),
+                (Some(zero), Some(overflow), Some(divide))
+                    if zero < overflow && overflow < divide
+            ),
+            "integer div guards do not precede the C division"
+        );
+        assert!(source.contains("fw_double_arithmetic(args[0].d,args[1].d,FW_DOUBLE_DIV)"));
+        assert!(source.contains("operation==FW_DOUBLE_DIV"));
+        assert!(source.contains("fw_selected_division_by_zero"));
+        assert!(source.contains("\"division_by_zero\""));
+    }
+
+    #[test]
+    fn operation_reference_identity_prepares_direct_c_dispatch_without_name_lookup() {
+        let reference = must(crate::lowering::resolve_operation_reference(
+            "add",
+            crate::SourceSpan {
+                begin: crate::SourceLocation::start(),
+                end: crate::SourceLocation {
+                    offset: 4,
+                    line: 1,
+                    column: 4,
+                },
+            },
+            crate::OriginIndex(0),
+            crate::lowering::OperationReferenceConstraint {
+                parameter_types: &[Some(crate::ScalarType::Int), Some(crate::ScalarType::Int)],
+                result_type: Some(crate::ScalarType::Int),
+            },
+            &mut crate::lowering::DiagnosticReservations::default(),
+        ));
+        let source = emit("add[1 2]\n");
+        assert!(source.contains(&format!(
+            "static int fw_kernel_{}(",
+            reference.implementation_id
+        )));
+        assert!(source.contains(&format!(
+            "static int fw_impl_{}(",
+            reference.implementation_id
+        )));
         assert!(!source.contains("primitive=="));
     }
 
@@ -1796,6 +2524,52 @@ mod ir_tests {
                 &["3"],
             ),
             ("parameters[x Int]\ninc[x]\n", &["9223372036854775807"]),
+            ("div[(8 9 10) (2 0 5)]\n", &[]),
+            ("div[-9223372036854775808 -1]\n", &[]),
+            ("length[(true false true)]\n", &[]),
+            ("parameters[n Int]\nlength iota n\n", &["3"]),
+            ("sort[(true false true false)]\n", &[]),
+            ("sort[(3 -1 3 0)]\n", &[]),
+            ("sort[(nan inf -0.0 0.0 -inf)]\n", &[]),
+            ("parameters[n Int]\nsort iota n\n", &["3"]),
+            ("sum[(1 2 3 -4)]\n", &[]),
+            ("sum[(1e16 1.0 -1e16)]\n", &[]),
+            ("sum[(inf -inf)]\n", &[]),
+            ("sum[(9223372036854775807 1 -1)]\n", &[]),
+            ("parameters[n Int]\nsum iota n\n", &["3"]),
+            ("all_of[Bool()]\n", &[]),
+            ("all_of[(true true false true)]\n", &[]),
+            ("parameters[n Int]\nall_of equals[iota n iota n]\n", &["3"]),
+            ("any_of[Bool()]\n", &[]),
+            ("any_of[(false false true false)]\n", &[]),
+            (
+                "parameters[n Int]\nany_of not equals[iota n iota n]\n",
+                &["3"],
+            ),
+            ("none_of[Bool()]\n", &[]),
+            ("none_of[(false false true false)]\n", &[]),
+            (
+                "parameters[n Int]\nnone_of not equals[iota n iota n]\n",
+                &["3"],
+            ),
+            ("foldl[@and true Bool()]\n", &[]),
+            ("foldl[@and true (true false true)]\n", &[]),
+            ("foldl[@sub 20 (3 4 5)]\n", &[]),
+            ("foldl[@add 1 (2.5 3.5)]\n", &[]),
+            ("parameters[n Int]\nfoldl[@add 0 iota[n]]\n", &["3"]),
+            ("foldl[@add 9223372036854775807 (1)]\n", &[]),
+            ("foldl[@div 8 (2 0 4)]\n", &[]),
+            (
+                "foldl[@add 0 (1 2)]\nfoldl[@add 9223372036854775807 (1)]\n",
+                &[],
+            ),
+            ("scanl[@and true Bool()]\n", &[]),
+            ("scanl[@and true (true false true)]\n", &[]),
+            ("scanl[@sub 20 (3 4 5)]\n", &[]),
+            ("scanl[@add 1 (2.5 3.5)]\n", &[]),
+            ("parameters[n Int]\nscanl[@add 0 iota[n]]\n", &["3"]),
+            ("scanl[@add 9223372036854775807 (1)]\n", &[]),
+            ("scanl[@div 8 (2 0 4)]\n", &[]),
             ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
         ];
         for (source, arguments) in corpus {
@@ -1812,6 +2586,259 @@ mod ir_tests {
         };
         let source = "parameters[n Int]\n1\niota[n]\n";
         assert_public_generated_matches_direct(source, &["3"], resource_configuration);
+
+        let length_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(3),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "parameters[n Int]\nlength iota n\n",
+            &["3"],
+            length_work_configuration,
+        );
+
+        let sort_live_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_live_evaluation_bytes: Some(47),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct("sort[(3 1 2)]\n", &[], sort_live_configuration);
+
+        let sort_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "sort[(3 1 2)]\n",
+            &[],
+            sort_allocation_configuration,
+        );
+
+        let sum_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(5),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "parameters[n Int]\nsum iota n\n",
+            &["3"],
+            sum_work_configuration,
+        );
+
+        let sum_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct("sum[(1 2 3)]\n", &[], sum_allocation_configuration);
+
+        let all_of_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(2),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "all_of[(false true true)]\n",
+            &[],
+            all_of_work_configuration,
+        );
+
+        let all_of_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "all_of[(false true true)]\n",
+            &[],
+            all_of_allocation_configuration,
+        );
+
+        let any_of_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(2),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "any_of[(true false false)]\n",
+            &[],
+            any_of_work_configuration,
+        );
+
+        let any_of_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "any_of[(true false false)]\n",
+            &[],
+            any_of_allocation_configuration,
+        );
+
+        let none_of_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(2),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "none_of[(true false false)]\n",
+            &[],
+            none_of_work_configuration,
+        );
+
+        let none_of_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "none_of[(true false false)]\n",
+            &[],
+            none_of_allocation_configuration,
+        );
+
+        let foldl_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(2),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "foldl[@div 8 (2 0 4)]\n",
+            &[],
+            foldl_work_configuration,
+        );
+
+        let foldl_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "foldl[@add 7 Int()]\n",
+            &[],
+            foldl_allocation_configuration,
+        );
+
+        let scanl_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(2),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "scanl[@div 8 (2 0 4)]\n",
+            &[],
+            scanl_work_configuration,
+        );
+
+        let scanl_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "scanl[@add 7 (1 2)]\n",
+            &[],
+            scanl_allocation_configuration,
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn randomized_sort_corpus_matches_direct_ir_by_exact_output_bits() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let double_values = [
+            "nan",
+            "inf",
+            "-inf",
+            "-0.0",
+            "0.0",
+            "-3.5",
+            "2.25",
+            "5e-324",
+            "-1.7976931348623157e308",
+        ];
+        let mut source = String::new();
+        for case in 0..72 {
+            let length = (next() % 18) as usize;
+            match case % 3 {
+                0 if length == 0 => source.push_str("sort[Bool()]\n"),
+                0 => {
+                    source.push_str("sort[(");
+                    for index in 0..length {
+                        if index != 0 {
+                            source.push(' ');
+                        }
+                        source.push_str(if next() & 1 == 0 { "false" } else { "true" });
+                    }
+                    source.push_str(")]\n");
+                }
+                1 if length == 0 => source.push_str("sort[Int()]\n"),
+                1 => {
+                    source.push_str("sort[(");
+                    for index in 0..length {
+                        if index != 0 {
+                            source.push(' ');
+                        }
+                        let value = i64::try_from(next() % 401).unwrap_or(0) - 200;
+                        write!(source, "{value}").expect("write randomized Int source");
+                    }
+                    source.push_str(")]\n");
+                }
+                _ if length == 0 => source.push_str("sort[Double()]\n"),
+                _ => {
+                    source.push_str("sort[(");
+                    for index in 0..length {
+                        if index != 0 {
+                            source.push(' ');
+                        }
+                        let value = (next() as usize) % double_values.len();
+                        source.push_str(double_values[value]);
+                    }
+                    source.push_str(")]\n");
+                }
+            }
+        }
+        assert_public_generated_matches_direct(&source, &[], EvaluationConfiguration::default());
     }
 
     #[cfg(not(windows))]
@@ -1898,11 +2925,16 @@ mod ir_tests {
     fn all_direct_selected_kernels_compile_strictly_and_match_direct_ir() {
         let source = "inc[1]\ninc[1.5]\ndec[1]\ndec[1.5]\nneg[1]\nneg[1.5]\n\
              abs[-1]\nabs[-1.5]\nadd[1 2]\nadd[1.0 2.0]\nsub[2 1]\nsub[2.0 1.0]\n\
-             mul[2 3]\nmul[2.0 3.0]\nequals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
+             mul[2 3]\nmul[2.0 3.0]\ndiv[7 3]\ndiv[7.0 3.0]\n\
+             equals[true false]\nequals[1 2]\nequals[1.0 2.0]\n\
              not_equals[true false]\nnot_equals[1 2]\nnot_equals[1.0 2.0]\nnot[true]\n\
              and[true false]\nor[true false]\nodd[3]\neven[4]\nis_positive[1]\n\
              is_positive[1.0]\nis_negative[-1]\nis_negative[-1.0]\nless_than[1 2]\n\
-             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n";
+             less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
+             length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
+             sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n\
+             sum[(1 2)]\nsum[(1.0 2.0)]\nall_of[(true false)]\nany_of[(true false)]\n\
+             none_of[(true false)]\n";
         let configuration = EvaluationConfiguration::default();
         assert_public_generated_matches_direct(source, &[], configuration);
     }

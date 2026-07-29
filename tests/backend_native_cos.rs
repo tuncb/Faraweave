@@ -134,29 +134,29 @@ fn cos_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
         selections,
         vec![
             (
-                40,
-                40,
+                59,
+                59,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::Identity,
             ),
             (
-                40,
-                40,
+                59,
+                59,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                40,
-                40,
+                59,
+                59,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                40,
-                40,
+                59,
+                59,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
@@ -398,7 +398,7 @@ fn cos_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     );
 
     let node = cos_node(&bytes);
-    for (relative, replacement) in [(24, 33_u32), (28, 39), (32, 39)] {
+    for (relative, replacement) in [(24, 33_u32), (28, 58), (32, 58)] {
         let mut malformed = bytes.clone();
         malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
         let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
@@ -452,6 +452,6 @@ fn cos_emitted_c_calls_math_h_cos_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=cos(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_cos(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_40("));
-    assert!(source.contains("static int fw_impl_40("));
+    assert!(source.contains("static int fw_kernel_59("));
+    assert!(source.contains("static int fw_impl_59("));
 }

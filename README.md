@@ -13,13 +13,21 @@ structural tuples. The public primitives are:
 | Group | Primitives |
 | --- | --- |
 | Checked numeric unary | `inc`, `dec`, `neg`, `abs` |
-| Checked numeric dyadic | `add`, `sub`, `mul` |
+| Checked numeric dyadic | `add`, `sub`, `mul`, `div` |
 | Equality and logic | `equals`, `not_equals`, `not`, `and`, `or` |
 | Integer predicates | `odd`, `even` |
 | Numeric predicates | `is_positive`, `is_negative` |
 | Numeric ordering | `less_than`, `greater_than` |
 | Backend-native numeric unary | `sqrt`, `exp`, `log` (natural logarithm), `log10`, `sin`, `cos`, `tan`, `floor` |
 | Structural constructor | `iota` |
+| Container query | `length` |
+| Container transform | `sort` |
+| Numeric reduction | `sum` |
+| Boolean reduction | `all_of` |
+| Boolean reduction | `any_of` |
+| Boolean reduction | `none_of` |
+| Explicit-initializer reduction | `foldl` |
+| Seed-inclusive scan | `scanl` |
 
 Calls use adjacent brackets (`sub[10 2.5]`) or right-associative prefix syntax
 (`inc iota 3`). Vectors use parentheses: `(1 2 3)`, `(false true)`,
@@ -37,9 +45,55 @@ This produces `[(2 3 4) (11 12 13)]`.
 Elementwise calls broadcast scalars over vectors and require equal vector
 lengths. Singleton vectors stay vectors. Exact overloads win; the only
 conversion is `Int` to `Double`. Integer arithmetic is checked and publishes no
-partial result on overflow. Double results canonicalize NaNs; signed zero,
-infinities, gradual underflow, and IEEE unordered comparisons are preserved.
-Canonical output includes visible `.0` for integral Doubles.
+partial result on overflow; integer `div` truncates toward zero and reports
+division by zero as a structured domain error. Double results canonicalize
+NaNs; signed zero, infinities, gradual underflow, IEEE division, and unordered
+comparisons are preserved. Canonical output includes visible `.0` for integral
+Doubles.
+
+`length` accepts a homogeneous Bool, Int, or Double vector, including a typed
+empty or dynamically sized vector, and returns its element count as an Int. It
+borrows the existing vector without copying it and charges one semantic work
+unit independently of the vector length.
+
+`sort` accepts those same vector types and returns a newly owned ascending
+vector without mutating its input. Bool and Int use their ordinary order;
+Double uses a total bit-defined order with `-0.0` before `0.0` and canonical
+NaN after positive infinity, while semantic work is exactly the input length.
+
+`sum` accepts an Int or Double vector and reduces it left-to-right from typed
+zero. Int addition is checked at every element; Double addition uses the
+strict binary64 arithmetic contract without reassociation, and the complete
+input length is charged as work before reduction.
+
+`all_of` accepts a Bool vector and returns true exactly when every element is
+true, including the empty-vector identity. Implementations may stop inspecting
+after the first false element, but they charge the complete input length before
+inspection so work limits and resource observers cannot reveal its position.
+
+`any_of` accepts a Bool vector and returns true exactly when at least one
+element is true, with false as the empty-vector identity. Implementations may
+stop inspecting after the first true element only after charging the complete
+input length, keeping work limits and resource observers position-independent.
+
+`none_of` accepts a Bool vector and returns true exactly when every element is
+false, including the empty vector. It has its own selected identity,
+diagnostics, and resource producer while using the same complete-length work
+admission before an optional first-true short circuit.
+
+`foldl[@add init vector]` accepts a closed registered binary operation
+reference, a scalar initializer, and a homogeneous Bool, Int, or Double vector.
+It applies the reducer strictly left-to-right, returns the initializer without
+invoking the reducer for an empty vector, and charges the full vector length as
+work before the first step. Reducer overloads and the only permitted
+initializer promotion (`Int` to `Double`) are fixed during lowering; no backend
+performs runtime name lookup.
+
+`scanl[@add init vector]` uses the same closed reducer selection but returns
+every accumulator, starting with the converted initializer. Its result length
+is the checked input length plus one, so an empty vector returns a one-element
+vector; output bytes and complete input-length work are admitted together
+before the seed is written or any reducer step runs.
 
 `sqrt`, `exp`, natural logarithm `log`, base-10 logarithm `log10`, `sin`,
 `cos`, `tan`, and `floor` accept Double scalars and vectors, with the existing
@@ -81,6 +135,31 @@ cargo run -- emit-c-ir rewrite.fwir -o rewrite-from-ir.c
 cargo run -- build-ir rewrite.fwir -o rewrite-from-ir
 ```
 
+Within the REPL, `.internal` prints a read-only view of the production semantic
+registry for overload and lifting diagnosis. Its human-readable text is an
+internal troubleshooting aid, not a stable machine-readable format or
+compatibility contract.
+
+The REPL command `.history` prints the current process session's retained input
+with absolute entry numbers. Every nonempty submitted line is included exactly
+after LF or CRLF removal, including space/tab-only lines, failed expressions,
+and `.history` itself; the oldest entries are evicted to retain at most 100
+entries and 65,536 UTF-8 bytes. History is not persisted, and line navigation
+and `.clear` are not provided.
+
+Inside the REPL, the exact case-sensitive `.cls` meta-command clears and homes
+interactive Windows consoles or ANSI terminals with a nonempty, non-`dumb`
+`TERM`; Windows PTYs that are not native console screen buffers use the ANSI
+path. Redirected output remains byte-clean, while unsupported terminals and
+terminal failures produce a deterministic diagnostic and leave the session
+running.
+
+In the REPL, `.exit` ends the session successfully without evaluating source.
+Matching is case-sensitive and exact after removing the line ending and
+ignoring surrounding ASCII spaces or tabs; arguments, prefixes, and trailing
+source comments do not match the command. End-of-file also ends the session
+successfully.
+
 `emit-c` writes deterministic self-contained strict C11. `build` selects the C
 compiler in this order: explicit `--cc`, `CC`, then `cc` on Unix or `cl.exe` on
 Windows. Compiler values are executable names or paths, not shell fragments.
@@ -103,11 +182,16 @@ and `build_native_from_verified_program`. Named compilation retains a logical
 source name inside the artifact so later execution diagnostics do not depend
 on the artifact's filesystem path.
 
-FWIR v1 commits to physical format 1.0, semantic contract 1.1, `.fwir`, and
-the documented API and CLI spellings. The canonical semantic-1.0 corpus
-remains accepted and round-trips byte-for-byte. Artifacts that use the
-backend-native math identities carry the known mandatory feature
-`7=BackendNativeMathV1`; artifacts without those identities need not carry it.
+FWIR v1 commits to physical formats 1.0 and 1.1, semantic contract 1.1,
+`.fwir`, and the documented API and CLI spellings. The canonical
+semantic/physical-1.0 corpus remains accepted and round-trips byte-for-byte.
+Artifacts that use explicit application plans carry mandatory feature
+`5=ApplicationPlans` and physical format 1.1; artifacts that use the
+stable operation-reference sidecar carry mandatory feature
+`6=OperationReferences` and physical format 1.1; artifacts that use the
+backend-native math identities carry mandatory feature
+`7=BackendNativeMathV1`. Artifacts without these capabilities need not carry
+the corresponding feature.
 Unknown class-1 advisory features and explicitly optional, non-identity
 forward-minor sections may be skipped. Unknown mandatory semantics,
 unsupported semantic minors, and other unsupported current-minor extensions
@@ -211,8 +295,10 @@ Anka is inspiration, not a compatibility target. Faraweave keeps explicit
 bracket calls, checked Int64 arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit
-currying, functions, effects, reductions, multidimensional arrays, `length`,
-or `divide`.
+currying, functions, effects, reductions other than `sum`, `all_of`, `any_of`,
+`none_of`, explicit-initializer `foldl`, and seed-inclusive `scanl`,
+multidimensional arrays, or container-wide operations other than `length`,
+`sort`, `sum`, `all_of`, `any_of`, `none_of`, `foldl`, and `scanl`.
 
 Rust enums and vectors replace C++ tagged/plain records at the public boundary.
 Ordinary syntax remains visibly separated by parse, resolution, analysis, and

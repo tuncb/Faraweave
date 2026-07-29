@@ -17,6 +17,7 @@ pub(crate) enum Binary64Operation {
     Add,
     Subtract,
     Multiply,
+    Divide,
 }
 
 pub(crate) fn int_to_binary64(value: i64) -> f64 {
@@ -58,21 +59,23 @@ pub(crate) fn arithmetic(left: f64, right: f64, operation: Binary64Operation) ->
     let left_bits = left.to_bits();
     let right_bits = right.to_bits();
     let signs_differ = (left_bits ^ right_bits) & SIGN_MASK != 0;
-    let invalid_infinity_arithmetic = is_infinity_bits(left_bits)
-        && is_infinity_bits(right_bits)
-        && match operation {
-            Binary64Operation::Add => signs_differ,
-            Binary64Operation::Subtract => !signs_differ,
-            Binary64Operation::Multiply => false,
-        };
-    let invalid_infinity_product = matches!(operation, Binary64Operation::Multiply)
-        && ((is_infinity_bits(left_bits) && is_zero_bits(right_bits))
-            || (is_zero_bits(left_bits) && is_infinity_bits(right_bits)));
-    if is_nan_bits(left_bits)
-        || is_nan_bits(right_bits)
-        || invalid_infinity_arithmetic
-        || invalid_infinity_product
-    {
+    let invalid_operation = match operation {
+        Binary64Operation::Add => {
+            is_infinity_bits(left_bits) && is_infinity_bits(right_bits) && signs_differ
+        }
+        Binary64Operation::Subtract => {
+            is_infinity_bits(left_bits) && is_infinity_bits(right_bits) && !signs_differ
+        }
+        Binary64Operation::Multiply => {
+            (is_infinity_bits(left_bits) && is_zero_bits(right_bits))
+                || (is_zero_bits(left_bits) && is_infinity_bits(right_bits))
+        }
+        Binary64Operation::Divide => {
+            (is_zero_bits(left_bits) && is_zero_bits(right_bits))
+                || (is_infinity_bits(left_bits) && is_infinity_bits(right_bits))
+        }
+    };
+    if is_nan_bits(left_bits) || is_nan_bits(right_bits) || invalid_operation {
         return f64::from_bits(CANONICAL_NAN_BITS);
     }
 
@@ -88,6 +91,7 @@ pub(crate) fn arithmetic(left: f64, right: f64, operation: Binary64Operation) ->
             Binary64Operation::Add => strict_left + strict_right,
             Binary64Operation::Subtract => strict_left - strict_right,
             Binary64Operation::Multiply => strict_left * strict_right,
+            Binary64Operation::Divide => strict_left / strict_right,
         };
         let result = core::ptr::read_volatile(&strict_result);
         core::ptr::write_volatile(&mut strict_result, 0.0);
@@ -438,6 +442,27 @@ compile_error!("Faraweave requires an x86-64 or AArch64 floating-point environme
 mod tests {
     use super::*;
 
+    const AARCH64_EXCEPTION_ENABLE_MASK: u64 = 0x0000_9f00;
+    const AARCH64_ROUNDING_FZ_DN_MASK: u64 = 0x00c0_0000 | 0x0300_0000;
+    #[cfg(target_arch = "aarch64")]
+    const AARCH64_STATUS_MASK: u64 = 0x0000_009f;
+
+    fn aarch64_nontrapping_hostile_control(original: u64) -> u64 {
+        (original & !AARCH64_EXCEPTION_ENABLE_MASK) | AARCH64_ROUNDING_FZ_DN_MASK
+    }
+
+    #[test]
+    fn aarch64_hostile_probe_control_is_nontrapping() {
+        for original in [0, AARCH64_EXCEPTION_ENABLE_MASK, u64::MAX] {
+            let hostile = aarch64_nontrapping_hostile_control(original);
+            assert_eq!(hostile & AARCH64_EXCEPTION_ENABLE_MASK, 0);
+            assert_eq!(
+                hostile & AARCH64_ROUNDING_FZ_DN_MASK,
+                AARCH64_ROUNDING_FZ_DN_MASK
+            );
+        }
+    }
+
     #[test]
     fn integer_conversion_matches_every_normative_boundary() {
         let cases = [
@@ -493,6 +518,31 @@ mod tests {
                 Binary64Operation::Multiply,
                 0x7ff0_0000_0000_0000,
                 0,
+                CANONICAL_NAN_BITS,
+            ),
+            (
+                Binary64Operation::Divide,
+                0x0000_0000_0000_0002,
+                0x4000_0000_0000_0000,
+                0x0000_0000_0000_0001,
+            ),
+            (
+                Binary64Operation::Divide,
+                0x3ff0_0000_0000_0000,
+                0x8000_0000_0000_0000,
+                0xfff0_0000_0000_0000,
+            ),
+            (
+                Binary64Operation::Divide,
+                0x8000_0000_0000_0000,
+                0x4000_0000_0000_0000,
+                0x8000_0000_0000_0000,
+            ),
+            (Binary64Operation::Divide, 0, 0, CANONICAL_NAN_BITS),
+            (
+                Binary64Operation::Divide,
+                0x7ff0_0000_0000_0000,
+                0x7ff0_0000_0000_0000,
                 CANONICAL_NAN_BITS,
             ),
         ];
@@ -698,9 +748,9 @@ mod tests {
                 backend_native_floor(f64::from_bits(0x8000_0000_0000_0001)).to_bits();
             let after_floor = read_mxcsr();
             let result = arithmetic(
-                f64::from_bits(0x0000_0000_0000_0001),
+                f64::from_bits(0x0000_0000_0000_0002),
                 2.0,
-                Binary64Operation::Multiply,
+                Binary64Operation::Divide,
             )
             .to_bits();
             let restored = read_mxcsr();
@@ -721,7 +771,7 @@ mod tests {
             assert_eq!(after_tan, hostile);
             assert_eq!(floor_result, reference_floor);
             assert_eq!(after_floor, hostile);
-            assert_eq!(result, 0x0000_0000_0000_0002);
+            assert_eq!(result, 0x0000_0000_0000_0001);
             assert_eq!(restored, hostile);
         }
     }
@@ -757,10 +807,10 @@ mod tests {
             }
         }
 
-        // SAFETY: the hostile values are derived from a valid captured state
-        // and set only documented exception-enable, rounding, FZ/DN, and
-        // cumulative-status fields. The original pair is restored before any
-        // assertion or test return.
+        // SAFETY: the hostile values are derived from a valid captured state,
+        // keep every exception trap disabled while arithmetic runs, and set
+        // only documented rounding, FZ/DN, and cumulative-status fields. The
+        // original pair is restored before any assertion or test return.
         unsafe {
             let reference_sqrt = backend_native_sqrt(f64::from_bits(1)).to_bits();
             let reference_exp = backend_native_exp(-744.0).to_bits();
@@ -778,10 +828,20 @@ mod tests {
             )
             .to_bits();
             let original = read_environment();
-            let requested_control = original.0 | 0x0000_9f00 | 0x00c0_0000 | 0x0300_0000;
-            let requested_status = original.1 | 0x0000_009f;
+            let requested_control = aarch64_nontrapping_hostile_control(original.0);
+            let requested_status = original.1 | AARCH64_STATUS_MASK;
             write_environment(requested_control, requested_status);
             let hostile = read_environment();
+
+            let traps_disabled = hostile.0 & AARCH64_EXCEPTION_ENABLE_MASK == 0;
+            if !traps_disabled {
+                write_environment(original.0, original.1);
+                assert!(traps_disabled, "AArch64 exception traps remained enabled");
+            }
+            let hostile_control_matches = hostile.0 & AARCH64_ROUNDING_FZ_DN_MASK
+                == requested_control & AARCH64_ROUNDING_FZ_DN_MASK;
+            let hostile_status_matches =
+                hostile.1 & AARCH64_STATUS_MASK == requested_status & AARCH64_STATUS_MASK;
 
             let sqrt_result = backend_native_sqrt(f64::from_bits(1)).to_bits();
             let after_sqrt = read_environment();
@@ -809,11 +869,9 @@ mod tests {
             let after_arithmetic = read_environment();
             write_environment(original.0, original.1);
 
-            assert_eq!(
-                hostile.0 & (0x00c0_0000 | 0x0300_0000),
-                requested_control & (0x00c0_0000 | 0x0300_0000)
-            );
-            assert_eq!(hostile.1 & 0x0000_009f, requested_status & 0x0000_009f);
+            assert!(traps_disabled);
+            assert!(hostile_control_matches);
+            assert!(hostile_status_matches);
             assert_eq!(sqrt_result, reference_sqrt);
             assert_eq!(after_sqrt, hostile);
             assert_eq!(exp_result, reference_exp);
