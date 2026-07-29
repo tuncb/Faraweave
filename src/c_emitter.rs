@@ -297,6 +297,22 @@ impl<'a> IrCGenerator<'a> {
                 .map_err(|_| emission_error())?;
                 continue;
             }
+            if descriptor.kernel == ScalarKernel::NoneOfBoolVector {
+                if descriptor.application_plan.result_cardinality
+                    != crate::semantic_registry::ResultCardinality::Scalar
+                    || descriptor.application_plan.resources.work
+                        != crate::semantic_registry::WorkAdmission::OperandCardinality(1)
+                {
+                    return Err(emission_error());
+                }
+                writeln!(
+                    self.definitions,
+                    "static int fw_impl_{implementation}(const FWV *args,size_t count,FWV *out,size_t line,size_t column,const size_t (*origins)[2],size_t origin_count,size_t static_anchor,const size_t *shape_checks,size_t shape_count,const int *conversions,int lift) {{ (void)count;(void)origins;(void)origin_count;(void)static_anchor;(void)shape_checks;(void)shape_count;(void)conversions;(void)lift; return fw_apply_selected_none_of({},args,out,line,column); }}",
+                    c_string(descriptor.primitive_name),
+                )
+                .map_err(|_| emission_error())?;
+                continue;
+            }
             self.emit_selected_kernel(implementation, descriptor.kernel)?;
             writeln!(
                 self.definitions,
@@ -404,6 +420,7 @@ impl<'a> IrCGenerator<'a> {
             | ScalarKernel::SumDoubleVector
             | ScalarKernel::AllOfBoolVector
             | ScalarKernel::AnyOfBoolVector
+            | ScalarKernel::NoneOfBoolVector
             | ScalarKernel::IotaInt => return Err(emission_error()),
         };
         writeln!(
@@ -1375,6 +1392,16 @@ static int fw_apply_selected_any_of(const char *name,const FWV *args,FWV *out,
   }
   fw_set_bool(out,0);return 1;
 }
+static int fw_apply_selected_none_of(const char *name,const FWV *args,FWV *out,
+                                     size_t line,size_t column) {
+  const unsigned char *values=(const unsigned char *)args[0].data;
+  size_t index;
+  if(!fw_charge_work(args[0].len,name,line,column))return 0;
+  for(index=0U;index<args[0].len;++index){
+    if(values[index]!=0U){fw_set_bool(out,0);return 1;}
+  }
+  fw_set_bool(out,1);return 1;
+}
 typedef struct { char *data; size_t size, capacity; } FWBuffer;
 static int fw_append(FWBuffer *buffer,const char *text) {
   size_t n=strlen(text),needed; char *grown;
@@ -1549,6 +1576,7 @@ static int fw_main(int argc,char **argv,size_t root_count,const FWExpr *roots) {
   (void)fw_apply_selected_sum_double;
   (void)fw_apply_selected_all_of;
   (void)fw_apply_selected_any_of;
+  (void)fw_apply_selected_none_of;
   (void)fw_selected_integer_overflow;
   (void)fw_selected_division_by_zero;
   (void)fw_as_double;
@@ -1779,7 +1807,8 @@ mod ir_tests {
              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
              length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
              sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n\
-             sum[(1 2)]\nsum[(1.0 2.0)]\nall_of[(true false)]\nany_of[(true false)]\n",
+             sum[(1 2)]\nsum[(1.0 2.0)]\nall_of[(true false)]\nany_of[(true false)]\n\
+             none_of[(true false)]\n",
         );
         for implementation in (1..=36).filter(|implementation| *implementation != 34) {
             assert!(
@@ -1830,6 +1859,12 @@ mod ir_tests {
         assert!(source.contains("fw_impl_46(const FWV *args"));
         assert_eq!(
             source.matches("return fw_apply_selected_any_of(").count(),
+            1
+        );
+        assert!(source.contains("static int fw_impl_47("));
+        assert!(source.contains("fw_impl_47(const FWV *args"));
+        assert_eq!(
+            source.matches("return fw_apply_selected_none_of(").count(),
             1
         );
         assert!(!source.contains("fw_apply_scalar"));
@@ -1924,6 +1959,30 @@ mod ir_tests {
             matches!((work, loop_start, decisive), (Some(work), Some(loop_start), Some(decisive)) if work < loop_start && loop_start < decisive)
         );
         assert!(runtime.contains("fw_set_bool(out,0)"));
+        assert!(!runtime.contains("fw_make_vector"));
+        assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
+    }
+
+    #[test]
+    fn none_of_has_independent_dispatch_and_charges_before_short_circuit() {
+        let source = emit("none_of[(false true false)]\n");
+        assert!(
+            source.contains("return fw_apply_selected_none_of(\"none_of\",args,out,line,column)")
+        );
+        assert!(source.contains("static int fw_impl_47("));
+        let runtime = source
+            .split("static int fw_apply_selected_none_of")
+            .nth(1)
+            .and_then(|tail| tail.split("typedef struct { char *data").next())
+            .unwrap_or("");
+        let work = runtime.find("fw_charge_work(args[0].len,name,line,column)");
+        let loop_start = runtime.find("for(index=0U;index<args[0].len;++index)");
+        let decisive = runtime.find("if(values[index]!=0U)");
+        assert!(
+            matches!((work, loop_start, decisive), (Some(work), Some(loop_start), Some(decisive)) if work < loop_start && loop_start < decisive)
+        );
+        assert!(runtime.contains("fw_set_bool(out,1)"));
+        assert!(!runtime.contains("fw_apply_selected_any_of"));
         assert!(!runtime.contains("fw_make_vector"));
         assert!(!source.contains("fw_scalar_at_selected(&args[0]"));
     }
@@ -2169,6 +2228,12 @@ mod ir_tests {
                 "parameters[n Int]\nany_of not equals[iota n iota n]\n",
                 &["3"],
             ),
+            ("none_of[Bool()]\n", &[]),
+            ("none_of[(false false true false)]\n", &[]),
+            (
+                "parameters[n Int]\nnone_of not equals[iota n iota n]\n",
+                &["3"],
+            ),
             ("parameters[n Int]\nadd[iota[n] iota[2]]\n", &["3"]),
         ];
         for (source, arguments) in corpus {
@@ -2294,6 +2359,32 @@ mod ir_tests {
             "any_of[(true false false)]\n",
             &[],
             any_of_allocation_configuration,
+        );
+
+        let none_of_work_configuration = EvaluationConfiguration {
+            profile: crate::ExecutionProfile::BoundedV2,
+            limits: crate::ResourceLimits {
+                max_work_units: Some(2),
+                ..crate::ResourceLimits::default()
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "none_of[(true false false)]\n",
+            &[],
+            none_of_work_configuration,
+        );
+
+        let none_of_allocation_configuration = EvaluationConfiguration {
+            allocation_failure: crate::AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        };
+        assert_public_generated_matches_direct(
+            "none_of[(true false false)]\n",
+            &[],
+            none_of_allocation_configuration,
         );
     }
 
@@ -2454,7 +2545,8 @@ mod ir_tests {
              less_than[1.0 2.0]\ngreater_than[2 1]\ngreater_than[2.0 1.0]\niota[3]\n\
              length[(true false)]\nlength[(1 2)]\nlength[(1.0 2.0)]\n\
              sort[(true false)]\nsort[(2 1)]\nsort[(2.0 1.0)]\n\
-             sum[(1 2)]\nsum[(1.0 2.0)]\nall_of[(true false)]\nany_of[(true false)]\n";
+             sum[(1 2)]\nsum[(1.0 2.0)]\nall_of[(true false)]\nany_of[(true false)]\n\
+             none_of[(true false)]\n";
         let configuration = EvaluationConfiguration::default();
         assert_public_generated_matches_direct(source, &[], configuration);
     }

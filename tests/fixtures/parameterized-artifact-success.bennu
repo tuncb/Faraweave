@@ -8,5 +8,6 @@ sort iota count
 sum iota count
 all_of equals[iota count iota count]
 any_of equals[iota count iota count]
+none_of not equals[iota count iota count]
 add[ratio count]
 not[enabled]
