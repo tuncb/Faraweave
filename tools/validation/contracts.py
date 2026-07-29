@@ -17,6 +17,8 @@ import re
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+CHECKOUT_ACTION_REVISION = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+DEPRECATED_NODE20_CHECKOUT_REVISION = "11bd71901bbe5b1630ceea73d27597364c9af683"
 
 def require(condition: bool, message: str) -> None:
     if not condition:
@@ -30,6 +32,11 @@ def static_contracts() -> None:
     require('channel = "1.97.1"' in toolchain and "clippy" in toolchain, "toolchain pin")
     main = (ROOT / ".github/workflows/main.yml").read_text()
     validate_main_workflow(main)
+    workflows = {
+        str(path.relative_to(ROOT)): path.read_text()
+        for path in sorted((ROOT / ".github/workflows").glob("*.y*ml"))
+    }
+    validate_action_pins(workflows)
     validate_release_workflows()
     validate_fwir_conformance()
     validate_product_cutover()
@@ -86,6 +93,52 @@ def validate_main_workflow_without_mutations(text: str, required: list[str]) -> 
     for needle in required:
         if needle not in text:
             raise AssertionError(needle)
+
+
+def validate_action_pins(workflows: dict[str, str]) -> None:
+    try:
+        validate_action_pins_without_mutations(workflows)
+    except AssertionError as error:
+        raise SystemExit(str(error)) from error
+
+    for relative, text in workflows.items():
+        checkout = f"actions/checkout@{CHECKOUT_ACTION_REVISION}"
+        if checkout not in text:
+            continue
+        parts = text.split(checkout)
+        for occurrence in range(len(parts) - 1):
+            mutated = dict(workflows)
+            mutated[relative] = (
+                checkout.join(parts[: occurrence + 1])
+                + f"actions/checkout@{DEPRECATED_NODE20_CHECKOUT_REVISION}"
+                + checkout.join(parts[occurrence + 1 :])
+            )
+            try:
+                validate_action_pins_without_mutations(mutated)
+            except AssertionError:
+                continue
+            raise SystemExit(
+                "workflow checkout revision negative mutation survived: "
+                f"{relative} occurrence {occurrence + 1}"
+            )
+
+
+def validate_action_pins_without_mutations(workflows: dict[str, str]) -> None:
+    checkout_revisions = []
+    for relative, text in workflows.items():
+        for action, revision in re.findall(r"uses:\s*([^@\s]+)@([^\s]+)", text):
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise AssertionError(
+                    f"{relative} action {action} is not pinned by a full commit"
+                )
+            if action == "actions/checkout":
+                checkout_revisions.append(revision)
+    if not checkout_revisions:
+        raise AssertionError("workflows have no actions/checkout usage")
+    if any(revision != CHECKOUT_ACTION_REVISION for revision in checkout_revisions):
+        raise AssertionError(
+            "workflows do not pin actions/checkout to the approved Node 24 revision"
+        )
 
 
 def validate_release_workflows() -> None:
