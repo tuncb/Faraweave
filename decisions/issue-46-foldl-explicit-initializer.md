@@ -1,0 +1,3 @@
+# Issue #46 — `foldl` with an explicit initializer
+
+Implementation is based on dependency commit `9f27fa87a86f5c61548a355a8a931f7d56467db9`, which contains #40–#45 and must wait for those predecessors before final integration. Primitive 27 appends Bool, Int, and Double signature/implementation IDs 48–50 plus application-plan ID 9, while `NODE.a7` links each fold to its lowering-selected `OPRF` reducer without runtime name lookup. The complete vector cardinality is charged before strict left-to-right execution, empty input returns the converted initializer, scalar results allocate nothing, and no dependency is added.

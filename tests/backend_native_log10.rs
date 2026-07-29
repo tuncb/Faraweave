@@ -131,29 +131,29 @@ fn log10_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
         selections,
         vec![
             (
-                38,
-                38,
+                57,
+                57,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::Identity,
             ),
             (
-                38,
-                38,
+                57,
+                57,
                 LiftMode::Scalar,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                38,
-                38,
+                57,
+                57,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
             ),
             (
-                38,
-                38,
+                57,
+                57,
                 LiftMode::Vector,
                 ScalarType::Double,
                 Conversion::PromoteIntToDouble,
@@ -390,7 +390,7 @@ fn log10_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     );
 
     let node = log10_node(&bytes);
-    for (relative, replacement) in [(24, 31_u32), (28, 37), (32, 37)] {
+    for (relative, replacement) in [(24, 31_u32), (28, 56), (32, 56)] {
         let mut malformed = bytes.clone();
         malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
         let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
@@ -444,6 +444,6 @@ fn log10_emitted_c_calls_math_h_log10_directly() {
     assert!(source.contains("#include <math.h>"));
     assert!(source.contains("result=log10(input);"));
     assert!(source.contains("fw_set_double(out,fw_backend_native_log10(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_38("));
-    assert!(source.contains("static int fw_impl_38("));
+    assert!(source.contains("static int fw_kernel_57("));
+    assert!(source.contains("static int fw_impl_57("));
 }

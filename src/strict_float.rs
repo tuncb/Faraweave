@@ -17,6 +17,7 @@ pub(crate) enum Binary64Operation {
     Add,
     Subtract,
     Multiply,
+    Divide,
 }
 
 pub(crate) fn int_to_binary64(value: i64) -> f64 {
@@ -58,21 +59,23 @@ pub(crate) fn arithmetic(left: f64, right: f64, operation: Binary64Operation) ->
     let left_bits = left.to_bits();
     let right_bits = right.to_bits();
     let signs_differ = (left_bits ^ right_bits) & SIGN_MASK != 0;
-    let invalid_infinity_arithmetic = is_infinity_bits(left_bits)
-        && is_infinity_bits(right_bits)
-        && match operation {
-            Binary64Operation::Add => signs_differ,
-            Binary64Operation::Subtract => !signs_differ,
-            Binary64Operation::Multiply => false,
-        };
-    let invalid_infinity_product = matches!(operation, Binary64Operation::Multiply)
-        && ((is_infinity_bits(left_bits) && is_zero_bits(right_bits))
-            || (is_zero_bits(left_bits) && is_infinity_bits(right_bits)));
-    if is_nan_bits(left_bits)
-        || is_nan_bits(right_bits)
-        || invalid_infinity_arithmetic
-        || invalid_infinity_product
-    {
+    let invalid_operation = match operation {
+        Binary64Operation::Add => {
+            is_infinity_bits(left_bits) && is_infinity_bits(right_bits) && signs_differ
+        }
+        Binary64Operation::Subtract => {
+            is_infinity_bits(left_bits) && is_infinity_bits(right_bits) && !signs_differ
+        }
+        Binary64Operation::Multiply => {
+            (is_infinity_bits(left_bits) && is_zero_bits(right_bits))
+                || (is_zero_bits(left_bits) && is_infinity_bits(right_bits))
+        }
+        Binary64Operation::Divide => {
+            (is_zero_bits(left_bits) && is_zero_bits(right_bits))
+                || (is_infinity_bits(left_bits) && is_infinity_bits(right_bits))
+        }
+    };
+    if is_nan_bits(left_bits) || is_nan_bits(right_bits) || invalid_operation {
         return f64::from_bits(CANONICAL_NAN_BITS);
     }
 
@@ -88,6 +91,7 @@ pub(crate) fn arithmetic(left: f64, right: f64, operation: Binary64Operation) ->
             Binary64Operation::Add => strict_left + strict_right,
             Binary64Operation::Subtract => strict_left - strict_right,
             Binary64Operation::Multiply => strict_left * strict_right,
+            Binary64Operation::Divide => strict_left / strict_right,
         };
         let result = core::ptr::read_volatile(&strict_result);
         core::ptr::write_volatile(&mut strict_result, 0.0);
@@ -444,6 +448,31 @@ mod tests {
                 0,
                 CANONICAL_NAN_BITS,
             ),
+            (
+                Binary64Operation::Divide,
+                0x0000_0000_0000_0002,
+                0x4000_0000_0000_0000,
+                0x0000_0000_0000_0001,
+            ),
+            (
+                Binary64Operation::Divide,
+                0x3ff0_0000_0000_0000,
+                0x8000_0000_0000_0000,
+                0xfff0_0000_0000_0000,
+            ),
+            (
+                Binary64Operation::Divide,
+                0x8000_0000_0000_0000,
+                0x4000_0000_0000_0000,
+                0x8000_0000_0000_0000,
+            ),
+            (Binary64Operation::Divide, 0, 0, CANONICAL_NAN_BITS),
+            (
+                Binary64Operation::Divide,
+                0x7ff0_0000_0000_0000,
+                0x7ff0_0000_0000_0000,
+                CANONICAL_NAN_BITS,
+            ),
         ];
         for (operation, left, right, expected) in cases {
             assert_eq!(
@@ -588,9 +617,9 @@ mod tests {
             let sin_result = backend_native_sin(f64::from_bits(0x7e37_e43c_8800_759c)).to_bits();
             let after_sin = read_mxcsr();
             let result = arithmetic(
-                f64::from_bits(0x0000_0000_0000_0001),
+                f64::from_bits(0x0000_0000_0000_0002),
                 2.0,
-                Binary64Operation::Multiply,
+                Binary64Operation::Divide,
             )
             .to_bits();
             let restored = read_mxcsr();
@@ -605,7 +634,7 @@ mod tests {
             assert_eq!(after_log10, hostile);
             assert_eq!(sin_result, reference_sin);
             assert_eq!(after_sin, hostile);
-            assert_eq!(result, 0x0000_0000_0000_0002);
+            assert_eq!(result, 0x0000_0000_0000_0001);
             assert_eq!(restored, hostile);
         }
     }
