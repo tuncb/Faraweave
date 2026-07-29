@@ -98,6 +98,7 @@ pub struct ResourceErrorContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DomainErrorReason {
     IntegerOverflow,
+    DivisionByZero,
 }
 
 #[derive(Clone, Debug, PartialEq)]
