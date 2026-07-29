@@ -135,6 +135,23 @@ pub(crate) fn backend_native_exp(value: f64) -> f64 {
     canonicalize(result)
 }
 
+pub(crate) fn backend_native_log(value: f64) -> f64 {
+    // SAFETY: `StrictEnvironment` saves the complete supported host state,
+    // installs masked round-to-nearest with gradual underflow, and restores the
+    // saved bytes in `Drop`. The volatile input/result keep the direct
+    // `f64::ln` call inside that guard.
+    let result = unsafe {
+        let environment = StrictEnvironment::begin();
+        let strict_value = core::ptr::read_volatile(&value);
+        let mut strict_result = f64::ln(strict_value);
+        let result = core::ptr::read_volatile(&strict_result);
+        core::ptr::write_volatile(&mut strict_result, 0.0);
+        drop(environment);
+        result
+    };
+    canonicalize(result)
+}
+
 pub(crate) fn negate(value: f64) -> f64 {
     canonicalize(f64::from_bits(value.to_bits() ^ SIGN_MASK))
 }
@@ -485,6 +502,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backend_native_log_preserves_exact_special_values_and_canonical_nan() {
+        for (input, expected) in [
+            (0x0000_0000_0000_0000, 0xfff0_0000_0000_0000),
+            (0x8000_0000_0000_0000, 0xfff0_0000_0000_0000),
+            (0x3ff0_0000_0000_0000, 0x0000_0000_0000_0000),
+            (0xbff0_0000_0000_0000, CANONICAL_NAN_BITS),
+            (0xfff0_0000_0000_0000, CANONICAL_NAN_BITS),
+            (0x7ff0_0000_0000_0000, 0x7ff0_0000_0000_0000),
+            (0x7ff8_0000_0000_0000, CANONICAL_NAN_BITS),
+        ] {
+            assert_eq!(
+                backend_native_log(f64::from_bits(input)).to_bits(),
+                expected
+            );
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn hostile_x86_environment_is_ignored_and_exactly_restored() {
@@ -518,6 +553,7 @@ mod tests {
         // the original is restored before any assertion or test return.
         unsafe {
             let reference_exp = backend_native_exp(-744.0).to_bits();
+            let reference_log = backend_native_log(f64::from_bits(1)).to_bits();
             let original = read_mxcsr();
             let hostile = (original | 0x0040 | 0x4000 | 0x8000 | 0x1f80) & !0x003f;
             write_mxcsr(hostile);
@@ -525,6 +561,8 @@ mod tests {
             let after_sqrt = read_mxcsr();
             let exp_result = backend_native_exp(-744.0).to_bits();
             let after_exp = read_mxcsr();
+            let log_result = backend_native_log(f64::from_bits(1)).to_bits();
+            let after_log = read_mxcsr();
             let result = arithmetic(
                 f64::from_bits(0x0000_0000_0000_0002),
                 2.0,
@@ -537,6 +575,8 @@ mod tests {
             assert_eq!(after_sqrt, hostile);
             assert_eq!(exp_result, reference_exp);
             assert_eq!(after_exp, hostile);
+            assert_eq!(log_result, reference_log);
+            assert_eq!(after_log, hostile);
             assert_eq!(result, 0x0000_0000_0000_0001);
             assert_eq!(restored, hostile);
         }
@@ -580,6 +620,7 @@ mod tests {
         unsafe {
             let reference_sqrt = backend_native_sqrt(f64::from_bits(1)).to_bits();
             let reference_exp = backend_native_exp(-744.0).to_bits();
+            let reference_log = backend_native_log(f64::from_bits(1)).to_bits();
             let reference_arithmetic = arithmetic(
                 f64::from_bits(0x0000_0000_0000_0001),
                 2.0,
@@ -606,6 +647,8 @@ mod tests {
             let after_sqrt = read_environment();
             let exp_result = backend_native_exp(-744.0).to_bits();
             let after_exp = read_environment();
+            let log_result = backend_native_log(f64::from_bits(1)).to_bits();
+            let after_log = read_environment();
             let arithmetic_result = arithmetic(
                 f64::from_bits(0x0000_0000_0000_0001),
                 2.0,
@@ -622,6 +665,8 @@ mod tests {
             assert_eq!(after_sqrt, hostile);
             assert_eq!(exp_result, reference_exp);
             assert_eq!(after_exp, hostile);
+            assert_eq!(log_result, reference_log);
+            assert_eq!(after_log, hostile);
             assert_eq!(arithmetic_result, reference_arithmetic);
             assert_eq!(after_arithmetic, hostile);
         }
