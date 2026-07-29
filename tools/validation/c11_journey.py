@@ -379,7 +379,7 @@ def main() -> None:
             (
                 ROOT / "tests/fixtures/parameterized-artifact-success.bennu",
                 ["3", "2.5", "true"],
-                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\n5.5\nfalse\n",
+                b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n5.5\nfalse\n",
             ),
             (
                 ROOT / "tests/fixtures/parameterized-artifact-double.bennu",
@@ -799,7 +799,7 @@ int main(int argc, char **argv) {
         )
         require(
             normalize_newlines(native_result.stdout)
-            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\n5.5\nfalse\n",
+            == b"3\n2.5\ntrue\n(1 2 3)\n3\n(1 2 3)\n6\ntrue\ntrue\ntrue\n5.5\nfalse\n",
             "native build output",
         )
         artifact = work / "native-build.fwir"

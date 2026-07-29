@@ -262,6 +262,8 @@ mod tests {
             ("all_of[(true true false)]", "false"),
             ("any_of[Bool()]", "false"),
             ("any_of[(false false true)]", "true"),
+            ("none_of[Bool()]", "true"),
+            ("none_of[(false false true)]", "false"),
             ("equals[1 1.0]", "true"),
             ("not_equals[1 2]", "true"),
             ("not[false]", "true"),

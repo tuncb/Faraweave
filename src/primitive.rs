@@ -239,6 +239,21 @@ pub(crate) fn apply_implementation(
             .map(|value| (value, false));
     }
 
+    if descriptor.kernel == ScalarKernel::NoneOfBoolVector {
+        let [argument] = arguments else {
+            return Err(type_runtime_error(producer, location));
+        };
+        if lift != crate::LiftMode::ContainerScalar
+            || result_type != ScalarType::Bool
+            || argument.conversion != crate::Conversion::Identity
+        {
+            return Err(type_runtime_error(producer, location));
+        }
+        let work = admitted_work(application_plan, 1, arguments, producer, location)?;
+        return apply_vector_none_of(argument.value, work, location, producer, resources)
+            .map(|value| (value, false));
+    }
+
     if matches!(
         lift,
         crate::LiftMode::ContainerScalar | crate::LiftMode::ContainerVector
@@ -542,6 +557,7 @@ fn invoke_kernel(
             | ScalarKernel::SumDoubleVector
             | ScalarKernel::AllOfBoolVector
             | ScalarKernel::AnyOfBoolVector
+            | ScalarKernel::NoneOfBoolVector
             | ScalarKernel::IotaInt,
             _,
         ) => None,
@@ -696,6 +712,20 @@ fn apply_vector_any_of(
     };
     resources.charge_work(work, location, producer)?;
     Ok(Value::Bool(values.iter().any(|value| *value)))
+}
+
+fn apply_vector_none_of(
+    input: &Value,
+    work: usize,
+    location: SourceLocation,
+    producer: &str,
+    resources: &mut ResourceContext,
+) -> Result<Value, Error> {
+    let Value::BoolVector(values) = input else {
+        return Err(type_runtime_error(producer, location));
+    };
+    resources.charge_work(work, location, producer)?;
+    Ok(Value::Bool(values.iter().all(|value| !*value)))
 }
 
 fn integer_domain_error(

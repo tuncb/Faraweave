@@ -612,6 +612,85 @@ fn any_of_container_plan_roundtrips_and_dispatches_by_verified_identity() {
 }
 
 #[test]
+fn none_of_container_plan_roundtrips_and_dispatches_by_its_own_verified_identity() {
+    let source = "parameters[n Int]\n\
+                  none_of[Bool()]\n\
+                  none_of[(false false false)]\n\
+                  none_of equals[iota n iota n]\n";
+    let program =
+        compile_source_to_verified_program(source, "none-of.faraweave").expect("compile none_of");
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ApplicationPlans.numeric())
+    );
+    let identities: Vec<_> = program
+        .as_raw()
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SelectedApply {
+                primitive_id: 26,
+                signature_id,
+                implementation_id,
+                application_plan_id,
+                lift,
+                ..
+            } => Some((signature_id, implementation_id, application_plan_id, lift)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (47, 47, 8, LiftMode::ContainerScalar),
+            (47, 47, 8, LiftMode::ContainerScalar),
+            (47, 47, 8, LiftMode::ContainerScalar),
+        ]
+    );
+
+    let encoded = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode none_of");
+    let decoded =
+        decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode verified none_of");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode none_of"),
+        encoded
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct none_of");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["4"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded none_of");
+    assert_eq!(loaded, direct);
+    assert_eq!(direct.formatted, ["true", "true", "false"]);
+
+    let emitted =
+        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default()).expect("C");
+    assert!(emitted.source.contains("static int fw_impl_47("));
+    assert_eq!(
+        emitted
+            .source
+            .matches("return fw_apply_selected_none_of(")
+            .count(),
+        1
+    );
+    assert!(
+        emitted
+            .source
+            .contains("return fw_apply_selected_none_of(\"none_of\",args,out,line,column)")
+    );
+    assert!(!emitted.source.contains("strcmp(name"));
+}
+
+#[test]
 fn inspection_is_deterministic_and_carries_exact_binary64_bits() {
     let program = compile_source_to_verified_program("-0.0\nnan\n", "bits.faraweave")
         .expect("compile exact doubles");
