@@ -374,6 +374,27 @@ compile_error!("Faraweave requires an x86-64 or AArch64 floating-point environme
 mod tests {
     use super::*;
 
+    const AARCH64_EXCEPTION_ENABLE_MASK: u64 = 0x0000_9f00;
+    const AARCH64_ROUNDING_FZ_DN_MASK: u64 = 0x00c0_0000 | 0x0300_0000;
+    #[cfg(target_arch = "aarch64")]
+    const AARCH64_STATUS_MASK: u64 = 0x0000_009f;
+
+    fn aarch64_nontrapping_hostile_control(original: u64) -> u64 {
+        (original & !AARCH64_EXCEPTION_ENABLE_MASK) | AARCH64_ROUNDING_FZ_DN_MASK
+    }
+
+    #[test]
+    fn aarch64_hostile_probe_control_is_nontrapping() {
+        for original in [0, AARCH64_EXCEPTION_ENABLE_MASK, u64::MAX] {
+            let hostile = aarch64_nontrapping_hostile_control(original);
+            assert_eq!(hostile & AARCH64_EXCEPTION_ENABLE_MASK, 0);
+            assert_eq!(
+                hostile & AARCH64_ROUNDING_FZ_DN_MASK,
+                AARCH64_ROUNDING_FZ_DN_MASK
+            );
+        }
+    }
+
     #[test]
     fn integer_conversion_matches_every_normative_boundary() {
         let cases = [
@@ -632,10 +653,10 @@ mod tests {
             }
         }
 
-        // SAFETY: the hostile values are derived from a valid captured state
-        // and set only documented exception-enable, rounding, FZ/DN, and
-        // cumulative-status fields. The original pair is restored before any
-        // assertion or test return.
+        // SAFETY: the hostile values are derived from a valid captured state,
+        // keep every exception trap disabled while arithmetic runs, and set
+        // only documented rounding, FZ/DN, and cumulative-status fields. The
+        // original pair is restored before any assertion or test return.
         unsafe {
             let reference_sqrt = backend_native_sqrt(f64::from_bits(1)).to_bits();
             let reference_exp = backend_native_exp(-744.0).to_bits();
@@ -648,10 +669,20 @@ mod tests {
             )
             .to_bits();
             let original = read_environment();
-            let requested_control = original.0 | 0x0000_9f00 | 0x00c0_0000 | 0x0300_0000;
-            let requested_status = original.1 | 0x0000_009f;
+            let requested_control = aarch64_nontrapping_hostile_control(original.0);
+            let requested_status = original.1 | AARCH64_STATUS_MASK;
             write_environment(requested_control, requested_status);
             let hostile = read_environment();
+
+            let traps_disabled = hostile.0 & AARCH64_EXCEPTION_ENABLE_MASK == 0;
+            if !traps_disabled {
+                write_environment(original.0, original.1);
+                assert!(traps_disabled, "AArch64 exception traps remained enabled");
+            }
+            let hostile_control_matches = hostile.0 & AARCH64_ROUNDING_FZ_DN_MASK
+                == requested_control & AARCH64_ROUNDING_FZ_DN_MASK;
+            let hostile_status_matches =
+                hostile.1 & AARCH64_STATUS_MASK == requested_status & AARCH64_STATUS_MASK;
 
             let sqrt_result = backend_native_sqrt(f64::from_bits(1)).to_bits();
             let after_sqrt = read_environment();
@@ -670,11 +701,9 @@ mod tests {
             let after_arithmetic = read_environment();
             write_environment(original.0, original.1);
 
-            assert_eq!(
-                hostile.0 & (0x00c0_0000 | 0x0300_0000),
-                requested_control & (0x00c0_0000 | 0x0300_0000)
-            );
-            assert_eq!(hostile.1 & 0x0000_009f, requested_status & 0x0000_009f);
+            assert!(traps_disabled);
+            assert!(hostile_control_matches);
+            assert!(hostile_status_matches);
             assert_eq!(sqrt_result, reference_sqrt);
             assert_eq!(after_sqrt, hostile);
             assert_eq!(exp_result, reference_exp);
