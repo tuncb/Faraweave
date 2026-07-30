@@ -1,74 +1,18 @@
 use faraweave::{
-    AllocationFailureInjection, Cardinality, Conversion, ErrorKind, EvaluationConfiguration,
-    ExecutionProfile, Feature, FwirDecodeErrorKind, FwirDecodeLimits, FwirEncodeOptions, Invariant,
-    LiftMode, NodeKind, ResourceErrorReason, ResourceLimits, ScalarType, Value, VerifyError,
-    compile_source_to_fwir, compile_source_to_verified_program, decode_fwir, encode_fwir,
-    evaluate_expression, evaluate_expression_with_configuration, evaluate_source_with_arguments,
+    Cardinality, Conversion, ErrorKind, EvaluationConfiguration, Feature, FwirEncodeOptions,
+    LiftMode, NodeKind, ResourceLimits, ScalarType, Value, compile_source_to_fwir,
+    compile_source_to_verified_program, evaluate_expression, evaluate_source_with_arguments,
 };
 
-const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+#[path = "support/backend_native.rs"]
+mod backend_native_support;
 
-fn double(source: &str) -> f64 {
-    match evaluate_expression(source).expect(source).value {
-        Value::Double(value) => value,
-        value => panic!("{source} returned {value:?}"),
-    }
-}
-
-fn assert_exact(source: &str, expected_bits: u64) {
-    assert_eq!(double(source).to_bits(), expected_bits, "{source}");
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-        bytes[offset + 4],
-        bytes[offset + 5],
-        bytes[offset + 6],
-        bytes[offset + 7],
-    ])
-}
-
-fn section(bytes: &[u8], wanted: u16) -> (usize, usize) {
-    for index in 0..read_u32(bytes, 20) as usize {
-        let entry = 32 + index * 24;
-        if read_u16(bytes, entry) == wanted {
-            return (
-                read_u64(bytes, entry + 8) as usize,
-                read_u64(bytes, entry + 16) as usize,
-            );
-        }
-    }
-    panic!("canonical artifact lacks section {wanted}");
-}
-
-fn ceil_node(bytes: &[u8]) -> usize {
-    let (offset, length) = section(bytes, 14);
-    bytes[offset..offset + length]
-        .chunks_exact(56)
-        .position(|record| {
-            record[0] == 4
-                && u32::from_le_bytes([record[24], record[25], record[26], record[27]]) == 37
-        })
-        .map(|index| offset + index * 56)
-        .unwrap_or_else(|| panic!("canonical artifact lacks ceil node"))
-}
+use backend_native_support::{
+    CANONICAL_NAN_BITS, assert_allocation_refusal, assert_backend_native_feature_required,
+    assert_bounded_usage, assert_canonical_roundtrip, assert_empty_double_vector, assert_exact,
+    assert_identity_mismatches, assert_profile_limit_refusal, assert_semantic_minor_zero_rejected,
+    double, selected_node,
+};
 
 #[test]
 fn ceil_uses_contiguous_ids_lifting_promotion_and_shared_feature() {
@@ -236,40 +180,33 @@ fn ceil_fractional_signs_integral_boundaries_and_exact_results_are_public_semant
 
 #[test]
 fn ceil_resources_failures_cleanup_and_diagnostics_are_exact() {
-    let scalar = evaluate_expression_with_configuration(
+    assert_bounded_usage(
         "ceil[0]",
-        EvaluationConfiguration {
-            profile: ExecutionProfile::BoundedV2,
-            limits: ResourceLimits {
-                max_work_units: Some(1),
-                ..ResourceLimits::default()
-            },
-            allocation_failure: AllocationFailureInjection::default(),
+        ResourceLimits {
+            max_work_units: Some(1),
+            ..ResourceLimits::default()
         },
-    )
-    .expect("scalar exact work");
-    assert_eq!(scalar.value, Value::Double(0.0));
-    assert_eq!(scalar.usage.work_units, 1);
-    assert_eq!(scalar.usage.allocation_attempts, 0);
+        Some(Value::Double(0.0)),
+        0,
+        0,
+        1,
+        0,
+    );
 
-    let vector = evaluate_expression_with_configuration(
+    assert_bounded_usage(
         "ceil[(0.0 1.0 2.0)]",
-        EvaluationConfiguration {
-            profile: ExecutionProfile::BoundedV2,
-            limits: ResourceLimits {
-                max_vector_bytes: Some(24),
-                max_live_evaluation_bytes: Some(48),
-                max_work_units: Some(3),
-                ..ResourceLimits::default()
-            },
-            allocation_failure: AllocationFailureInjection::default(),
+        ResourceLimits {
+            max_vector_bytes: Some(24),
+            max_live_evaluation_bytes: Some(48),
+            max_work_units: Some(3),
+            ..ResourceLimits::default()
         },
-    )
-    .expect("vector exact resources");
-    assert_eq!(vector.usage.live_evaluation_bytes, 24);
-    assert_eq!(vector.usage.peak_live_evaluation_bytes, 48);
-    assert_eq!(vector.usage.work_units, 3);
-    assert_eq!(vector.usage.allocation_attempts, 2);
+        None,
+        24,
+        48,
+        3,
+        2,
+    );
 
     for (limits, expected_limit, expected_producer) in [
         (
@@ -303,58 +240,17 @@ fn ceil_resources_failures_cleanup_and_diagnostics_are_exact() {
             "ceil",
         ),
     ] {
-        let error = evaluate_expression_with_configuration(
+        assert_profile_limit_refusal(
             "ceil[(0.0 1.0 2.0)]",
-            EvaluationConfiguration {
-                profile: ExecutionProfile::BoundedV2,
-                limits,
-                allocation_failure: AllocationFailureInjection::default(),
-            },
-        )
-        .expect_err(expected_limit);
-        assert_eq!(error.kind, ErrorKind::ResourceError);
-        assert_eq!(error.primitive.as_deref(), Some(expected_producer));
-        let resource = error.resource.expect("resource context");
-        assert_eq!(resource.reason, ResourceErrorReason::ProfileLimit);
-        assert_eq!(resource.limit_kind, Some(expected_limit));
-        assert_eq!(
-            error
-                .usage
-                .expect("post-cleanup usage")
-                .live_evaluation_bytes,
-            0
+            limits,
+            expected_limit,
+            expected_producer,
+            Some(0),
         );
     }
 
-    let allocation = evaluate_expression_with_configuration(
-        "ceil[(0.0 1.0)]",
-        EvaluationConfiguration {
-            profile: ExecutionProfile::TrustedLocalV2,
-            limits: ResourceLimits::default(),
-            allocation_failure: AllocationFailureInjection {
-                fail_at_ordinal: Some(1),
-            },
-        },
-    )
-    .expect_err("vector allocation refusal");
-    assert_eq!(allocation.kind, ErrorKind::ResourceError);
-    assert_eq!(allocation.primitive.as_deref(), Some("ceil"));
-    assert_eq!(
-        allocation.resource.expect("allocation context").reason,
-        ResourceErrorReason::AllocationUnavailable
-    );
-    assert_eq!(
-        allocation
-            .usage
-            .expect("allocation post-cleanup usage")
-            .live_evaluation_bytes,
-        0
-    );
-
-    let empty = evaluate_expression("ceil[Double()]").expect("empty vector");
-    assert_eq!(empty.value, Value::DoubleVector(Vec::new()));
-    assert_eq!(empty.usage.work_units, 0);
-    assert_eq!(empty.usage.allocation_attempts, 0);
+    assert_allocation_refusal("ceil[(0.0 1.0)]", "ceil", Some(0));
+    assert_empty_double_vector("ceil[Double()]", 0, 0);
 
     for (source, kind) in [
         ("ceil[true]", ErrorKind::TypeError),
@@ -371,62 +267,10 @@ fn ceil_resources_failures_cleanup_and_diagnostics_are_exact() {
 fn ceil_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     let bytes = compile_source_to_fwir("ceil[(0.0 1.0)]\n", &FwirEncodeOptions::default())
         .expect("ceil artifact");
-    let decoded = decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode ceil artifact");
-    assert_eq!(
-        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("re-encode ceil artifact"),
-        bytes
-    );
-    assert_eq!(
-        decoded.as_raw().features,
-        vec![
-            Feature::StableSemanticIds.numeric(),
-            Feature::BackendNativeMathV1.numeric(),
-        ]
-    );
+    assert_canonical_roundtrip(&bytes, "ceil");
 
-    let node = ceil_node(&bytes);
-    for (relative, replacement) in [(24, 36_u32), (28, 61), (32, 61)] {
-        let mut malformed = bytes.clone();
-        malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
-        let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
-            .expect_err("mismatched ceil identity");
-        assert_eq!(
-            error.kind,
-            FwirDecodeErrorKind::NonCanonicalRecord {
-                field: "semantic_id"
-            }
-        );
-        assert_eq!(usize::try_from(error.offset).ok(), Some(node + 24));
-        assert_eq!(error.section_id, Some(14));
-    }
-
-    let (feature_offset, feature_length) = section(&bytes, 2);
-    let feature = bytes[feature_offset..feature_offset + feature_length]
-        .chunks_exact(4)
-        .position(|record| read_u16(record, 0) == Feature::BackendNativeMathV1.numeric())
-        .map(|index| feature_offset + index * 4)
-        .expect("backend-native feature record");
-    let mut missing_feature = bytes.clone();
-    missing_feature[feature..feature + 2].copy_from_slice(&9_u16.to_le_bytes());
-    missing_feature[feature + 2] = 1;
-    let error = decode_fwir(&missing_feature, &FwirDecodeLimits::default())
-        .expect_err("missing backend-native feature");
-    assert!(matches!(
-        error.kind,
-        FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(ref malformed))
-            if malformed.invariant == Invariant::MissingFeature
-                && malformed.field == "backend_native_math_v1"
-    ));
-
-    let (module, _) = section(&bytes, 1);
-    let mut old_version = bytes.clone();
-    old_version[module + 2..module + 4].copy_from_slice(&0_u16.to_le_bytes());
-    let error = decode_fwir(&old_version, &FwirDecodeLimits::default())
-        .expect_err("semantic 1.0 ceil artifact");
-    assert!(matches!(
-        error.kind,
-        FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(ref malformed))
-            if malformed.invariant == Invariant::UnsupportedVersion
-                && malformed.field == "semantic_version"
-    ));
+    let node = selected_node(&bytes, 37, "ceil");
+    assert_identity_mismatches(&bytes, node, &[(24, 36), (28, 61), (32, 61)], "ceil");
+    assert_backend_native_feature_required(&bytes);
+    assert_semantic_minor_zero_rejected(&bytes, "ceil");
 }
