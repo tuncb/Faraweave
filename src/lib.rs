@@ -27,8 +27,9 @@ mod typed_program;
 mod value;
 
 pub use error::{
-    ArgumentErrorContext, ArgumentErrorReason, DomainErrorContext, DomainErrorReason, Error,
-    ErrorKind, LocatedError, ParameterErrorContext, ParameterErrorReason, ResourceErrorContext,
+    ArgumentErrorContext, ArgumentErrorReason, ConnectedApplicationErrorContext,
+    ConnectedApplicationErrorReason, DomainErrorContext, DomainErrorReason, Error, ErrorKind,
+    LocatedError, ParameterErrorContext, ParameterErrorReason, ResourceErrorContext,
     ResourceErrorReason, SourceLocation, SourceSpan,
 };
 pub use evaluator::{

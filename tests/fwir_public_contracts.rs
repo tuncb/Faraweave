@@ -102,6 +102,78 @@ fn public_source_and_decoded_artifact_execution_and_resource_traces_match() {
 }
 
 #[test]
+fn connected_completion_roundtrips_as_ordinary_existing_fwir() {
+    let source = "parameters[n Int]\nadd[10] mul[2] n\n";
+    let program =
+        compile_source_to_verified_program(source, "connected.faraweave").expect("compile");
+    assert_eq!(program.module().semantic_major, 1);
+    assert_eq!(program.module().semantic_minor, 0);
+    assert_eq!(
+        program.as_raw().features,
+        [Feature::StableSemanticIds.numeric()]
+    );
+    assert_eq!(
+        program
+            .as_raw()
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::SelectedApply { .. }))
+            .count(),
+        2
+    );
+    assert!(!program.as_raw().nodes.iter().any(|node| matches!(
+        node.kind,
+        NodeKind::TupleConstruct | NodeKind::PrefixSpreadPrepare
+    )));
+
+    let bytes = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode");
+    let decoded = decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("re-encode"),
+        bytes
+    );
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["20"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["20"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded");
+    assert_eq!(direct, loaded);
+    assert_eq!(direct.formatted, ["50"]);
+
+    let direct_error = evaluate_verified_program_with_arguments(
+        &program,
+        &["9223372036854775807"],
+        EvaluationConfiguration::default(),
+    )
+    .expect_err("direct overflow");
+    let loaded_error = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["9223372036854775807"],
+        EvaluationConfiguration::default(),
+    )
+    .expect_err("decoded overflow");
+    assert_eq!(direct_error, loaded_error);
+
+    let authored_tuple =
+        compile_source_to_verified_program("add[] [10 20]\n", "tuple-bundle.faraweave")
+            .expect("tuple bundle");
+    assert!(
+        !authored_tuple
+            .as_raw()
+            .features
+            .contains(&Feature::Tuples.numeric())
+    );
+    assert_eq!(authored_tuple.module().semantic_minor, 0);
+}
+
+#[test]
 fn line_comments_preserve_source_length_and_interpreter_result() {
     let source = "# prologue 🦀\r\ninc[# argument\n1]# eof";
     let program =
