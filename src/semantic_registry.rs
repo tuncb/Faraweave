@@ -23,6 +23,7 @@ pub(crate) enum Conversion {
 pub(crate) enum OperandConsumption {
     Elementwise,
     WholeVector,
+    AtomicScalar,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,9 +106,12 @@ pub(crate) enum ScalarKernel {
     LengthBoolVector,
     LengthIntVector,
     LengthDoubleVector,
+    LengthString,
+    LengthStringVector,
     SortBoolVector,
     SortIntVector,
     SortDoubleVector,
+    SortStringVector,
     SumIntVector,
     SumDoubleVector,
     AllOfBoolVector,
@@ -125,9 +129,11 @@ pub(crate) enum ScalarKernel {
     EqualsBool,
     EqualsInt,
     EqualsDouble,
+    EqualsString,
     NotEqualsBool,
     NotEqualsInt,
     NotEqualsDouble,
+    NotEqualsString,
     NotBool,
     AndBool,
     OrBool,
@@ -139,8 +145,10 @@ pub(crate) enum ScalarKernel {
     IsNegativeDouble,
     LessThanInt,
     LessThanDouble,
+    LessThanString,
     GreaterThanInt,
     GreaterThanDouble,
+    GreaterThanString,
     IotaInt,
     SqrtDouble,
     ExpDouble,
@@ -239,8 +247,8 @@ impl InternalRegistryDiagnosticFailureInjection {
 }
 
 const PRIMITIVE_COUNT: u16 = 39;
-const SIGNATURE_COUNT: u16 = 66;
-const IMPLEMENTATION_COUNT: u16 = 66;
+const SIGNATURE_COUNT: u16 = 73;
+const IMPLEMENTATION_COUNT: u16 = 73;
 const APPLICATION_PLAN_COUNT: u16 = 11;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
@@ -257,6 +265,13 @@ const fn whole_vector(element_type: ScalarType) -> OperandDescriptor {
     }
 }
 
+const fn atomic_scalar(element_type: ScalarType) -> OperandDescriptor {
+    OperandDescriptor {
+        element_type,
+        consumption: OperandConsumption::AtomicScalar,
+    }
+}
+
 const INT1: &[OperandDescriptor] = &[elementwise(ScalarType::Int)];
 const DOUBLE1: &[OperandDescriptor] = &[elementwise(ScalarType::Double)];
 const BOOL1: &[OperandDescriptor] = &[elementwise(ScalarType::Bool)];
@@ -266,9 +281,15 @@ const DOUBLE2: &[OperandDescriptor] = &[
     elementwise(ScalarType::Double),
 ];
 const BOOL2: &[OperandDescriptor] = &[elementwise(ScalarType::Bool), elementwise(ScalarType::Bool)];
+const STRING2: &[OperandDescriptor] = &[
+    elementwise(ScalarType::String),
+    elementwise(ScalarType::String),
+];
 const WHOLE_BOOL1: &[OperandDescriptor] = &[whole_vector(ScalarType::Bool)];
 const WHOLE_INT1: &[OperandDescriptor] = &[whole_vector(ScalarType::Int)];
 const WHOLE_DOUBLE1: &[OperandDescriptor] = &[whole_vector(ScalarType::Double)];
+const WHOLE_STRING1: &[OperandDescriptor] = &[whole_vector(ScalarType::String)];
+const ATOMIC_STRING1: &[OperandDescriptor] = &[atomic_scalar(ScalarType::String)];
 const FOLDL_BOOL: &[OperandDescriptor] = &[
     elementwise(ScalarType::Bool),
     whole_vector(ScalarType::Bool),
@@ -1104,6 +1125,83 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         FILTER_PLAN,
         FilterDouble
     ),
+    descriptor!(
+        8,
+        "equals",
+        67,
+        67,
+        STRING2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        EqualsString
+    ),
+    descriptor!(
+        9,
+        "not_equals",
+        68,
+        68,
+        STRING2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        NotEqualsString
+    ),
+    descriptor!(
+        17,
+        "less_than",
+        69,
+        69,
+        STRING2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        LessThanString
+    ),
+    descriptor!(
+        18,
+        "greater_than",
+        70,
+        70,
+        STRING2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        GreaterThanString
+    ),
+    descriptor!(
+        21,
+        "length",
+        71,
+        71,
+        ATOMIC_STRING1,
+        Int,
+        VectorLength,
+        LENGTH_PLAN,
+        LengthString
+    ),
+    descriptor!(
+        21,
+        "length",
+        72,
+        72,
+        WHOLE_STRING1,
+        Int,
+        VectorLength,
+        LENGTH_PLAN,
+        LengthStringVector
+    ),
+    descriptor!(
+        22,
+        "sort",
+        73,
+        73,
+        WHOLE_STRING1,
+        String,
+        VectorSort,
+        SORT_PLAN,
+        SortStringVector
+    ),
 ];
 
 impl PrimitiveId {
@@ -1348,6 +1446,7 @@ const fn operand_consumption_name(value: OperandConsumption) -> &'static str {
     match value {
         OperandConsumption::Elementwise => "elementwise",
         OperandConsumption::WholeVector => "whole_vector",
+        OperandConsumption::AtomicScalar => "atomic_scalar",
     }
 }
 
@@ -1430,9 +1529,11 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::EqualsBool => "equals_bool",
         ScalarKernel::EqualsInt => "equals_int",
         ScalarKernel::EqualsDouble => "equals_double",
+        ScalarKernel::EqualsString => "equals_string",
         ScalarKernel::NotEqualsBool => "not_equals_bool",
         ScalarKernel::NotEqualsInt => "not_equals_int",
         ScalarKernel::NotEqualsDouble => "not_equals_double",
+        ScalarKernel::NotEqualsString => "not_equals_string",
         ScalarKernel::NotBool => "not_bool",
         ScalarKernel::AndBool => "and_bool",
         ScalarKernel::OrBool => "or_bool",
@@ -1444,15 +1545,20 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::IsNegativeDouble => "is_negative_double",
         ScalarKernel::LessThanInt => "less_than_int",
         ScalarKernel::LessThanDouble => "less_than_double",
+        ScalarKernel::LessThanString => "less_than_string",
         ScalarKernel::GreaterThanInt => "greater_than_int",
         ScalarKernel::GreaterThanDouble => "greater_than_double",
+        ScalarKernel::GreaterThanString => "greater_than_string",
         ScalarKernel::IotaInt => "iota_int",
         ScalarKernel::LengthBoolVector => "length_bool_vector",
         ScalarKernel::LengthIntVector => "length_int_vector",
         ScalarKernel::LengthDoubleVector => "length_double_vector",
+        ScalarKernel::LengthString => "length_string",
+        ScalarKernel::LengthStringVector => "length_string_vector",
         ScalarKernel::SortBoolVector => "sort_bool_vector",
         ScalarKernel::SortIntVector => "sort_int_vector",
         ScalarKernel::SortDoubleVector => "sort_double_vector",
+        ScalarKernel::SortStringVector => "sort_string_vector",
         ScalarKernel::SumIntVector => "sum_int_vector",
         ScalarKernel::SumDoubleVector => "sum_double_vector",
         ScalarKernel::AllOfBoolVector => "all_of_bool_vector",
@@ -1654,10 +1760,12 @@ fn valid_application_plan(descriptor: &SemanticDescriptor) -> bool {
             .iter()
             .all(|operand| operand.consumption == OperandConsumption::Elementwise),
         ResultCardinality::DynamicVector => true,
-        ResultCardinality::Scalar => descriptor
-            .parameters
-            .iter()
-            .any(|operand| operand.consumption == OperandConsumption::WholeVector),
+        ResultCardinality::Scalar => descriptor.parameters.iter().any(|operand| {
+            matches!(
+                operand.consumption,
+                OperandConsumption::WholeVector | OperandConsumption::AtomicScalar
+            )
+        }),
         ResultCardinality::PreserveOperand(position)
         | ResultCardinality::OperandPlusOne(position)
         | ResultCardinality::SubsetOfOperand(position) => whole_vector_at(position),
@@ -1763,7 +1871,13 @@ mod tests {
             );
         }
         let mut descriptors = SEMANTIC_REGISTRY.iter().collect::<Vec<_>>();
-        descriptors.sort_unstable_by_key(|descriptor| descriptor.signature_id.numeric());
+        descriptors.sort_unstable_by_key(|descriptor| {
+            (
+                descriptor.primitive_id.numeric(),
+                descriptor.signature_id.numeric(),
+                descriptor.implementation_id.numeric(),
+            )
+        });
         for (descriptor, line) in descriptors.into_iter().zip(signature_lines) {
             let marker = format!(
                 "  signature id={} implementation={} ",
@@ -1985,6 +2099,13 @@ mod tests {
             (39, "filter"),
             (39, "filter"),
             (39, "filter"),
+            (8, "equals"),
+            (9, "not_equals"),
+            (17, "less_than"),
+            (18, "greater_than"),
+            (21, "length"),
+            (21, "length"),
+            (22, "sort"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -2195,7 +2316,10 @@ mod tests {
                     descriptor.application_plan == LENGTH_PLAN
                         && descriptor.result == ScalarType::Int
                         && descriptor.parameters.len() == 1
-                        && descriptor.parameters[0].consumption == OperandConsumption::WholeVector
+                        && matches!(
+                            descriptor.parameters[0].consumption,
+                            OperandConsumption::WholeVector | OperandConsumption::AtomicScalar
+                        )
                 })
         );
         assert_eq!(
@@ -2296,11 +2420,11 @@ mod tests {
         );
         assert_eq!(application_plan_from_numeric(11), Ok(FILTER_PLAN));
         assert_eq!(
-            signature_from_numeric(67),
+            signature_from_numeric(74),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(67),
+            implementation_from_numeric(74),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
@@ -2342,9 +2466,13 @@ mod tests {
             Err(RegistryValidationError::DuplicatePrimitiveName)
         );
 
-        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 3];
+        let missing = SEMANTIC_REGISTRY
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.primitive_id.numeric() != 39)
+            .collect::<Vec<_>>();
         assert_eq!(
-            validate_registry(missing),
+            validate_registry(&missing),
             Err(RegistryValidationError::MissingPrimitiveId)
         );
 

@@ -3,9 +3,9 @@ use crate::{
     IndexRange, LiftMode, ModuleMetadata, Node, NodeIndex, NodeKind, OperationReference,
     OperationReferenceIndex, Origin, OriginIndex, OriginPosition, OriginSpan, Ownership,
     OwnershipMode, Parameter, ParameterIndex, ProgramRanges, RawProgram, ReleaseAfter, Root,
-    RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit, SourceUnitIndex, TypeIndex,
-    TypeRecord, ValueAccess, VerifiedProgram, VerifyAllocationFailureInjection,
-    VerifyAllocationSite, VerifyError,
+    RootIndex, ScalarConstant, ScalarType, ShapePlan, SourceUnit, SourceUnitIndex,
+    StringValueIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
+    VerifyAllocationFailureInjection, VerifyAllocationSite, VerifyError,
 };
 use std::collections::TryReserveError;
 
@@ -224,6 +224,7 @@ fn scalar_type_from_tag(tag: u8) -> Option<ScalarType> {
         1 => Some(ScalarType::Bool),
         2 => Some(ScalarType::Int),
         3 => Some(ScalarType::Double),
+        4 => Some(ScalarType::String),
         _ => None,
     }
 }
@@ -236,6 +237,9 @@ fn scalar_constant_from_parts(tag: u8, payload: u64) -> Option<ScalarConstant> {
         ))),
         3 if !f64::from_bits(payload).is_nan() || payload == 0x7ff8_0000_0000_0000 => {
             Some(ScalarConstant::DoubleBits(payload))
+        }
+        4 if payload <= u64::from(u32::MAX) => {
+            Some(ScalarConstant::String(StringValueIndex(payload as u32)))
         }
         _ => None,
     }
@@ -1213,7 +1217,7 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
         if reserved != 0 {
             return Err(record_error(features, index, 3, "reserved"));
         }
-        if id <= Feature::ImmutableBindings.numeric() {
+        if id <= Feature::Strings.numeric() {
             if class != 0 {
                 return Err(record_error(features, index, 2, "feature_class"));
             }
@@ -1224,6 +1228,9 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
                 return Err(record_error(features, index, 0, "feature_format_minor"));
             }
             if id == Feature::ImmutableBindings.numeric() && plan.format_minor < 3 {
+                return Err(record_error(features, index, 0, "feature_format_minor"));
+            }
+            if id == Feature::Strings.numeric() && plan.format_minor < 4 {
                 return Err(record_error(features, index, 0, "feature_format_minor"));
             }
         } else if class == 0 {
@@ -1637,6 +1644,23 @@ fn validate_string_use(
             }
         }
     }
+    for section_id in [8_u16, 9_u16] {
+        if let Some(records) = section(plan, section_id) {
+            for index in 0..records.record_count() {
+                let tag = record_u8(bytes, records, index, if section_id == 8 { 1 } else { 0 })?;
+                if tag == 4 {
+                    let payload =
+                        record_u64(bytes, records, index, if section_id == 8 { 12 } else { 4 })?;
+                    let string = usize::try_from(payload)
+                        .map_err(|_| record_error(records, index, 0, "string_index"))?;
+                    let Some(value) = used.get_mut(string) else {
+                        return Err(record_error(records, index, 0, "string_index"));
+                    };
+                    *value = true;
+                }
+            }
+        }
+    }
     if let Some(unused) = used.iter().position(|value| !value) {
         return Err(record_error(strings, unused, 0, "unused_string"));
     }
@@ -1741,6 +1765,7 @@ fn reconstruct_program(
     let mut type_elements = Vec::new();
     let mut constants = Vec::new();
     let mut constant_elements = Vec::new();
+    let mut string_values = Vec::new();
     let mut origins = Vec::new();
     let mut operation_references = Vec::new();
     let mut edges = Vec::new();
@@ -1757,6 +1782,26 @@ fn reconstruct_program(
         injection,
         section(plan, 2),
     )?;
+    reserve_arena(
+        &mut string_values,
+        plan.string_count,
+        FwirDecodeAllocationSite::StringUse,
+        injection,
+        strings,
+    )?;
+    if let Some(string_section) = strings {
+        for index in 0..plan.string_count {
+            let value = string_value(bytes, string_section, plan.string_count, index)?;
+            string_values.push(copy_name(
+                value,
+                FwirDecodeAllocationSite::StringUse,
+                injection,
+                record_offset(string_section, index),
+                3,
+                index,
+            )?);
+        }
+    }
     reserve_arena(
         &mut source_units,
         section_count(plan, 4),
@@ -1859,7 +1904,7 @@ fn reconstruct_program(
     if let Some(records) = section(plan, 2) {
         for index in 0..records.record_count() {
             let id = record_u16(bytes, records, index, 0)?;
-            if id <= Feature::ImmutableBindings.numeric() {
+            if id <= Feature::Strings.numeric() {
                 features.push(id);
             }
         }
@@ -2203,6 +2248,7 @@ fn reconstruct_program(
         type_elements: whole_range(type_elements.len(), "type_elements")?,
         constants: whole_range(constants.len(), "constants")?,
         constant_elements: whole_range(constant_elements.len(), "constant_elements")?,
+        string_values: whole_range(string_values.len(), "string_values")?,
         nodes: whole_range(nodes.len(), "nodes")?,
         edges: whole_range(edges.len(), "edges")?,
         shape_checks: whole_range(shape_checks.len(), "shape_checks")?,
@@ -2230,6 +2276,7 @@ fn reconstruct_program(
         type_elements,
         constants,
         constant_elements,
+        string_values,
         nodes,
         edges,
         shape_checks,
@@ -2311,7 +2358,9 @@ fn reserve_exact<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Feature, FwirEncodeOptions, RawProgramBuilder, encode_fwir};
+    use crate::{
+        Feature, FwirEncodeOptions, Invariant, MalformedProgram, RawProgramBuilder, encode_fwir,
+    };
 
     fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
         match result {
@@ -3136,6 +3185,124 @@ mod tests {
                 ..
             }) if actual == site
         ));
+    }
+
+    #[test]
+    fn string_artifacts_reject_hostile_pool_feature_version_and_identity_mutations() {
+        let scalar = must(crate::compile_source_to_fwir(
+            "\"é\"\n",
+            &FwirEncodeOptions::default(),
+        ));
+        let (_, strings, _) = test_section(&scalar, 3);
+        let string_count = test_u32(&scalar, strings) as usize;
+        let (_, constants, _) = test_section(&scalar, 8);
+        let string_index = test_u64(&scalar, constants + 12) as usize;
+        assert!(string_index < string_count);
+
+        let mut out_of_range = scalar.clone();
+        put_u64_at(
+            &mut out_of_range,
+            constants + 12,
+            u64::try_from(string_count).unwrap_or(u64::MAX),
+        );
+        assert_noncanonical_record(&out_of_range, "string_index", constants, 8, Some(0));
+
+        let mut high_bits = scalar.clone();
+        put_u64_at(
+            &mut high_bits,
+            constants + 12,
+            (1_u64 << 32) | string_index as u64,
+        );
+        assert_noncanonical_record(&high_bits, "scalar_payload", constants + 1, 8, Some(0));
+
+        let mut reserved = scalar.clone();
+        reserved[constants + 2] = 1;
+        assert_noncanonical_record(&reserved, "reserved", constants + 2, 8, Some(0));
+
+        let descriptor = strings + 4 + string_index * 8;
+        let payload = strings + 4 + string_count * 8 + test_u32(&scalar, descriptor) as usize;
+        let mut invalid_utf8 = scalar.clone();
+        invalid_utf8[payload] = 0xff;
+        assert!(matches!(
+            decode_fwir(&invalid_utf8, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::InvalidUtf8,
+                section_id: Some(3),
+                ..
+            })
+        ));
+
+        let (_, module, _) = test_section(&scalar, 1);
+        let mut old_semantic = scalar.clone();
+        put_u16_at(&mut old_semantic, module + 2, 3);
+        assert!(matches!(
+            decode_fwir(&old_semantic, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                    MalformedProgram {
+                        invariant: Invariant::UnsupportedVersion,
+                        ..
+                    }
+                )),
+                ..
+            })
+        ));
+
+        let mut old_physical = scalar.clone();
+        put_u16_at(&mut old_physical, 10, 3);
+        assert!(matches!(
+            decode_fwir(&old_physical, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                    field: "feature_format_minor"
+                },
+                section_id: Some(2),
+                ..
+            })
+        ));
+
+        let (_, features, feature_length) = test_section(&scalar, 2);
+        let string_feature = scalar[features..features + feature_length]
+            .chunks_exact(4)
+            .position(|record| test_u16(record, 0) == Feature::Strings.numeric())
+            .map(|index| features + index * 4)
+            .unwrap_or(features);
+        let mut missing_feature = scalar.clone();
+        put_u16_at(&mut missing_feature, string_feature, 11);
+        missing_feature[string_feature + 2] = 1;
+        assert!(matches!(
+            decode_fwir(&missing_feature, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                    MalformedProgram {
+                        invariant: Invariant::MissingFeature,
+                        field: "strings",
+                        ..
+                    }
+                )),
+                ..
+            })
+        ));
+
+        let equals = must(crate::compile_source_to_fwir(
+            "equals[\"a\" \"a\"]\n",
+            &FwirEncodeOptions::default(),
+        ));
+        let (_, nodes, node_length) = test_section(&equals, 14);
+        let selected_index = equals[nodes..nodes + node_length]
+            .chunks_exact(56)
+            .position(|record| record[0] == 4)
+            .unwrap_or(0);
+        let selected = nodes + selected_index * 56;
+        let mut wrong_identity = equals;
+        put_u32_at(&mut wrong_identity, selected + 28, 15);
+        assert_noncanonical_record(
+            &wrong_identity,
+            "semantic_id",
+            selected + 24,
+            14,
+            u32::try_from(selected_index).ok(),
+        );
     }
 
     fn planned_program(depth: u32, explicit_application_plans: bool) -> VerifiedProgram {

@@ -152,7 +152,7 @@ pub fn assert_backend_native_feature_required(bytes: &[u8]) {
         .map(|index| feature_offset + index * 4)
         .expect("backend-native feature record");
     let mut missing_feature = bytes.to_vec();
-    missing_feature[feature..feature + 2].copy_from_slice(&10_u16.to_le_bytes());
+    missing_feature[feature..feature + 2].copy_from_slice(&11_u16.to_le_bytes());
     missing_feature[feature + 2] = 1;
     let error = decode_fwir(&missing_feature, &FwirDecodeLimits::default())
         .expect_err("missing backend-native feature");

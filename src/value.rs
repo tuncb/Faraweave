@@ -1,12 +1,19 @@
 use crate::{Error, ErrorKind, SourceLocation};
+use std::cell::Cell;
 use std::fmt::Write;
 use std::ops::Deref;
+
+thread_local! {
+    static FORMAT_FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    static FORMAT_ALLOCATION_ORDINAL: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ScalarType {
     Bool,
     Int,
     Double,
+    String,
 }
 
 impl ScalarType {
@@ -15,6 +22,7 @@ impl ScalarType {
             Self::Bool => "Bool",
             Self::Int => "Int",
             Self::Double => "Double",
+            Self::String => "String",
         }
     }
 
@@ -22,6 +30,7 @@ impl ScalarType {
         match self {
             Self::Bool => 1,
             Self::Int | Self::Double => 8,
+            Self::String => 16,
         }
     }
 }
@@ -66,9 +75,20 @@ impl Deref for TupleValues {
 impl Drop for TupleValues {
     fn drop(&mut self) {
         let mut pending = std::mem::take(&mut self.values);
-        while let Some(mut value) = pending.pop() {
+        let mut current = None;
+        loop {
+            let Some(mut value) = current.take().or_else(|| pending.pop()) else {
+                break;
+            };
             if let Value::Tuple(tuple) = &mut value {
-                pending.append(&mut tuple.values);
+                let mut children = std::mem::take(&mut tuple.values);
+                if let Some(child) = children.pop() {
+                    if !pending.is_empty() {
+                        children.push(Value::Tuple(TupleValues { values: pending }));
+                    }
+                    pending = children;
+                    current = Some(child);
+                }
             }
         }
     }
@@ -79,30 +99,120 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Double(f64),
+    String(String),
     BoolVector(Vec<bool>),
     IntVector(Vec<i64>),
     DoubleVector(Vec<f64>),
+    StringVector(Vec<String>),
     Tuple(TupleValues),
 }
 
 impl Value {
+    pub(crate) fn try_clone(&self) -> Result<Self, ()> {
+        enum CloneTask<'a> {
+            Value(&'a Value),
+            FinishTuple(usize),
+        }
+
+        fn push_value(values: &mut Vec<Value>, value: Value) -> Result<(), ()> {
+            values.try_reserve(1).map_err(|_| ())?;
+            values.push(value);
+            Ok(())
+        }
+
+        let mut pending = Vec::new();
+        pending.try_reserve(1).map_err(|_| ())?;
+        pending.push(CloneTask::Value(self));
+        let mut cloned = Vec::new();
+        while let Some(task) = pending.pop() {
+            match task {
+                CloneTask::Value(value) => match value {
+                    Self::Bool(value) => push_value(&mut cloned, Self::Bool(*value))?,
+                    Self::Int(value) => push_value(&mut cloned, Self::Int(*value))?,
+                    Self::Double(value) => push_value(&mut cloned, Self::Double(*value))?,
+                    Self::String(value) => {
+                        let mut copy = String::new();
+                        copy.try_reserve_exact(value.len()).map_err(|_| ())?;
+                        copy.push_str(value);
+                        push_value(&mut cloned, Self::String(copy))?;
+                    }
+                    Self::BoolVector(values) => {
+                        let mut copy = Vec::new();
+                        copy.try_reserve_exact(values.len()).map_err(|_| ())?;
+                        copy.extend_from_slice(values);
+                        push_value(&mut cloned, Self::BoolVector(copy))?;
+                    }
+                    Self::IntVector(values) => {
+                        let mut copy = Vec::new();
+                        copy.try_reserve_exact(values.len()).map_err(|_| ())?;
+                        copy.extend_from_slice(values);
+                        push_value(&mut cloned, Self::IntVector(copy))?;
+                    }
+                    Self::DoubleVector(values) => {
+                        let mut copy = Vec::new();
+                        copy.try_reserve_exact(values.len()).map_err(|_| ())?;
+                        copy.extend_from_slice(values);
+                        push_value(&mut cloned, Self::DoubleVector(copy))?;
+                    }
+                    Self::StringVector(values) => {
+                        let mut copy = Vec::new();
+                        copy.try_reserve_exact(values.len()).map_err(|_| ())?;
+                        for value in values {
+                            let mut string = String::new();
+                            string.try_reserve_exact(value.len()).map_err(|_| ())?;
+                            string.push_str(value);
+                            copy.push(string);
+                        }
+                        push_value(&mut cloned, Self::StringVector(copy))?;
+                    }
+                    Self::Tuple(values) => {
+                        pending.try_reserve(values.len() + 1).map_err(|_| ())?;
+                        pending.push(CloneTask::FinishTuple(values.len()));
+                        for value in values.iter().rev() {
+                            pending.push(CloneTask::Value(value));
+                        }
+                    }
+                },
+                CloneTask::FinishTuple(length) => {
+                    let start = cloned.len().checked_sub(length).ok_or(())?;
+                    let mut values = Vec::new();
+                    values.try_reserve_exact(length).map_err(|_| ())?;
+                    values.extend(cloned.drain(start..));
+                    push_value(&mut cloned, Self::Tuple(values.into()))?;
+                }
+            }
+        }
+        if cloned.len() == 1 {
+            cloned.pop().ok_or(())
+        } else {
+            Err(())
+        }
+    }
+
     pub const fn scalar_type(&self) -> Option<ScalarType> {
         match self {
             Self::Bool(_) | Self::BoolVector(_) => Some(ScalarType::Bool),
             Self::Int(_) | Self::IntVector(_) => Some(ScalarType::Int),
             Self::Double(_) | Self::DoubleVector(_) => Some(ScalarType::Double),
+            Self::String(_) | Self::StringVector(_) => Some(ScalarType::String),
             Self::Tuple(_) => None,
         }
     }
 
     pub const fn is_scalar(&self) -> bool {
-        matches!(self, Self::Bool(_) | Self::Int(_) | Self::Double(_))
+        matches!(
+            self,
+            Self::Bool(_) | Self::Int(_) | Self::Double(_) | Self::String(_)
+        )
     }
 
     pub const fn is_vector(&self) -> bool {
         matches!(
             self,
-            Self::BoolVector(_) | Self::IntVector(_) | Self::DoubleVector(_)
+            Self::BoolVector(_)
+                | Self::IntVector(_)
+                | Self::DoubleVector(_)
+                | Self::StringVector(_)
         )
     }
 
@@ -111,8 +221,9 @@ impl Value {
             Self::BoolVector(values) => values.len(),
             Self::IntVector(values) => values.len(),
             Self::DoubleVector(values) => values.len(),
+            Self::StringVector(values) => values.len(),
             Self::Tuple(values) => values.len(),
-            Self::Bool(_) | Self::Int(_) | Self::Double(_) => 1,
+            Self::Bool(_) | Self::Int(_) | Self::Double(_) | Self::String(_) => 1,
         }
     }
 
@@ -121,8 +232,9 @@ impl Value {
             Self::BoolVector(values) => values.is_empty(),
             Self::IntVector(values) => values.is_empty(),
             Self::DoubleVector(values) => values.is_empty(),
+            Self::StringVector(values) => values.is_empty(),
             Self::Tuple(values) => values.values.is_empty(),
-            Self::Bool(_) | Self::Int(_) | Self::Double(_) => false,
+            Self::Bool(_) | Self::Int(_) | Self::Double(_) | Self::String(_) => false,
         }
     }
 
@@ -131,39 +243,56 @@ impl Value {
             Self::Bool(_) => Type::Scalar(ScalarType::Bool),
             Self::Int(_) => Type::Scalar(ScalarType::Int),
             Self::Double(_) => Type::Scalar(ScalarType::Double),
+            Self::String(_) => Type::Scalar(ScalarType::String),
             Self::BoolVector(_) => Type::Vector(ScalarType::Bool),
             Self::IntVector(_) => Type::Vector(ScalarType::Int),
             Self::DoubleVector(_) => Type::Vector(ScalarType::Double),
+            Self::StringVector(_) => Type::Vector(ScalarType::String),
             Self::Tuple(values) => Type::Tuple(values.iter().map(Self::value_type).collect()),
         }
     }
 
-    pub(crate) fn canonical_bytes(&self) -> Result<usize, Error> {
+    pub(crate) fn into_canonical_bytes(self) -> Result<usize, Error> {
         let mut total = 0usize;
-        let mut pending = vec![self];
-        while let Some(value) = pending.pop() {
-            let charge = match value {
+        let mut pending = Vec::new();
+        let mut current = Some(self);
+        loop {
+            let Some(mut value) = current.take().or_else(|| pending.pop()) else {
+                return Ok(total);
+            };
+            let charge = match &mut value {
                 Self::Bool(_) | Self::Int(_) | Self::Double(_) => 0,
+                Self::String(value) => value.len(),
                 Self::BoolVector(values) => values.len(),
                 Self::IntVector(values) => values.len().checked_mul(8).ok_or_else(sizing_error)?,
                 Self::DoubleVector(values) => {
                     values.len().checked_mul(8).ok_or_else(sizing_error)?
                 }
-                Self::Tuple(values) => {
-                    pending.try_reserve(values.len()).map_err(|_| {
-                        Error::new(
-                            ErrorKind::ResourceError,
-                            SourceLocation::start(),
-                            "resource sizing failed: allocation_unavailable",
-                        )
-                    })?;
-                    pending.extend(values.iter());
-                    values.len().checked_mul(16).ok_or_else(sizing_error)?
+                Self::StringVector(values) => {
+                    let descriptors = values.len().checked_mul(16).ok_or_else(sizing_error)?;
+                    values.iter().try_fold(descriptors, |bytes, value| {
+                        bytes.checked_add(value.len()).ok_or_else(sizing_error)
+                    })?
+                }
+                Self::Tuple(tuple) => {
+                    let charge = tuple
+                        .values
+                        .len()
+                        .checked_mul(16)
+                        .ok_or_else(sizing_error)?;
+                    let mut children = std::mem::take(&mut tuple.values);
+                    if let Some(child) = children.pop() {
+                        if !pending.is_empty() {
+                            children.push(Self::Tuple(TupleValues { values: pending }));
+                        }
+                        pending = children;
+                        current = Some(child);
+                    }
+                    charge
                 }
             };
             total = total.checked_add(charge).ok_or_else(sizing_error)?;
         }
-        Ok(total)
     }
 }
 
@@ -222,64 +351,89 @@ enum ValueFormatTask<'a> {
 }
 
 pub fn format_value(value: &Value) -> Result<String, Error> {
+    let required = formatted_value_length(value)?;
     let mut output = String::new();
-    let mut pending = vec![ValueFormatTask::Value(value)];
+    format_allocation_attempt()?;
+    output
+        .try_reserve_exact(required)
+        .map_err(|_| formatting_allocation_error())?;
+    write_value(value, &mut output)?;
+    Ok(output)
+}
+
+fn formatted_value_length(value: &Value) -> Result<usize, Error> {
+    let mut output = LengthWriter { length: 0 };
+    write_value(value, &mut output)?;
+    Ok(output.length)
+}
+
+fn write_value(output_value: &Value, output: &mut impl Write) -> Result<(), Error> {
+    let mut pending = Vec::new();
+    reserve_format_tasks(&mut pending, 1)?;
+    pending.push(ValueFormatTask::Value(output_value));
     while let Some(task) = pending.pop() {
         match task {
-            ValueFormatTask::Text(text) => output.push_str(text),
+            ValueFormatTask::Text(text) => output.write_str(text).map_err(formatting_error)?,
             ValueFormatTask::Value(Value::Bool(value)) => {
-                output.push_str(if *value { "true" } else { "false" });
+                output
+                    .write_str(if *value { "true" } else { "false" })
+                    .map_err(formatting_error)?;
             }
             ValueFormatTask::Value(Value::Int(value)) => {
                 write!(output, "{value}").map_err(formatting_error)?;
             }
-            ValueFormatTask::Value(Value::Double(value)) => append_double(&mut output, *value),
+            ValueFormatTask::Value(Value::Double(value)) => append_double(output, *value)?,
+            ValueFormatTask::Value(Value::String(value)) => append_string(output, value)?,
             ValueFormatTask::Value(Value::BoolVector(values)) => {
-                output.push('(');
+                output.write_char('(').map_err(formatting_error)?;
                 for (index, value) in values.iter().enumerate() {
                     if index != 0 {
-                        output.push(' ');
+                        output.write_char(' ').map_err(formatting_error)?;
                     }
-                    output.push_str(if *value { "true" } else { "false" });
+                    output
+                        .write_str(if *value { "true" } else { "false" })
+                        .map_err(formatting_error)?;
                 }
-                output.push(')');
+                output.write_char(')').map_err(formatting_error)?;
             }
             ValueFormatTask::Value(Value::IntVector(values)) => {
-                output.push('(');
+                output.write_char('(').map_err(formatting_error)?;
                 for (index, value) in values.iter().enumerate() {
                     if index != 0 {
-                        output.push(' ');
+                        output.write_char(' ').map_err(formatting_error)?;
                     }
                     write!(output, "{value}").map_err(formatting_error)?;
                 }
-                output.push(')');
+                output.write_char(')').map_err(formatting_error)?;
             }
             ValueFormatTask::Value(Value::DoubleVector(values)) => {
-                output.push('(');
+                output.write_char('(').map_err(formatting_error)?;
                 for (index, value) in values.iter().enumerate() {
                     if index != 0 {
-                        output.push(' ');
+                        output.write_char(' ').map_err(formatting_error)?;
                     }
-                    append_double(&mut output, *value);
+                    append_double(output, *value)?;
                 }
-                output.push(')');
+                output.write_char(')').map_err(formatting_error)?;
+            }
+            ValueFormatTask::Value(Value::StringVector(values)) => {
+                output.write_char('(').map_err(formatting_error)?;
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.write_char(' ').map_err(formatting_error)?;
+                    }
+                    append_string(output, value)?;
+                }
+                output.write_char(')').map_err(formatting_error)?;
             }
             ValueFormatTask::Value(Value::Tuple(values)) => {
-                output.push('[');
-                let task_count = values.len().checked_mul(2).ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::FormattingError,
-                        SourceLocation::start(),
-                        "formatting traversal size overflow",
-                    )
-                })?;
-                pending.try_reserve(task_count).map_err(|_| {
-                    Error::new(
-                        ErrorKind::FormattingError,
-                        SourceLocation::start(),
-                        "unable to allocate formatting traversal",
-                    )
-                })?;
+                output.write_char('[').map_err(formatting_error)?;
+                let task_count = values
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or_else(formatting_size_error)?;
+                reserve_format_tasks(&mut pending, task_count)?;
                 pending.push(ValueFormatTask::Text("]"));
                 for (index, value) in values.iter().enumerate().rev() {
                     pending.push(ValueFormatTask::Value(value));
@@ -290,34 +444,214 @@ pub fn format_value(value: &Value) -> Result<String, Error> {
             }
         }
     }
-    Ok(output)
+    Ok(())
 }
 
-fn append_double(output: &mut String, value: f64) {
+fn reserve_format_tasks(
+    pending: &mut Vec<ValueFormatTask<'_>>,
+    additional: usize,
+) -> Result<(), Error> {
+    format_allocation_attempt()?;
+    pending
+        .try_reserve(additional)
+        .map_err(|_| formatting_allocation_error())
+}
+
+fn format_allocation_attempt() -> Result<(), Error> {
+    if cfg!(test) {
+        let ordinal = FORMAT_ALLOCATION_ORDINAL.with(|value| {
+            let ordinal = value.get();
+            value.set(ordinal.saturating_add(1));
+            ordinal
+        });
+        let refused = FORMAT_FAIL_AT.with(|value| value.get() == Some(ordinal));
+        if refused {
+            return Err(formatting_allocation_error());
+        }
+    }
+    Ok(())
+}
+
+fn append_string(output: &mut impl Write, value: &str) -> Result<(), Error> {
+    output.write_char('"').map_err(formatting_error)?;
+    for character in value.chars() {
+        match character {
+            '"' => output.write_str("\\\"").map_err(formatting_error)?,
+            '\\' => output.write_str("\\\\").map_err(formatting_error)?,
+            '\n' => output.write_str("\\n").map_err(formatting_error)?,
+            '\r' => output.write_str("\\r").map_err(formatting_error)?,
+            '\t' => output.write_str("\\t").map_err(formatting_error)?,
+            '\0' => output.write_str("\\0").map_err(formatting_error)?,
+            character if character.is_control() => {
+                write!(output, "\\u{{{:x}}}", character as u32).map_err(formatting_error)?;
+            }
+            character => output.write_char(character).map_err(formatting_error)?,
+        }
+    }
+    output.write_char('"').map_err(formatting_error)
+}
+
+fn formatting_allocation_error() -> Error {
+    Error::new(
+        ErrorKind::FormattingError,
+        SourceLocation::start(),
+        "unable to allocate formatted String",
+    )
+}
+
+fn append_double(output: &mut impl Write, value: f64) -> Result<(), Error> {
     if value.is_nan() {
-        output.push_str("nan");
+        output.write_str("nan").map_err(formatting_error)?;
     } else if value == f64::INFINITY {
-        output.push_str("inf");
+        output.write_str("inf").map_err(formatting_error)?;
     } else if value == f64::NEG_INFINITY {
-        output.push_str("-inf");
+        output.write_str("-inf").map_err(formatting_error)?;
     } else {
         let magnitude = value.abs();
-        let text = if magnitude >= 1.0e6 || (magnitude != 0.0 && magnitude < 1.0e-4) {
-            format!("{value:e}")
+        let scientific = magnitude >= 1.0e6 || (magnitude != 0.0 && magnitude < 1.0e-4);
+        if scientific {
+            write!(output, "{value:e}").map_err(formatting_error)?;
         } else {
-            value.to_string()
-        };
-        output.push_str(&text);
-        if !text.contains('.') && !text.contains('e') && !text.contains('E') {
-            output.push_str(".0");
+            write!(output, "{value}").map_err(formatting_error)?;
         }
+        if !scientific && value.fract() == 0.0 {
+            output.write_str(".0").map_err(formatting_error)?;
+        }
+    }
+    Ok(())
+}
+
+struct LengthWriter {
+    length: usize,
+}
+
+impl Write for LengthWriter {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.length = self.length.checked_add(text.len()).ok_or(std::fmt::Error)?;
+        Ok(())
     }
 }
 
 fn formatting_error(_: std::fmt::Error) -> Error {
+    formatting_size_error()
+}
+
+fn formatting_size_error() -> Error {
     Error::new(
         ErrorKind::FormattingError,
         SourceLocation::start(),
-        "unable to format value",
+        "formatted String size overflow",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn format_with_failure(value: &Value, fail_at: Option<usize>) -> Result<String, Error> {
+        FORMAT_ALLOCATION_ORDINAL.with(|ordinal| ordinal.set(0));
+        FORMAT_FAIL_AT.with(|failure| failure.set(fail_at));
+        let result = format_value(value);
+        FORMAT_FAIL_AT.with(|failure| failure.set(None));
+        FORMAT_ALLOCATION_ORDINAL.with(|ordinal| ordinal.set(0));
+        result
+    }
+
+    #[test]
+    fn formatting_reports_initial_and_later_allocation_refusals() {
+        let value = Value::Tuple(
+            vec![
+                Value::String("héllo\n".to_owned()),
+                Value::Tuple(vec![Value::Double(2.0)].into()),
+            ]
+            .into(),
+        );
+        for ordinal in 0..=4 {
+            let error = format_with_failure(&value, Some(ordinal)).expect_err("allocation refusal");
+            assert_eq!(error.kind, ErrorKind::FormattingError);
+            assert_eq!(error.message, "unable to allocate formatted String");
+        }
+        assert_eq!(
+            format_with_failure(&value, None).expect("formatting succeeds"),
+            "[\"héllo\\n\" [2.0]]"
+        );
+    }
+
+    #[test]
+    fn formatting_preserves_double_boundaries_string_escapes_and_nested_values() {
+        let doubles = Value::DoubleVector(vec![
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            999_999.0,
+            1_000_000.0,
+            0.0001,
+            0.00001,
+        ]);
+        assert_eq!(
+            format_value(&doubles).expect("Double formatting"),
+            "(nan inf -inf 0.0 -0.0 999999.0 1e6 0.0001 1e-5)"
+        );
+
+        let strings = Value::StringVector(vec![
+            "héllo 世界 🦀".to_owned(),
+            "\"\\\n\r\t\0\u{1}".to_owned(),
+        ]);
+        assert_eq!(
+            format_value(&strings).expect("String formatting"),
+            "(\"héllo 世界 🦀\" \"\\\"\\\\\\n\\r\\t\\0\\u{1}\")"
+        );
+
+        let nested = Value::Tuple(
+            vec![
+                Value::Bool(true),
+                Value::IntVector(vec![-1, 0, 2]),
+                Value::Tuple(vec![Value::String("終".to_owned()), doubles].into()),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            format_value(&nested).expect("nested formatting"),
+            "[true (-1 0 2) [\"終\" (nan inf -inf 0.0 -0.0 999999.0 1e6 0.0001 1e-5)]]"
+        );
+    }
+
+    #[test]
+    fn destructive_sizing_and_drop_handle_wide_and_deep_string_tuples_iteratively() {
+        let thread = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let width = 8_192usize;
+                let wide = Value::Tuple(
+                    (0..width)
+                        .map(|_| Value::String("é".to_owned()))
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+                assert_eq!(
+                    wide.into_canonical_bytes().expect("wide tuple sizing"),
+                    width * (16 + "é".len())
+                );
+
+                let depth = 16_384usize;
+                let mut deep = Value::String("終".to_owned());
+                for _ in 0..depth {
+                    deep = Value::Tuple(vec![deep].into());
+                }
+                assert_eq!(
+                    deep.into_canonical_bytes().expect("deep tuple sizing"),
+                    depth * 16 + "終".len()
+                );
+
+                let mut dropped = Value::String("🦀".to_owned());
+                for _ in 0..depth {
+                    dropped = Value::Tuple(vec![dropped].into());
+                }
+                drop(dropped);
+            })
+            .expect("spawn reduced-stack test");
+        thread.join().expect("wide/deep tuple test");
+    }
 }

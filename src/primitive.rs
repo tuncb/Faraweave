@@ -8,6 +8,11 @@ use crate::strict_float::{self, Binary64Operation};
 use crate::{
     DomainErrorContext, DomainErrorReason, Error, ErrorKind, ScalarType, SourceLocation, Value,
 };
+use std::cell::Cell;
+
+thread_local! {
+    static STRING_COMPARISON_RESULT_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 pub(crate) fn resolve_names(program: &Program) -> Result<(), Error> {
     let mut declaration = 0;
@@ -154,6 +159,7 @@ pub(crate) fn apply_implementation(
         ScalarKernel::LengthBoolVector
             | ScalarKernel::LengthIntVector
             | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::LengthStringVector
     ) {
         let [argument] = arguments else {
             return Err(type_runtime_error(producer, location));
@@ -168,6 +174,7 @@ pub(crate) fn apply_implementation(
             (ScalarKernel::LengthBoolVector, Value::BoolVector(values)) => values.len(),
             (ScalarKernel::LengthIntVector, Value::IntVector(values)) => values.len(),
             (ScalarKernel::LengthDoubleVector, Value::DoubleVector(values)) => values.len(),
+            (ScalarKernel::LengthStringVector, Value::StringVector(values)) => values.len(),
             _ => return Err(type_runtime_error(producer, location)),
         };
         let work = admitted_work(application_plan, 1, arguments, producer, location)?;
@@ -175,9 +182,30 @@ pub(crate) fn apply_implementation(
             .map(|value| (value, false));
     }
 
+    if descriptor.kernel == ScalarKernel::LengthString {
+        let [argument] = arguments else {
+            return Err(type_runtime_error(producer, location));
+        };
+        let Value::String(value) = argument.value else {
+            return Err(type_runtime_error(producer, location));
+        };
+        if lift != crate::LiftMode::ContainerScalar
+            || result_type != ScalarType::Int
+            || argument.conversion != crate::Conversion::Identity
+        {
+            return Err(type_runtime_error(producer, location));
+        }
+        let work = admitted_work(application_plan, 1, arguments, producer, location)?;
+        return apply_vector_length(value.chars().count(), work, location, producer, resources)
+            .map(|value| (value, false));
+    }
+
     if matches!(
         descriptor.kernel,
-        ScalarKernel::SortBoolVector | ScalarKernel::SortIntVector | ScalarKernel::SortDoubleVector
+        ScalarKernel::SortBoolVector
+            | ScalarKernel::SortIntVector
+            | ScalarKernel::SortDoubleVector
+            | ScalarKernel::SortStringVector
     ) {
         let [argument] = arguments else {
             return Err(type_runtime_error(producer, location));
@@ -204,6 +232,25 @@ pub(crate) fn apply_implementation(
             resources,
         )
         .map(|value| (value, true));
+    }
+
+    if matches!(
+        descriptor.kernel,
+        ScalarKernel::EqualsString
+            | ScalarKernel::NotEqualsString
+            | ScalarKernel::LessThanString
+            | ScalarKernel::GreaterThanString
+    ) {
+        return apply_string_comparison(
+            descriptor.kernel,
+            application_plan,
+            arguments,
+            lift,
+            result_type,
+            location,
+            producer,
+            resources,
+        );
     }
 
     if matches!(
@@ -491,14 +538,14 @@ pub(crate) fn apply_reference_consumer_implementation(
         }
     };
     if write_scan_output(&mut output, 0, &accumulator).is_err() {
-        resources.release(&output);
+        resources.release_owned(output)?;
         return Err(type_runtime_error(producer, location));
     }
     for index in 0..length {
         let element = match vector_element(vector.value, index, producer, location) {
             Ok(element) => element,
             Err(error) => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(error);
             }
         };
@@ -513,12 +560,12 @@ pub(crate) fn apply_reference_consumer_implementation(
         ) {
             Ok(value) => value,
             Err(error) => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(error);
             }
         };
         if write_scan_output(&mut output, index + 1, &accumulator).is_err() {
-            resources.release(&output);
+            resources.release_owned(output)?;
             return Err(type_runtime_error(producer, location));
         }
     }
@@ -617,7 +664,7 @@ fn apply_vector_filter_consumer(
         let element = match vector_element(vector.value, index, producer, location) {
             Ok(element) => element,
             Err(error) => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(error);
             }
         };
@@ -631,20 +678,20 @@ fn apply_vector_filter_consumer(
         ) {
             Ok(result) => result,
             Err(error) => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(error);
             }
         };
         match predicate_result {
             Value::Bool(true) => {
                 if push_filter_output(&mut output, element).is_err() {
-                    resources.release(&output);
+                    resources.release_owned(output)?;
                     return Err(type_runtime_error(producer, location));
                 }
             }
             Value::Bool(false) => {}
             _ => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(type_runtime_error(
                     "referenced operation",
                     reference_location,
@@ -672,6 +719,7 @@ fn allocate_filter_output(element_type: ScalarType, length: usize) -> Result<Val
             values.try_reserve_exact(length).map_err(|_| ())?;
             Ok(Value::DoubleVector(values))
         }
+        ScalarType::String => Err(()),
     }
 }
 
@@ -739,6 +787,7 @@ fn allocate_scan_output(element_type: ScalarType, length: usize) -> Result<Value
             values.resize(length, 0.0);
             Ok(Value::DoubleVector(values))
         }
+        ScalarType::String => Err(()),
     }
 }
 
@@ -816,6 +865,114 @@ pub(crate) fn implementation_name(implementation_id: u16) -> Option<&'static str
         .map(|descriptor| descriptor.primitive_name)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_string_comparison(
+    kernel: ScalarKernel,
+    application_plan: ApplicationPlan,
+    arguments: &[SelectedApplicationArgument<'_>],
+    lift: crate::LiftMode,
+    result_type: ScalarType,
+    location: SourceLocation,
+    producer: &str,
+    resources: &mut ResourceContext,
+) -> Result<(Value, bool), Error> {
+    let [left, right] = arguments else {
+        return Err(type_runtime_error(producer, location));
+    };
+    if result_type != ScalarType::Bool
+        || left.conversion != crate::Conversion::Identity
+        || right.conversion != crate::Conversion::Identity
+        || !matches!(
+            lift,
+            crate::LiftMode::Scalar | crate::LiftMode::Vector | crate::LiftMode::DynamicVector
+        )
+    {
+        return Err(type_runtime_error(producer, location));
+    }
+    let accounted = !matches!(lift, crate::LiftMode::Scalar);
+    let count = if accounted {
+        arguments
+            .iter()
+            .find(|argument| argument.value.is_vector())
+            .map_or(0, |argument| argument.value.len())
+    } else {
+        1
+    };
+    let work = admitted_work(application_plan, count, arguments, producer, location)?;
+    let admitted = if accounted {
+        resources.admit_vector_with_work(ScalarType::Bool, count, work, location, producer)?
+    } else {
+        resources.charge_work(work, location, producer)?;
+        let left = string_at(left.value, 0)?;
+        let right = string_at(right.value, 0)?;
+        return Ok((
+            Value::Bool(compare_strings(kernel, left, right, producer, location)?),
+            false,
+        ));
+    };
+    let mut results = Vec::new();
+    if cfg!(test) {
+        STRING_COMPARISON_RESULT_ALLOCATIONS
+            .with(|allocations| allocations.set(allocations.get().saturating_add(1)));
+    }
+    if results.try_reserve_exact(count).is_err() {
+        resources.refund(admitted);
+        return Err(allocation_error(producer, location));
+    }
+    for index in 0..count {
+        let left = match string_at(left.value, index) {
+            Ok(value) => value,
+            Err(error) => {
+                resources.refund(admitted);
+                return Err(error);
+            }
+        };
+        let right = match string_at(right.value, index) {
+            Ok(value) => value,
+            Err(error) => {
+                resources.refund(admitted);
+                return Err(error);
+            }
+        };
+        match compare_strings(kernel, left, right, producer, location) {
+            Ok(value) => results.push(value),
+            Err(error) => {
+                resources.refund(admitted);
+                return Err(error);
+            }
+        }
+    }
+    Ok((Value::BoolVector(results), true))
+}
+
+fn compare_strings(
+    kernel: ScalarKernel,
+    left: &str,
+    right: &str,
+    producer: &str,
+    location: SourceLocation,
+) -> Result<bool, Error> {
+    let ordering = left.as_bytes().cmp(right.as_bytes());
+    match kernel {
+        ScalarKernel::EqualsString => Ok(ordering.is_eq()),
+        ScalarKernel::NotEqualsString => Ok(!ordering.is_eq()),
+        ScalarKernel::LessThanString => Ok(ordering.is_lt()),
+        ScalarKernel::GreaterThanString => Ok(ordering.is_gt()),
+        _ => Err(type_runtime_error(producer, location)),
+    }
+}
+
+fn string_at(value: &Value, index: usize) -> Result<&str, Error> {
+    match value {
+        Value::String(value) => Ok(value),
+        Value::StringVector(values) => values
+            .get(index)
+            .map(String::as_str)
+            .ok_or_else(|| type_runtime_error("application", SourceLocation::start())),
+        _ => Err(type_runtime_error("application", SourceLocation::start())),
+    }
+}
+
 fn scalar_at(value: &Value, index: usize) -> Result<Value, Error> {
     match value {
         Value::Bool(value) => Ok(Value::Bool(*value)),
@@ -836,6 +993,9 @@ fn scalar_at(value: &Value, index: usize) -> Result<Value, Error> {
             .copied()
             .map(Value::Double)
             .ok_or_else(|| type_runtime_error("application", SourceLocation::start())),
+        Value::String(_) | Value::StringVector(_) => {
+            Err(type_runtime_error("application", SourceLocation::start()))
+        }
         Value::Tuple(_) => Err(type_runtime_error("application", SourceLocation::start())),
     }
 }
@@ -928,9 +1088,11 @@ fn invoke_kernel(
         (ScalarKernel::EqualsBool, [left, right])
         | (ScalarKernel::EqualsInt, [left, right])
         | (ScalarKernel::EqualsDouble, [left, right]) => Some(Value::Bool(equals(left, right))),
+        (ScalarKernel::EqualsString, [left, right]) => Some(Value::Bool(equals(left, right))),
         (ScalarKernel::NotEqualsBool, [left, right])
         | (ScalarKernel::NotEqualsInt, [left, right])
         | (ScalarKernel::NotEqualsDouble, [left, right]) => Some(Value::Bool(!equals(left, right))),
+        (ScalarKernel::NotEqualsString, [left, right]) => Some(Value::Bool(!equals(left, right))),
         (ScalarKernel::NotBool, [Value::Bool(value)]) => Some(Value::Bool(!value)),
         (ScalarKernel::AndBool, [Value::Bool(left), Value::Bool(right)]) => {
             Some(Value::Bool(*left && *right))
@@ -959,6 +1121,12 @@ fn invoke_kernel(
         }
         (ScalarKernel::GreaterThanDouble, [Value::Double(left), Value::Double(right)]) => {
             Some(Value::Bool(strict_float::less_than(*right, *left)))
+        }
+        (ScalarKernel::LessThanString, [Value::String(left), Value::String(right)]) => {
+            Some(Value::Bool(left.as_bytes() < right.as_bytes()))
+        }
+        (ScalarKernel::GreaterThanString, [Value::String(left), Value::String(right)]) => {
+            Some(Value::Bool(left.as_bytes() > right.as_bytes()))
         }
         (ScalarKernel::SqrtDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_sqrt(*value)))
@@ -995,9 +1163,12 @@ fn invoke_kernel(
             | ScalarKernel::LengthBoolVector
             | ScalarKernel::LengthIntVector
             | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::LengthString
+            | ScalarKernel::LengthStringVector
             | ScalarKernel::SortBoolVector
             | ScalarKernel::SortIntVector
             | ScalarKernel::SortDoubleVector
+            | ScalarKernel::SortStringVector
             | ScalarKernel::SumIntVector
             | ScalarKernel::SumDoubleVector
             | ScalarKernel::AllOfBoolVector
@@ -1055,10 +1226,21 @@ fn apply_vector_sort(
         (ScalarKernel::SortDoubleVector, Value::DoubleVector(values)) => {
             (ScalarType::Double, values.len())
         }
+        (ScalarKernel::SortStringVector, Value::StringVector(values)) => {
+            (ScalarType::String, values.len())
+        }
         _ => return Err(type_runtime_error(producer, location)),
     };
-    let admitted =
-        resources.admit_vector_with_work(element_type, length, work, location, producer)?;
+    let admitted = if let Value::StringVector(values) = input {
+        let payload = values.iter().try_fold(0usize, |total, value| {
+            total
+                .checked_add(value.len())
+                .ok_or_else(|| resources.size_overflow(Some(length), location, producer))
+        })?;
+        resources.admit_string_vector(length, payload, work, location, producer)?
+    } else {
+        resources.admit_vector_with_work(element_type, length, work, location, producer)?
+    };
     let result = match (kernel, input) {
         (ScalarKernel::SortBoolVector, Value::BoolVector(input)) => {
             let mut output = Vec::new();
@@ -1089,6 +1271,24 @@ fn apply_vector_sort(
             output.extend_from_slice(input);
             output.sort_unstable_by(f64::total_cmp);
             Value::DoubleVector(output)
+        }
+        (ScalarKernel::SortStringVector, Value::StringVector(input)) => {
+            let mut output = Vec::new();
+            if output.try_reserve_exact(length).is_err() {
+                resources.refund(admitted);
+                return Err(allocation_error(producer, location));
+            }
+            for value in input {
+                let mut copy = String::new();
+                if copy.try_reserve_exact(value.len()).is_err() {
+                    resources.refund(admitted);
+                    return Err(allocation_error(producer, location));
+                }
+                copy.push_str(value);
+                output.push(copy);
+            }
+            output.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            Value::StringVector(output)
         }
         _ => {
             resources.refund(admitted);
@@ -1225,6 +1425,7 @@ fn equals(left: &Value, right: &Value) -> bool {
         (Value::Double(left), Value::Int(right)) => {
             strict_float::equal(*left, strict_float::int_to_binary64(*right))
         }
+        (Value::String(left), Value::String(right)) => left == right,
         _ => false,
     }
 }
@@ -1255,6 +1456,14 @@ fn vector_from_scalars(element_type: ScalarType, values: Vec<Value>) -> Result<V
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::DoubleVector),
+        ScalarType::String => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(value) => Ok(value),
+                _ => Err(type_runtime_error("application", SourceLocation::start())),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::StringVector),
     }
 }
 
@@ -1432,5 +1641,81 @@ mod tests {
         assert_eq!(context.requested_elements, Some(usize::MAX));
         assert_eq!(resources.usage.work_units, 0);
         assert_eq!(resources.usage.allocation_attempts, 0);
+    }
+
+    #[test]
+    fn string_comparison_allocates_only_for_a_lifted_result() {
+        let plan = application_plan_from_numeric(1).expect("elementwise plan");
+        let left = Value::String("café".to_owned());
+        let right = Value::String("café".to_owned());
+        let scalar_arguments = [
+            SelectedApplicationArgument {
+                value: &left,
+                conversion: Conversion::Identity,
+            },
+            SelectedApplicationArgument {
+                value: &right,
+                conversion: Conversion::Identity,
+            },
+        ];
+        STRING_COMPARISON_RESULT_ALLOCATIONS.with(|count| count.set(0));
+        let mut scalar_resources = context(ResourceLimits {
+            max_work_units: Some(1),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            apply_string_comparison(
+                ScalarKernel::EqualsString,
+                plan,
+                &scalar_arguments,
+                crate::LiftMode::Scalar,
+                ScalarType::Bool,
+                SourceLocation::start(),
+                "equals",
+                &mut scalar_resources,
+            ),
+            Ok((Value::Bool(true), false))
+        );
+        assert_eq!(
+            STRING_COMPARISON_RESULT_ALLOCATIONS.with(Cell::get),
+            0,
+            "scalar comparison must borrow its Strings directly"
+        );
+
+        let vector_left = Value::StringVector(vec!["a".to_owned(), "β".to_owned()]);
+        let vector_right = Value::String("β".to_owned());
+        let vector_arguments = [
+            SelectedApplicationArgument {
+                value: &vector_left,
+                conversion: Conversion::Identity,
+            },
+            SelectedApplicationArgument {
+                value: &vector_right,
+                conversion: Conversion::Identity,
+            },
+        ];
+        let mut vector_resources = context(ResourceLimits {
+            max_vector_bytes: Some(2),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            apply_string_comparison(
+                ScalarKernel::EqualsString,
+                plan,
+                &vector_arguments,
+                crate::LiftMode::Vector,
+                ScalarType::Bool,
+                SourceLocation::start(),
+                "equals",
+                &mut vector_resources,
+            ),
+            Ok((Value::BoolVector(vec![false, true]), true))
+        );
+        assert_eq!(
+            STRING_COMPARISON_RESULT_ALLOCATIONS.with(Cell::get),
+            1,
+            "lifted comparison must allocate exactly one result vector"
+        );
     }
 }

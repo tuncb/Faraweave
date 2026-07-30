@@ -119,8 +119,8 @@ Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`,
 `4=FanOut`, `5=ApplicationPlans`, `6=OperationReferences`,
-`7=BackendNativeMathV1`, `8=ConnectedApplicationBindings`, and
-`9=ImmutableBindings`; zero is invalid. IDs 1 through 9 are semantic capabilities and
+`7=BackendNativeMathV1`, `8=ConnectedApplicationBindings`,
+`9=ImmutableBindings`, and `10=Strings`; zero is invalid. IDs 1 through 10 are semantic capabilities and
 MUST have class `0`: pairing a known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
 Feature 5 requires semantic minor 1 and physical format minor 1.
@@ -131,13 +131,16 @@ Feature 8 requires semantic minor 2 and physical format minor 2 and is present
 exactly when connected binding nodes/accesses occur.
 Feature 9 requires semantic minor 3 and physical format minor 3 and is present
 exactly when immutable source-binding nodes/accesses occur.
+Feature 10 requires semantic minor 4 and physical format minor 4 and is present
+exactly when a String type or value is used.
 
 `STRS` begins with `count:u32`, followed by `count` descriptors
 `offset:u32, length:u32`, followed by one concatenated byte area. Offsets are
 relative to the start of the byte area. Strings are unique and strictly
 increasing by unsigned UTF-8 byte sequence, descriptors cover the byte area
 contiguously from offset zero, and unused strings are forbidden. Source-unit
-diagnostic names and parameter names reference this pool by `u32` index.
+diagnostic names, parameter names, and String constant payloads reference this
+pool by `u32` index.
 
 ### 4.3 Sources, parameters, types, and constants
 
@@ -148,15 +151,16 @@ declaration_origin:u32, name_origin:u32`.
 
 `TYPE` is `kind:u8, scalar_type:u8, reserved:u16, element_start:u32,
 element_count:u32`. Kinds are `1=Scalar`, `2=Vector`, and `3=Tuple`.
-`scalar_type` is `1=Bool`, `2=Int`, `3=Double`; tuple uses zero.
+`scalar_type` is `1=Bool`, `2=Int`, `3=Double`, `4=String`; tuple uses zero.
 `element_start` and `element_count` are zero except for Tuple. `TYEL` records
 are `type_index:u32`.
 
 `CONS` is `kind:u8, scalar_type:u8, reserved:u16, element_start:u32,
 element_count:u32, payload:u64`. Kinds are `1=Scalar` and `2=Vector`.
-Scalar uses zero element range and stores Bool, Int, or Double bits in
+Scalar uses zero element range and stores Bool, Int, Double, or String data in
 `payload`; Bool permits only `0` or `1`, Int uses the exact two's-complement
-`i64` bit pattern, and Double uses exact IEEE-754 bits. Vector uses zero
+`i64` bit pattern, Double uses exact IEEE-754 bits, and String uses a `STRS`
+index in the low 32 bits with the upper 32 bits zero. Vector uses zero
 payload and identifies its typed `COEL` range. `COEL` is
 `scalar_type:u8, reserved[3], payload:u64` with the same scalar payload rules.
 
@@ -275,6 +279,7 @@ asserts provenance but conveys no trust.
 | `features` | mandatory-class `FEAT` records |
 | `source_units` | `SRCU` plus `STRS` |
 | `parameters` | `PARM` plus `STRS` |
+| `string_values` | canonical `STRS` entries referenced by String `CONS`/`COEL` payloads |
 | `types`, `type_elements` | `TYPE`, `TYEL` |
 | `constants`, `constant_elements` | `CONS`, `COEL` |
 | `nodes`, except the application-plan sidecar | `NODE` |
@@ -293,7 +298,9 @@ backend handle is serialized.
 ## 6. Canonical ordering and program identity
 
 Arena record order is the already-semantic `VerifiedProgram` order; an encoder
-MUST NOT sort, deduplicate, or renumber those records. Features are strictly
+MUST NOT sort, deduplicate, or renumber those records, except that names and
+String values share the canonical sorted, deduplicated `STRS` pool and their
+references are remapped accordingly. Features are strictly
 increasing by numeric ID, the string pool is sorted as specified above, and
 directory order is numeric section-ID order. These rules make repeated
 encoding byte-identical without relying on map iteration or native layout.
@@ -333,6 +340,9 @@ The physical format version and semantic contract version are separate.
 - Format minor 3 is emitted when feature 9 is present. Binding node tags
   8/9/10 and access tags 6/7/8 are invalid without feature 9, semantic 1.3,
   and physical 1.3.
+- Format minor 4 is emitted when feature 10 is present. Scalar-type tag 4 and
+  String `CONS`/`COEL` pool references are invalid without feature 10,
+  semantic 1.4, and physical 1.4.
 - `OPRF` records or feature `6=OperationReferences` require semantic version
   1.1 and physical format minor 1. Semantic 1.0/physical 1.0 artifacts cannot
   opt into that mandatory sidecar capability.
@@ -371,7 +381,7 @@ canonical v1.0 artifacts, while an accepted forward-minor artifact re-encodes
 as canonical v1.0 with advisory extensions omitted. A semantic 1.1 artifact
 using mandatory feature 5 re-encodes as canonical physical v1.1, and feature 8
 re-encodes as canonical physical v1.2; feature 9 re-encodes as canonical
-physical v1.3.
+physical v1.3; feature 10 re-encodes as canonical physical v1.4.
 
 ## 8. Checked decoding and hostile lengths
 
@@ -397,7 +407,7 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known IDs 1 through 9), tag, boolean, optional sentinel, unused
+   class `1` on known IDs 1 through 10), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after
@@ -440,7 +450,7 @@ not part of the artifact.
   4,413-byte golden produced from one verified source program covering all 16
   semantic-1.0 sections, all six node opcodes, every graph sidecar, sorted
   strings, and exact binary64 payload bits. Operation-reference section 18 is
-  covered by constructed semantic-1.1/1.2/1.3 codec tests because no source consumer
+  covered by constructed semantic-1.1/1.2/1.3/1.4 codec tests because no source consumer
   exists in issue #38.
 
 Run:
@@ -508,7 +518,7 @@ issue rather than treating this comparison as authorization.
 
 ## 12. Accepted product, producer, and security policy
 
-Physical formats 1.0 through 1.3 and semantic contracts 1.0 through 1.3, canonical
+Physical formats 1.0 through 1.4 and semantic contracts 1.0 through 1.4, canonical
 program-identity bytes, the `.fwir` extension, and the library and CLI
 spellings above are the stable FWIR v1 product contract. A compatible addition
 uses the same-major

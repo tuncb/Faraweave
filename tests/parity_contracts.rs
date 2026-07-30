@@ -11,6 +11,125 @@ fn formatted(source: &str) -> String {
 }
 
 #[test]
+fn utf8_strings_literals_vectors_operations_and_diagnostics_are_exact() {
+    let cases = [
+        ("\"\"", "\"\""),
+        ("\"Málaga café\"", "\"Málaga café\""),
+        (
+            "\"quote:\\\" slash:\\\\ line:\\n nul:\\0 \\u{1f980}\"",
+            "\"quote:\\\" slash:\\\\ line:\\n nul:\\0 🦀\"",
+        ),
+        ("String()", "()"),
+        ("(\"é\" \"alpha\" \"z\")", "(\"é\" \"alpha\" \"z\")"),
+        ("equals[(\"é\" \"e\") \"é\"]", "(true false)"),
+        ("not_equals[\"é\" (\"é\" \"e\")]", "(false true)"),
+        ("less_than[(\"z\" \"alpha\") \"é\"]", "(true true)"),
+        ("greater_than[\"é\" (\"z\" \"é\")]", "(true false)"),
+        ("length[\"aé🦀\"]", "3"),
+        ("length[(\"a\" \"bb\")]", "2"),
+        (
+            "sort[(\"é\" \"alpha\" \"z\" \"\")]",
+            "(\"\" \"alpha\" \"z\" \"é\")",
+        ),
+        (
+            "[\"x\" (\"a\" \"b\") [\"nul\\0\" true]]",
+            "[\"x\" (\"a\" \"b\") [\"nul\\0\" true]]",
+        ),
+        ("fanout[\"é\" {length[_]} {equals[_ \"é\"]}]", "[1 true]"),
+        ("equals [\"é\" \"é\"]", "true"),
+        (
+            "let word = \"é\"\nlet words = (\"z\" \"é\")\n[equals[word \"é\"] sort[words] word]",
+            "[true (\"z\" \"é\") \"é\"]",
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    for source in [
+        "add[\"a\" \"b\"]",
+        "sum[(\"a\" \"b\")]",
+        "foldl[@equals \"a\" (\"a\")]",
+        "length[[\"a\"]]",
+    ] {
+        assert_eq!(
+            evaluate_source(source).expect_err(source).kind,
+            ErrorKind::TypeError
+        );
+    }
+    let shape = evaluate_source("equals[(\"a\" \"b\") (\"a\")]").expect_err("shape");
+    assert_eq!(shape.kind, ErrorKind::ShapeMismatch);
+    assert_eq!(shape.argument_position, Some(2));
+}
+
+#[test]
+fn utf8_string_parameters_are_raw_exact_and_typed_api_matches_source() {
+    let source = "parameters[name String]\n[name length[name] equals[name \"Málaga café\"]]\n";
+    let result = faraweave::evaluate_source_with_arguments(
+        source,
+        &[Value::String("Málaga café".to_owned())],
+        EvaluationConfiguration::default(),
+    )
+    .expect("String argument");
+    assert_eq!(
+        result.values,
+        vec![Value::Tuple(
+            vec![
+                Value::String("Málaga café".to_owned()),
+                Value::Int(11),
+                Value::Bool(true),
+            ]
+            .into()
+        )]
+    );
+
+    let typed = faraweave::evaluate_source_with_arguments(
+        "parameters[value String]\nvalue\n",
+        &[Value::String(String::new())],
+        EvaluationConfiguration::default(),
+    )
+    .expect("empty String argument");
+    assert_eq!(typed.values, vec![Value::String(String::new())]);
+}
+
+#[test]
+fn utf8_string_literal_failures_have_exact_byte_spans() {
+    for (source, expected_end) in [
+        ("\"unterminated", 14),
+        ("\"bad\\x\"", 6),
+        ("\"surrogate\\u{d800}\"", 18),
+        ("\"too-large\\u{110000}\"", 20),
+        ("\"raw\nnewline\"", 5),
+        ("\"empty-unicode\\u{}\"", 18),
+    ] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::MalformedLiteral, "{source}");
+        let span = error.span.expect("literal span");
+        assert_eq!(span.begin.offset, 1, "{source}");
+        assert_eq!(span.end.offset, expected_end, "{source}");
+    }
+}
+
+#[test]
+fn many_short_string_literals_parse_without_retaining_source_sized_capacities() {
+    let mut source = String::new();
+    source.push('(');
+    for index in 0..2_048 {
+        if index != 0 {
+            source.push(' ');
+        }
+        source.push_str("\"a\"");
+    }
+    source.push(')');
+    let result = evaluate_expression(&source).expect("many short String literals");
+    let Value::StringVector(values) = result.value else {
+        panic!("expected String vector");
+    };
+    assert_eq!(values.len(), 2_048);
+    assert!(values.iter().all(|value| value == "a"));
+}
+
+#[test]
 fn s16_complete_elementwise_matrix() {
     let cases = [
         ("inc[(1 2)]", "(2 3)"),

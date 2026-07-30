@@ -633,6 +633,156 @@ fn operation_reference_artifact_is_versioned_canonical_and_roundtrippable() {
     );
 }
 
+#[test]
+fn canonical_string_1_4_artifact_and_mutations_are_conformant() {
+    let program = compile_source_to_verified_program(
+        "[\"é\" (\"a\" \"é\") equals[\"a\" \"a\"]]\n",
+        "string-conformance.faraweave",
+    )
+    .expect("compile String conformance program");
+    let bytes = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode String FWIR");
+    assert_eq!(read_u16(&bytes, 10), 4);
+    let decoded = decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode String FWIR");
+    assert_eq!(decoded.as_raw().module.semantic_minor, 4);
+    assert!(
+        decoded
+            .as_raw()
+            .features
+            .iter()
+            .any(|feature| *feature == Feature::Strings.numeric())
+    );
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("canonical String reencode"),
+        bytes
+    );
+
+    let (_, types, type_length) = section(&bytes, 6);
+    assert!(
+        bytes[types..types + type_length]
+            .chunks_exact(12)
+            .any(|record| record[1] == 4)
+    );
+    let (_, constants, constant_length) = section(&bytes, 8);
+    let scalar_index = bytes[constants..constants + constant_length]
+        .chunks_exact(20)
+        .position(|record| record[0] == 1 && record[1] == 4)
+        .expect("String scalar constant");
+    let scalar = constants + scalar_index * 20;
+    let (_, elements, element_length) = section(&bytes, 9);
+    assert!(
+        bytes[elements..elements + element_length]
+            .chunks_exact(12)
+            .any(|record| record[0] == 4)
+    );
+
+    let mut high_payload = bytes.clone();
+    put_u64(
+        &mut high_payload,
+        scalar + 12,
+        read_u64(&bytes, scalar + 12) | (1_u64 << 32),
+    );
+    assert!(matches!(
+        decode_fwir(&high_payload, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "scalar_payload"
+            },
+            ..
+        })
+    ));
+
+    let mut out_of_range = bytes.clone();
+    let string_count = read_u32(&bytes, section(&bytes, 3).1);
+    put_u64(&mut out_of_range, elements + 4, u64::from(string_count));
+    assert!(matches!(
+        decode_fwir(&out_of_range, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "string_index"
+            },
+            ..
+        })
+    ));
+
+    let (_, strings, _) = section(&bytes, 3);
+    let data = strings + 4 + read_u32(&bytes, strings) as usize * 8;
+    let mut invalid_utf8 = bytes.clone();
+    invalid_utf8[data] = 0xff;
+    assert!(matches!(
+        decode_fwir(&invalid_utf8, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::InvalidUtf8,
+            section_id: Some(3),
+            ..
+        })
+    ));
+
+    let (_, module, _) = section(&bytes, 1);
+    let mut old_semantic = bytes.clone();
+    put_u16(&mut old_semantic, module + 2, 3);
+    assert!(matches!(
+        decode_fwir(&old_semantic, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                faraweave::MalformedProgram {
+                    invariant: Invariant::UnsupportedVersion,
+                    ..
+                }
+            )),
+            ..
+        })
+    ));
+    let mut old_physical = bytes.clone();
+    put_u16(&mut old_physical, 10, 3);
+    assert!(matches!(
+        decode_fwir(&old_physical, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "feature_format_minor"
+            },
+            ..
+        })
+    ));
+
+    let (_, features, feature_length) = section(&bytes, 2);
+    let feature = bytes[features..features + feature_length]
+        .chunks_exact(4)
+        .position(|record| read_u16(record, 0) == Feature::Strings.numeric())
+        .expect("feature 10");
+    let mut missing_feature = bytes.clone();
+    put_u16(&mut missing_feature, features + feature * 4, 11);
+    missing_feature[features + feature * 4 + 2] = 1;
+    assert!(matches!(
+        decode_fwir(&missing_feature, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                faraweave::MalformedProgram {
+                    invariant: Invariant::MissingFeature,
+                    ..
+                }
+            )),
+            ..
+        })
+    ));
+
+    let (_, nodes, node_length) = section(&bytes, 14);
+    let selected = bytes[nodes..nodes + node_length]
+        .chunks_exact(56)
+        .position(|record| record[0] == 4)
+        .expect("String SelectedApply");
+    let mut wrong_identity = bytes;
+    put_u32(&mut wrong_identity, nodes + selected * 56 + 28, 15);
+    assert!(matches!(
+        decode_fwir(&wrong_identity, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "semantic_id"
+            },
+            ..
+        })
+    ));
+}
+
 fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
     let complete = example_bytes("complete");
     let empty = example_bytes("empty");
@@ -2314,6 +2464,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "canonical-operation-references",
         "canonical-connected-bindings",
         "canonical-immutable-bindings",
+        "canonical-strings",
     ]);
     let behavioral_evidence = BTreeSet::from([
         ("header.section_count", "section-count-limit"),
@@ -2379,6 +2530,10 @@ fn traceability_references_complete_executable_evidence_sets() {
         ("user_binding.node_kind", "user-binding-node-kind"),
         ("user_binding.access_kind", "user-binding-access-kind"),
         ("user_binding.provenance", "user-binding-provenance"),
+        ("strings.feature_version", "string-feature-version"),
+        ("strings.scalar_pool_reference", "string-scalar-reference"),
+        ("strings.vector_pool_reference", "string-vector-reference"),
+        ("strings.semantic_identity", "string-semantic-identity"),
         ("surfaces.source_memory_decoded", "differential-runtime"),
         (
             "surfaces.resources_faults_cleanup",

@@ -42,6 +42,59 @@ fn take_events() -> Vec<ObservedEvent> {
 }
 
 #[test]
+fn utf8_strings_are_semantic_and_physical_1_4_and_roundtrip_exactly() {
+    let source = "parameters[name String]\n[\"nul\\0é\" name equals[name \"é\"] length[name] sort[(\"é\" \"a\" \"\")]]\n";
+    let encoded =
+        compile_source_to_fwir(source, &FwirEncodeOptions::default()).expect("compile strings");
+    assert_eq!(u16::from_le_bytes([encoded[8], encoded[9]]), 1);
+    assert_eq!(u16::from_le_bytes([encoded[10], encoded[11]]), 4);
+
+    let decoded = decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode strings");
+    assert_eq!(decoded.module().semantic_minor, 4);
+    assert!(
+        decoded
+            .as_raw()
+            .features
+            .contains(&Feature::Strings.numeric())
+    );
+    assert!(
+        decoded
+            .as_raw()
+            .string_values
+            .iter()
+            .any(|value| value.as_bytes() == b"nul\0\xc3\xa9")
+    );
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("re-encode strings"),
+        encoded
+    );
+
+    let result = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["é"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("execute decoded strings");
+    assert_eq!(
+        result.formatted,
+        vec!["[\"nul\\0é\" \"é\" true 1 (\"\" \"a\" \"é\")]"]
+    );
+
+    let feature_record = encoded
+        .windows(4)
+        .position(|record| record == [10, 0, 0, 0])
+        .expect("feature 10 record");
+    let mut missing = encoded.clone();
+    missing[feature_record..feature_record + 2].copy_from_slice(&11_u16.to_le_bytes());
+    missing[feature_record + 2] = 1;
+    assert!(decode_fwir(&missing, &FwirDecodeLimits::default()).is_err());
+
+    let mut old_physical = encoded.clone();
+    old_physical[10..12].copy_from_slice(&3_u16.to_le_bytes());
+    assert!(decode_fwir(&old_physical, &FwirDecodeLimits::default()).is_err());
+}
+
+#[test]
 fn public_source_and_decoded_artifact_execution_and_resource_traces_match() {
     let source = "parameters[n Int]\nfanout[iota[n] {inc[_]} {add[_ 10]}]\n";
     let program =

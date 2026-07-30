@@ -2,7 +2,7 @@ use crate::ScalarType;
 use std::collections::TryReserveError;
 
 pub const SUPPORTED_SEMANTIC_MAJOR: u16 = 1;
-pub const SUPPORTED_SEMANTIC_MINOR: u16 = 3;
+pub const SUPPORTED_SEMANTIC_MINOR: u16 = 4;
 
 macro_rules! index_type {
     ($name:ident) => {
@@ -15,6 +15,7 @@ index_type!(SourceUnitIndex);
 index_type!(ParameterIndex);
 index_type!(TypeIndex);
 index_type!(ConstantIndex);
+index_type!(StringValueIndex);
 index_type!(NodeIndex);
 index_type!(OriginIndex);
 index_type!(OperationReferenceIndex);
@@ -41,6 +42,7 @@ pub struct ProgramRanges {
     pub type_elements: IndexRange,
     pub constants: IndexRange,
     pub constant_elements: IndexRange,
+    pub string_values: IndexRange,
     pub nodes: IndexRange,
     pub edges: IndexRange,
     pub shape_checks: IndexRange,
@@ -71,6 +73,7 @@ pub enum Feature {
     BackendNativeMathV1 = 7,
     ConnectedApplicationBindings = 8,
     ImmutableBindings = 9,
+    Strings = 10,
 }
 
 impl Feature {
@@ -133,6 +136,7 @@ pub enum ScalarConstant {
     Bool(bool),
     Int(i64),
     DoubleBits(u64),
+    String(StringValueIndex),
 }
 
 impl Eq for ScalarConstant {}
@@ -284,6 +288,7 @@ pub struct RawProgram {
     pub type_elements: Vec<TypeIndex>,
     pub constants: Vec<ConstantRecord>,
     pub constant_elements: Vec<ScalarConstant>,
+    pub string_values: Vec<String>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub shape_checks: Vec<u32>,
@@ -334,6 +339,7 @@ pub enum RecordKind {
     TypeElement,
     Constant,
     ConstantElement,
+    StringValue,
     Origin,
     OperationReference,
     Node,
@@ -434,6 +440,7 @@ pub enum Arena {
     TypeElement,
     Constant,
     ConstantElement,
+    StringValue,
     Node,
     Edge,
     ShapeCheck,
@@ -531,6 +538,7 @@ impl RawProgramBuilder {
                 type_elements: Vec::new(),
                 constants: Vec::new(),
                 constant_elements: Vec::new(),
+                string_values: Vec::new(),
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 shape_checks: Vec::new(),
@@ -617,6 +625,13 @@ impl RawProgramBuilder {
         ScalarConstant,
         ConstantElement
     );
+    push_method!(
+        push_string_value,
+        string_values,
+        String,
+        StringValue,
+        StringValueIndex
+    );
     push_method!(push_node, nodes, Node, Node, NodeIndex);
     push_method!(push_edge, edges, Edge, Edge);
     push_method!(push_shape_check, shape_checks, u32, ShapeCheck);
@@ -651,6 +666,7 @@ impl RawProgramBuilder {
                 self.raw.constant_elements.len(),
                 Arena::ConstantElement,
             )?,
+            string_values: whole_range(self.raw.string_values.len(), Arena::StringValue)?,
             nodes: whole_range(self.raw.nodes.len(), Arena::Node)?,
             edges: whole_range(self.raw.edges.len(), Arena::Edge)?,
             shape_checks: whole_range(self.raw.shape_checks.len(), Arena::ShapeCheck)?,
@@ -710,6 +726,7 @@ fn verify_program(
             Feature::BackendNativeMathV1.numeric(),
             Feature::ConnectedApplicationBindings.numeric(),
             Feature::ImmutableBindings.numeric(),
+            Feature::Strings.numeric(),
         ]
         .contains(&feature)
         {
@@ -784,6 +801,43 @@ fn verify_program(
             "immutable_bindings_version",
         ));
     }
+    let has_strings = has_feature(program, Feature::Strings);
+    let uses_strings = program
+        .parameters
+        .iter()
+        .any(|parameter| parameter.scalar_type == ScalarType::String)
+        || program.types.iter().any(|record| {
+            matches!(
+                record,
+                TypeRecord::Scalar(ScalarType::String) | TypeRecord::Vector(ScalarType::String)
+            )
+        })
+        || program.constants.iter().any(|record| match record {
+            ConstantRecord::Scalar(ScalarConstant::String(_)) => true,
+            ConstantRecord::Vector { element_type, .. } => *element_type == ScalarType::String,
+            _ => false,
+        })
+        || program
+            .constant_elements
+            .iter()
+            .any(|constant| matches!(constant, ScalarConstant::String(_)))
+        || program.nodes.iter().any(|node| {
+            matches!(
+                node.kind,
+                NodeKind::SelectedApply {
+                    result_element_type: ScalarType::String,
+                    ..
+                }
+            )
+        });
+    if program.module.semantic_minor < 4 && (has_strings || uses_strings) {
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "strings_version",
+        ));
+    }
     if program.module.semantic_minor == 0
         && (has_feature(program, Feature::OperationReferences)
             || !program.operation_references.is_empty())
@@ -812,6 +866,7 @@ fn verify_program(
     verify_parameters(program)?;
     verify_types(program)?;
     verify_constants(program)?;
+    verify_string_values(program)?;
     verify_sources_and_origins(program)?;
     verify_operation_references(program)?;
     verify_node_and_edge_references(program)?;
@@ -915,6 +970,12 @@ fn verify_module_ranges(program: &RawProgram) -> Result<(), VerifyError> {
         program.constant_elements.len(),
         RecordKind::Module,
         "ranges.constant_elements",
+    )?;
+    exact_range(
+        ranges.string_values,
+        program.string_values.len(),
+        RecordKind::Module,
+        "ranges.string_values",
     )?;
     exact_range(
         ranges.nodes,
@@ -1210,6 +1271,7 @@ fn scalar_kind(constant: ScalarConstant) -> ScalarType {
         ScalarConstant::Bool(_) => ScalarType::Bool,
         ScalarConstant::Int(_) => ScalarType::Int,
         ScalarConstant::DoubleBits(_) => ScalarType::Double,
+        ScalarConstant::String(_) => ScalarType::String,
     }
 }
 
@@ -1220,6 +1282,40 @@ fn canonical_constant(constant: ScalarConstant) -> bool {
     let is_nan =
         bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000 && bits & 0x000f_ffff_ffff_ffff != 0;
     !is_nan || bits == 0x7ff8_0000_0000_0000
+}
+
+fn verify_string_values(program: &RawProgram) -> Result<(), VerifyError> {
+    for (index, value) in program.string_values.iter().enumerate() {
+        let used_by_name = program
+            .source_units
+            .iter()
+            .any(|source| source.diagnostic_name == *value)
+            || program
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == *value);
+        let used_by_constant = program.constants.iter().any(|constant| {
+            matches!(
+                constant,
+                ConstantRecord::Scalar(ScalarConstant::String(value_index))
+                    if value_index.0 as usize == index
+            )
+        }) || program.constant_elements.iter().any(|constant| {
+            matches!(
+                constant,
+                ScalarConstant::String(value_index) if value_index.0 as usize == index
+            )
+        });
+        if !used_by_name && !used_by_constant {
+            return Err(malformed(
+                Invariant::InvalidRecord,
+                RecordKind::StringValue,
+                u32::try_from(index).ok(),
+                "unused",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_constants(program: &RawProgram) -> Result<(), VerifyError> {
@@ -1234,6 +1330,16 @@ fn verify_constants(program: &RawProgram) -> Result<(), VerifyError> {
                         RecordKind::Constant,
                         Some(record_index),
                         "value",
+                    ));
+                }
+                if let ScalarConstant::String(index) = value
+                    && program.string_values.get(index.0 as usize).is_none()
+                {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Constant,
+                        Some(record_index),
+                        "string_value",
                     ));
                 }
             }
@@ -1257,6 +1363,16 @@ fn verify_constants(program: &RawProgram) -> Result<(), VerifyError> {
                     "elements",
                 )?;
                 for value in &program.constant_elements[bounds] {
+                    if let ScalarConstant::String(index) = value
+                        && program.string_values.get(index.0 as usize).is_none()
+                    {
+                        return Err(malformed(
+                            Invariant::IndexOutOfBounds,
+                            RecordKind::Constant,
+                            Some(record_index),
+                            "string_value",
+                        ));
+                    }
                     if scalar_kind(*value) != element_type || !canonical_constant(*value) {
                         return Err(malformed(
                             Invariant::InvalidRecord,
@@ -2389,6 +2505,14 @@ fn verify_apply(
             ));
         }
         if accepted.consumption == OperandConsumption::WholeVector && !vector {
+            return Err(malformed(
+                Invariant::InvalidRecord,
+                RecordKind::Edge,
+                Some(node.edges.start.saturating_add(offset as u32)),
+                "operand_consumption",
+            ));
+        }
+        if accepted.consumption == OperandConsumption::AtomicScalar && vector {
             return Err(malformed(
                 Invariant::InvalidRecord,
                 RecordKind::Edge,
@@ -3610,6 +3734,25 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
                 | ValueAccess::BindingMove
         )
     });
+    let needs_strings = program
+        .parameters
+        .iter()
+        .any(|parameter| parameter.scalar_type == ScalarType::String)
+        || program.types.iter().any(|record| {
+            matches!(
+                record,
+                TypeRecord::Scalar(ScalarType::String) | TypeRecord::Vector(ScalarType::String)
+            )
+        })
+        || program.constants.iter().any(|record| match record {
+            ConstantRecord::Scalar(ScalarConstant::String(_)) => true,
+            ConstantRecord::Vector { element_type, .. } => *element_type == ScalarType::String,
+            _ => false,
+        })
+        || program
+            .constant_elements
+            .iter()
+            .any(|constant| matches!(constant, ScalarConstant::String(_)));
     for (required, needed, field) in [
         (Feature::StableSemanticIds, needs_ids, "stable_semantic_ids"),
         (Feature::Tuples, needs_tuples, "tuples"),
@@ -3640,6 +3783,7 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             needs_user_bindings,
             "immutable_bindings",
         ),
+        (Feature::Strings, needs_strings, "strings"),
     ] {
         if needed && !has_feature(program, required) {
             return Err(malformed(
@@ -3664,6 +3808,14 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             RecordKind::Module,
             None,
             "superfluous_immutable_bindings",
+        ));
+    }
+    if has_feature(program, Feature::Strings) && !needs_strings {
+        return Err(malformed(
+            Invariant::InvalidRecord,
+            RecordKind::Module,
+            None,
+            "superfluous_strings",
         ));
     }
     Ok(())
@@ -7002,6 +7154,34 @@ mod tests {
         };
         *name_origin = OriginIndex(u32::MAX);
         verify_error(invalid_origin, Invariant::IndexOutOfBounds);
+    }
+
+    #[test]
+    fn string_feature_and_value_arena_invariants_are_rejected() {
+        let mut superfluous = scalar_program();
+        superfluous.module.semantic_minor = 4;
+        superfluous.features.push(Feature::Strings.numeric());
+        superfluous.module.ranges.features.count += 1;
+        verify_error(superfluous, Invariant::InvalidRecord);
+
+        let mut missing = crate::lowering::compile_source_with_name("\"é\"\n", "string.faraweave")
+            .map(|program| program.raw)
+            .unwrap_or_else(|error| panic!("String fixture: {error:?}"));
+        missing
+            .features
+            .retain(|feature| *feature != Feature::Strings.numeric());
+        missing.module.ranges.features.count -= 1;
+        verify_error(missing, Invariant::MissingFeature);
+
+        let mut invalid =
+            crate::lowering::compile_source_with_name("(\"a\" \"b\")\n", "string.faraweave")
+                .map(|program| program.raw)
+                .unwrap_or_else(|error| panic!("String fixture: {error:?}"));
+        let Some(ScalarConstant::String(index)) = invalid.constant_elements.first_mut() else {
+            panic!("missing String element");
+        };
+        index.0 = u32::MAX;
+        verify_error(invalid, Invariant::IndexOutOfBounds);
     }
 
     #[test]

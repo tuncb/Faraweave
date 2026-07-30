@@ -225,6 +225,7 @@ fn string_pool_shape(program: &VerifiedProgram) -> Result<(u32, usize, u64), Fwi
         .source_units
         .len()
         .checked_add(raw.parameters.len())
+        .and_then(|count| count.checked_add(raw.string_values.len()))
         .ok_or(FwirEncodeError::CountOverflow {
             field: "string_references",
         })?;
@@ -253,6 +254,25 @@ fn string_pool_shape(program: &VerifiedProgram) -> Result<(u32, usize, u64), Fwi
             bytes = checked_add(
                 bytes,
                 u64::try_from(parameter.name.len())
+                    .map_err(|_| FwirEncodeError::SizeOverflow { field: "strings" })?,
+                "strings",
+            )?;
+        }
+    }
+    for (index, value) in raw.string_values.iter().enumerate() {
+        let seen_in_names =
+            name_already_seen(program, raw.source_units.len(), raw.parameters.len(), value);
+        let seen_in_values = raw.string_values[..index]
+            .iter()
+            .any(|prior| prior == value);
+        if !seen_in_names && !seen_in_values {
+            checked_count(value.len(), "string")?;
+            count = count
+                .checked_add(1)
+                .ok_or(FwirEncodeError::CountOverflow { field: "strings" })?;
+            bytes = checked_add(
+                bytes,
+                u64::try_from(value.len())
                     .map_err(|_| FwirEncodeError::SizeOverflow { field: "strings" })?,
                 "strings",
             )?;
@@ -415,6 +435,12 @@ fn preflight(
         total_size,
         format_minor: if raw
             .features
+            .binary_search(&crate::Feature::Strings.numeric())
+            .is_ok()
+        {
+            4
+        } else if raw
+            .features
             .binary_search(&crate::Feature::ImmutableBindings.numeric())
             .is_ok()
         {
@@ -460,6 +486,11 @@ fn collect_strings<'a>(
     for parameter in &program.as_raw().parameters {
         if !strings.contains(&parameter.name.as_str()) {
             strings.push(&parameter.name);
+        }
+    }
+    for value in &program.as_raw().string_values {
+        if !strings.contains(&value.as_str()) {
+            strings.push(value);
         }
     }
     strings.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -531,15 +562,29 @@ fn scalar_type(value: ScalarType) -> u8 {
         ScalarType::Bool => 1,
         ScalarType::Int => 2,
         ScalarType::Double => 3,
+        ScalarType::String => 4,
     }
 }
 
-fn scalar_payload(value: ScalarConstant) -> (u8, u64) {
-    match value {
+fn scalar_payload(
+    raw: &crate::RawProgram,
+    strings: &[&str],
+    value: ScalarConstant,
+) -> Result<(u8, u64), FwirEncodeError> {
+    Ok(match value {
         ScalarConstant::Bool(value) => (1, u64::from(value)),
         ScalarConstant::Int(value) => (2, u64::from_le_bytes(value.to_le_bytes())),
         ScalarConstant::DoubleBits(value) => (3, value),
-    }
+        ScalarConstant::String(index) => {
+            let value =
+                raw.string_values
+                    .get(index.0 as usize)
+                    .ok_or(FwirEncodeError::CountOverflow {
+                        field: "string_value",
+                    })?;
+            (4, u64::from(string_index(strings, value)?))
+        }
+    })
 }
 
 fn cardinality(value: Option<Cardinality>) -> (u8, u32) {
@@ -640,7 +685,7 @@ fn encode_sections(
     for constant in &raw.constants {
         match constant {
             ConstantRecord::Scalar(value) => {
-                let (scalar, payload) = scalar_payload(*value);
+                let (scalar, payload) = scalar_payload(raw, strings, *value)?;
                 put_u8(output, 1);
                 put_u8(output, scalar);
                 put_u16(output, 0);
@@ -662,7 +707,7 @@ fn encode_sections(
         }
     }
     for element in &raw.constant_elements {
-        let (scalar, payload) = scalar_payload(*element);
+        let (scalar, payload) = scalar_payload(raw, strings, *element)?;
         put_u8(output, scalar);
         output.extend_from_slice(&[0; 3]);
         put_u64(output, payload);

@@ -6,9 +6,9 @@ language defined by the current Bennu specifications at source commit
 development-time differential oracle; the shipped library and executable
 neither invoke nor require it.
 
-The language has rank-0 `Bool`, signed 64-bit `Int`, and IEEE-754 binary64
-`Double` scalars; homogeneous rank-1 vectors; and immutable heterogeneous
-structural tuples. The public primitives are:
+The language has rank-0 `Bool`, signed 64-bit `Int`, IEEE-754 binary64
+`Double`, and UTF-8 `String` scalars; homogeneous rank-1 vectors; and immutable
+heterogeneous structural tuples. The public primitives are:
 
 | Group | Primitives |
 | --- | --- |
@@ -32,7 +32,9 @@ structural tuples. The public primitives are:
 
 Calls use adjacent brackets (`sub[10 2.5]`) or right-associative prefix syntax
 (`inc iota 3`). Vectors use parentheses: `(1 2 3)`, `(false true)`,
-`Int()`. Tuples use square brackets: `[1 2.5 true]`. A tuple supplied to a
+`("a" "é")`, `Int()`, or `String()`. String literals are double quoted and
+support `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, and `\u{...}` escapes. Tuples use
+square brackets: `[1 2.5 true]`. A tuple supplied to a
 prefix primitive is spread by one level (`add [1 2]`); an adjacent call
 preserves it as one argument (`add[[1 2]]`, an arity error). Explicit sequential
 fan-out evaluates its operand once and branches left-to-right:
@@ -83,17 +85,20 @@ partial result on overflow; integer `div` truncates toward zero and reports
 division by zero as a structured domain error. Double results canonicalize
 NaNs; signed zero, infinities, gradual underflow, IEEE division, and unordered
 comparisons are preserved. Canonical output includes visible `.0` for integral
-Doubles.
+Doubles. String equality is exact UTF-8 byte equality and ordering is unsigned
+UTF-8 byte lexicographic order; strings are never normalized.
 
-`length` accepts a homogeneous Bool, Int, or Double vector, including a typed
-empty or dynamically sized vector, and returns its element count as an Int. It
-borrows the existing vector without copying it and charges one semantic work
-unit independently of the vector length.
+`length` accepts a String scalar or a homogeneous Bool, Int, Double, or String
+vector, including a typed empty or dynamically sized vector. A scalar String
+returns its Unicode scalar-value count; a vector returns its element count.
+It borrows the existing value without copying it and charges one semantic work
+unit independently of its size.
 
-`sort` accepts those same vector types and returns a newly owned ascending
-vector without mutating its input. Bool and Int use their ordinary order;
-Double uses a total bit-defined order with `-0.0` before `0.0` and canonical
-NaN after positive infinity, while semantic work is exactly the input length.
+`sort` accepts Bool, Int, Double, and String vectors and returns a newly owned
+ascending vector without mutating its input. Bool and Int use their ordinary
+order; Double uses a total bit-defined order with `-0.0` before `0.0` and
+canonical NaN after positive infinity; String uses unsigned UTF-8 byte order.
+Semantic work is exactly the input length.
 
 `sum` accepts an Int or Double vector and reduces it left-to-right from typed
 zero. Int addition is checked at every element; Double addition uses the
@@ -217,7 +222,7 @@ and `evaluate_verified_program_with_arguments`. Named compilation retains a
 logical source name inside the artifact so later execution diagnostics do not
 depend on the artifact's filesystem path.
 
-FWIR v1 commits to physical formats 1.0 through 1.3 and semantic contract 1.3,
+FWIR v1 commits to physical formats 1.0 through 1.4 and semantic contract 1.4,
 `.fwir`, and the documented API and CLI spellings. The canonical
 semantic/physical-1.0 corpus remains accepted and round-trips byte-for-byte.
 Artifacts that use explicit application plans carry mandatory feature
@@ -228,7 +233,8 @@ backend-native math identities carry mandatory feature
 `7=BackendNativeMathV1`; explicit connected bindings carry mandatory feature
 `8=ConnectedApplicationBindings` and physical format 1.2; immutable source
 bindings carry mandatory feature `9=ImmutableBindings` and physical format
-1.3. Artifacts without these capabilities need not carry the corresponding
+1.3; String values carry mandatory feature `10=Strings` and physical format
+1.4. Artifacts without these capabilities need not carry the corresponding
 feature.
 Unknown class-1 advisory features and explicitly optional, non-identity
 forward-minor sections may be skipped. Unknown mandatory semantics,
@@ -253,22 +259,25 @@ The parser is extension-agnostic. New examples use `.faraweave`; retained
 A leading header declares ordered scalar inputs:
 
 ```faraweave
-parameters[count Int scale Double enabled Bool]
+parameters[count Int scale Double enabled Bool label String]
 count
 add[scale count]
 not[enabled]
+length[label]
 ```
 
 Run it with an explicit boundary:
 
 ```sh
-faraweave run program.faraweave -- 3 2.5 true
+faraweave run program.faraweave -- 3 2.5 true "Málaga café"
 ```
 
 Bool accepts only `true`/`false`; Int uses canonical signed decimal without
 `+`, leading zeros, or `-0`; Double requires a decimal point or exponent, or
 exactly `inf`, `-inf`, or `nan`. Count errors precede decoding, static source
-errors precede binding, and all decoding precedes execution.
+errors precede binding, and all decoding precedes execution. String arguments
+are exact command-line UTF-8 values: source escapes are not interpreted, empty
+strings are valid, and invalid host Unicode is rejected before execution.
 
 ## Errors, transactions, and profiles
 
