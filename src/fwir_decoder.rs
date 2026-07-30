@@ -143,7 +143,14 @@ impl std::fmt::Display for FwirDecodeError {
     }
 }
 
-impl std::error::Error for FwirDecodeError {}
+impl std::error::Error for FwirDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            FwirDecodeErrorKind::MalformedProgram(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Section {
