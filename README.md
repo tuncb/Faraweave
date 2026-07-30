@@ -51,6 +51,12 @@ supplies its elements. Completion must be exact, evaluates template
 expressions before the operand, and creates no partial function—`add[10]`
 remains an arity error. Inside bracket and tuple sibling lists whitespace keeps
 its existing separator meaning, so `inc[add[1] 2]` is not connected syntax.
+Explicit connected placeholders remove that sibling ambiguity:
+`add[10 _] 20` is `30`, `add[_] [10 20]` is `30`,
+`sub[_2 _1] [1 2]` is `1`, and `mul[_1 _1] (2 3)` is `(4 9)`.
+`_` uses the whole scalar/vector operand or spreads one immediate tuple level;
+`_n` selects a one-based immediate element. Repeated selections borrow one
+evaluate-once operand, and `inc[add[1 _] 2]` remains one complete expression.
 
 Elementwise calls broadcast scalars over vectors and require equal vector
 lengths. Singleton vectors stay vectors. Exact overloads win; the only
@@ -193,7 +199,7 @@ and `evaluate_verified_program_with_arguments`. Named compilation retains a
 logical source name inside the artifact so later execution diagnostics do not
 depend on the artifact's filesystem path.
 
-FWIR v1 commits to physical formats 1.0 and 1.1, semantic contract 1.1,
+FWIR v1 commits to physical formats 1.0, 1.1, and 1.2 and semantic contract 1.2,
 `.fwir`, and the documented API and CLI spellings. The canonical
 semantic/physical-1.0 corpus remains accepted and round-trips byte-for-byte.
 Artifacts that use explicit application plans carry mandatory feature
@@ -201,7 +207,8 @@ Artifacts that use explicit application plans carry mandatory feature
 stable operation-reference sidecar carry mandatory feature
 `6=OperationReferences` and physical format 1.1; artifacts that use the
 backend-native math identities carry mandatory feature
-`7=BackendNativeMathV1`. Artifacts without these capabilities need not carry
+`7=BackendNativeMathV1`; explicit connected bindings carry mandatory feature
+`8=ConnectedApplicationBindings` and physical format 1.2. Artifacts without these capabilities need not carry
 the corresponding feature.
 Unknown class-1 advisory features and explicitly optional, non-identity
 forward-minor sections may be skipped. Unknown mandatory semantics,
@@ -301,7 +308,8 @@ manifest through GitHub OIDC, and publishes as its final mutation.
 ## Deliberate differences from Anka and Rust adaptations
 
 Anka is inspiration, not a compatibility target. Faraweave keeps explicit
-bracket calls, exact placeholder-free connected completion, checked Int64
+bracket calls, exact placeholder-free completion plus immediate `_`/`_n`
+connected bindings, checked Int64
 arithmetic, fixed one-level tuple spreading,
 sequential brace-delimited fan-out with one `_`, deterministic profile-v2
 tuple charges, and `iota` as its sole sequence constructor. It has no implicit

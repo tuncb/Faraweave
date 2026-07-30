@@ -413,15 +413,23 @@ fn preflight(
         string_count,
         string_reference_count,
         total_size,
-        format_minor: u16::from(
-            raw.features
-                .binary_search(&crate::Feature::ApplicationPlans.numeric())
-                .is_ok()
-                || raw
-                    .features
-                    .binary_search(&crate::Feature::OperationReferences.numeric())
-                    .is_ok(),
-        ),
+        format_minor: if raw
+            .features
+            .binary_search(&crate::Feature::ConnectedApplicationBindings.numeric())
+            .is_ok()
+        {
+            2
+        } else {
+            u16::from(
+                raw.features
+                    .binary_search(&crate::Feature::ApplicationPlans.numeric())
+                    .is_ok()
+                    || raw
+                        .features
+                        .binary_search(&crate::Feature::OperationReferences.numeric())
+                        .is_ok(),
+            )
+        },
     })
 }
 
@@ -669,6 +677,8 @@ fn encode_sections(
             ValueAccess::WholeValue => (1, 0),
             ValueAccess::TupleElement(index) => (2, index),
             ValueAccess::FanOutOperandBorrow => (3, 0),
+            ValueAccess::ConnectedBindingWhole => (4, 0),
+            ValueAccess::ConnectedBindingElement(index) => (5, index),
         };
         let (cardinality, cardinality_length) = cardinality(edge.cardinality);
         put_u8(output, access.0);
@@ -752,6 +762,7 @@ fn encode_sections(
                 ],
             ),
             NodeKind::PrefixSpreadPrepare => (5, 0, 0, [0; 8]),
+            NodeKind::ConnectedBinding => (7, 0, 0, [0; 8]),
             NodeKind::FanOut {
                 branches,
                 keyword_origin,

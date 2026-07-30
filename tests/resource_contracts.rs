@@ -31,6 +31,8 @@ static SCANL_FAULT_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::n
 static FILTER_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static FILTER_REFUSAL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static CONNECTED_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static CONNECTED_BINDING_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> =
+    Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
@@ -626,6 +628,105 @@ fn connected_completion_preserves_template_first_operand_once_resource_order() {
     )
     .expect("erased authored tuple requires no tuple profile");
     assert_eq!(v1.value, Value::Int(30));
+}
+
+fn observe_connected_binding_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = CONNECTED_BINDING_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+#[test]
+fn connected_binding_is_template_first_operand_once_and_cleanup_exact() {
+    CONNECTED_BINDING_RESOURCE_EVENTS
+        .lock()
+        .expect("event lock")
+        .clear();
+    let repeated = evaluate_expression_with_observer(
+        "mul[_1 _1] (2 3)",
+        EvaluationConfiguration::default(),
+        observe_connected_binding_resource_event,
+    )
+    .expect("repeated binding");
+    assert_eq!(repeated.value, Value::IntVector(vec![4, 9]));
+    assert_eq!(repeated.usage.allocation_attempts, 2);
+    assert_eq!(repeated.usage.work_units, 2);
+    let events = CONNECTED_BINDING_RESOURCE_EVENTS
+        .lock()
+        .expect("event lock")
+        .clone();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == faraweave::ResourceEventKind::Admission
+                    && event.producer == "vector_literal"
+            })
+            .count(),
+        1
+    );
+
+    let template_failure =
+        evaluate_expression("add[div[1 0] _] iota[3]").expect_err("template fails first");
+    assert_eq!(template_failure.kind, ErrorKind::DomainError);
+    assert_eq!(
+        template_failure.usage,
+        Some(faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 0,
+            work_units: 1,
+            allocation_attempts: 0,
+        })
+    );
+
+    CONNECTED_BINDING_RESOURCE_EVENTS
+        .lock()
+        .expect("event lock")
+        .clear();
+    let refusal = evaluate_expression_with_observer(
+        "mul[_1 _1] (2 3)",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+        observe_connected_binding_resource_event,
+    )
+    .expect_err("result allocation refusal");
+    assert_eq!(refusal.kind, ErrorKind::ResourceError);
+    let usage = refusal.usage.expect("post-cleanup usage");
+    assert_eq!(usage.live_evaluation_bytes, 0);
+    assert_eq!(usage.allocation_attempts, 2);
+    let events = CONNECTED_BINDING_RESOURCE_EVENTS
+        .lock()
+        .expect("event lock")
+        .clone();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == faraweave::ResourceEventKind::Admission
+                    && event.producer == "vector_literal"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == faraweave::ResourceEventKind::Release)
+            .count(),
+        1
+    );
 }
 
 #[test]

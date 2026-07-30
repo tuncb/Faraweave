@@ -1214,8 +1214,66 @@ fn connected_completion_scalar_vector_tuple_chain_and_boundaries_are_exact() {
         assert_eq!(error.primitive.as_deref(), Some("add"), "{source}");
         assert!(error.connected_application.is_none(), "{source}");
     }
-    let placeholder = evaluate_expression("add[_] 20").expect_err("placeholder not exposed");
-    assert_eq!(placeholder.kind, ErrorKind::SyntaxError);
+    assert_eq!(formatted("inc[_] 20"), "21");
+}
+
+#[test]
+fn connected_placeholders_bind_once_select_reorder_and_span_every_operand_kind() {
+    for (source, expected) in [
+        ("add[10 _] 20", "30"),
+        ("add[_] [10 20]", "30"),
+        ("sub[_2 _1] [1 2]", "1"),
+        ("mul[_1 _1] (2 3)", "(4 9)"),
+        ("inc[add[1 _] 2]", "4"),
+        ("[add[1 _] 2]", "[3]"),
+        ("add[10 _1] 20", "30"),
+        ("add[_2 _1] [1 2.5]", "3.5"),
+        ("sum[_] (1 2 3)", "6"),
+        ("add[_] fanout[1 {add[_ 9]} {add[_ 19]}]", "30"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+    let parameterized = faraweave::evaluate_source_with_arguments(
+        "parameters[left Int right Int]\nsub[_2 _1] [left right]\n",
+        &[Value::Int(1), Value::Int(2)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("parameter tuple operand");
+    assert_eq!(parameterized.values, [Value::Int(1)]);
+}
+
+#[test]
+fn connected_placeholder_failures_are_structured_and_fanout_stays_distinct() {
+    for (source, reason) in [
+        (
+            "add[_2 1] 2",
+            ConnectedApplicationErrorReason::PlaceholderIndexOutOfRange,
+        ),
+        (
+            "add[_] []",
+            ConnectedApplicationErrorReason::EmptyTupleOperand,
+        ),
+        (
+            "add[[_]] 1",
+            ConnectedApplicationErrorReason::NestedPlaceholder,
+        ),
+        ("add[_]", ConnectedApplicationErrorReason::MissingOperand),
+        (
+            "_1",
+            ConnectedApplicationErrorReason::PlaceholderOutsideTemplate,
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(
+            error
+                .connected_application
+                .as_ref()
+                .map(|context| context.reason),
+            Some(reason),
+            "{source}: {error:?}"
+        );
+    }
+    assert_eq!(formatted("fanout[2 {inc[_]} {mul[_ 3]}]"), "[3 6]");
 }
 
 #[test]
@@ -1359,6 +1417,15 @@ fn deep_unary_programs_use_iterative_parse_analysis_and_evaluation() {
     }
     connected.push('1');
     let evaluated = evaluate_expression(&connected).expect("4,000-deep connected program");
+    assert_eq!(evaluated.value, Value::Int(4_001));
+    assert_eq!(evaluated.usage.work_units, DEPTH);
+
+    let mut explicit = String::with_capacity(DEPTH * 7 + 1);
+    for _ in 0..DEPTH {
+        explicit.push_str("inc[_] ");
+    }
+    explicit.push('1');
+    let evaluated = evaluate_expression(&explicit).expect("4,000-deep explicit connected program");
     assert_eq!(evaluated.value, Value::Int(4_001));
     assert_eq!(evaluated.usage.work_units, DEPTH);
 }

@@ -28,6 +28,11 @@ Semantic FWIR 1.1 application plans extend those selected IDs with registry
 owned operand-consumption, result-cardinality, and resource-work metadata.
 Physical section 17 records the selected plan for feature-5 artifacts, while
 1.0 artifacts reconstruct the same legacy plan from their implementation ID.
+Semantic/physical FWIR 1.2 adds feature 8 for explicit connected bindings.
+Lowering emits one `ConnectedBinding` after authored template nodes and the
+operand, then binding-only whole/element borrow edges into exactly one selected
+call; verification rejects escape, cross-call use, cycles, and ambiguous
+ownership before the interpreter executes.
 
 `VerifiedProgram` is an in-process trust boundary, not a serialized ABI.
 Callers may build `RawProgram`, but only complete verification can construct a

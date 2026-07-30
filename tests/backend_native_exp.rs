@@ -350,7 +350,7 @@ fn exp_fwir_roundtrip_and_malformed_identities_are_checked() {
         .map(|index| feature_offset + index * 4)
         .expect("backend-native feature record");
     let mut missing_feature = bytes.clone();
-    missing_feature[feature..feature + 2].copy_from_slice(&8_u16.to_le_bytes());
+    missing_feature[feature..feature + 2].copy_from_slice(&9_u16.to_le_bytes());
     missing_feature[feature + 2] = 1;
     let error = decode_fwir(&missing_feature, &FwirDecodeLimits::default())
         .expect_err("missing backend-native feature");

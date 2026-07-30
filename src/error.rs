@@ -155,6 +155,11 @@ pub enum ConnectedApplicationErrorReason {
     AlreadyComplete,
     EmptyTupleOperand,
     RuntimeTupleOperand,
+    InvalidPlaceholder,
+    PlaceholderOutsideTemplate,
+    NestedPlaceholder,
+    MissingOperand,
+    PlaceholderIndexOutOfRange,
 }
 
 impl ConnectedApplicationErrorReason {
@@ -166,6 +171,11 @@ impl ConnectedApplicationErrorReason {
             Self::AlreadyComplete => "already_complete",
             Self::EmptyTupleOperand => "empty_tuple_operand",
             Self::RuntimeTupleOperand => "runtime_tuple_operand",
+            Self::InvalidPlaceholder => "invalid_placeholder",
+            Self::PlaceholderOutsideTemplate => "placeholder_outside_template",
+            Self::NestedPlaceholder => "nested_placeholder",
+            Self::MissingOperand => "missing_operand",
+            Self::PlaceholderIndexOutOfRange => "placeholder_index_out_of_range",
         }
     }
 }

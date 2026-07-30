@@ -118,14 +118,17 @@ mandatory semantic feature and class `1` is optional advisory metadata.
 Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`,
-`4=FanOut`, `5=ApplicationPlans`, `6=OperationReferences`, and
-`7=BackendNativeMathV1`; zero is invalid. IDs 1 through 7 are semantic capabilities and
+`4=FanOut`, `5=ApplicationPlans`, `6=OperationReferences`,
+`7=BackendNativeMathV1`, and `8=ConnectedApplicationBindings`; zero is
+invalid. IDs 1 through 8 are semantic capabilities and
 MUST have class `0`: pairing a known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
 Feature 5 requires semantic minor 1 and physical format minor 1.
 Feature 6 requires semantic minor 1 and physical format minor 1.
 Feature 7 requires semantic minor 1 but does not by itself raise the physical
 format minor.
+Feature 8 requires semantic minor 2 and physical format minor 2 and is present
+exactly when connected binding nodes/accesses occur.
 
 `STRS` begins with `count:u32`, followed by `count` descriptors
 `offset:u32, length:u32`, followed by one concatenated byte area. Offsets are
@@ -163,8 +166,9 @@ payload and identifies its typed `COEL` range. `COEL` is
 `EDGE` is `producer:u32, argument_position:u32, access:u8,
 cardinality_kind:u8, conversion:u8, ownership:u8, access_index:u32,
 cardinality_length:u32, origin:u32`. Access is `1=WholeValue`,
-`2=TupleElement`, or `3=FanOutOperandBorrow`; only TupleElement uses
-`access_index`. Cardinality is `0=None`, `1=StaticScalar`,
+`2=TupleElement`, `3=FanOutOperandBorrow`, `4=ConnectedBindingWhole`, or
+`5=ConnectedBindingElement`. TupleElement and ConnectedBindingElement use a
+zero-based `access_index`; the other accesses require zero. Cardinality is `0=None`, `1=StaticScalar`,
 `2=StaticVector`, or `3=DynamicVector`; only StaticVector uses
 `cardinality_length`. Conversion is `1=Identity` or
 `2=PromoteIntToDouble`. Ownership is `1=OwnedInput`,
@@ -193,14 +197,15 @@ placeholder_origin:u32, origin:u32`.
 | 24 | 32 | eight variant `u32` words `a0` through `a7` |
 
 Kinds are `1=Constant`, `2=ParameterBorrow`, `3=TupleConstruct`,
-`4=SelectedApply`, `5=PrefixSpreadPrepare`, and `6=FanOut`. Cardinality uses
+`4=SelectedApply`, `5=PrefixSpreadPrepare`, `6=FanOut`, and
+`7=ConnectedBinding`. Cardinality uses
 the `EDGE` tags. Lift is `0` outside SelectedApply and otherwise `1=Scalar`,
 `2=Vector`, or `3=DynamicVector`; result-element scalar type is likewise zero
 outside SelectedApply.
 
 - Constant: `a0=constant`.
 - ParameterBorrow: `a0=parameter`.
-- TupleConstruct and PrefixSpreadPrepare: all variant words are zero.
+- TupleConstruct, PrefixSpreadPrepare, and ConnectedBinding: all variant words are zero.
 - SelectedApply: `a0=primitive_id`, `a1=signature_id`,
   `a2=implementation_id`, `a3=primitive_origin`,
   `a4=static_anchor` (`NONE` when absent), `a5=dynamic_check_start`,
@@ -314,6 +319,9 @@ The physical format version and semantic contract version are separate.
   no greater than its supported minor.
 - Format minor 1 is emitted when feature 5 or feature 6 is present; either
   sidecar feature at format or semantic minor 0 is noncanonical/unsupported.
+- Format minor 2 is emitted when feature 8 is present. Connected-binding node
+  tag 7 and access tags 4/5 are invalid without feature 8, semantic 1.2, and
+  physical 1.2.
 - `OPRF` records or feature `6=OperationReferences` require semantic version
   1.1 and physical format minor 1. Semantic 1.0/physical 1.0 artifacts cannot
   opt into that mandatory sidecar capability.
@@ -350,7 +358,8 @@ feature; those forward-compatible bytes are not retained in
 `VerifiedProgram`. Decode-encode is therefore byte-identical for supported
 canonical v1.0 artifacts, while an accepted forward-minor artifact re-encodes
 as canonical v1.0 with advisory extensions omitted. A semantic 1.1 artifact
-using mandatory feature 5 re-encodes as canonical physical v1.1.
+using mandatory feature 5 re-encodes as canonical physical v1.1, and feature 8
+re-encodes as canonical physical v1.2.
 
 ## 8. Checked decoding and hostile lengths
 
@@ -376,7 +385,7 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known IDs 1 through 7), tag, boolean, optional sentinel, unused
+   class `1` on known IDs 1 through 8), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after
@@ -419,7 +428,7 @@ not part of the artifact.
   4,413-byte golden produced from one verified source program covering all 16
   semantic-1.0 sections, all six node opcodes, every graph sidecar, sorted
   strings, and exact binary64 payload bits. Operation-reference section 18 is
-  covered by constructed semantic-1.1 codec tests because no source consumer
+  covered by constructed semantic-1.1/1.2 codec tests because no source consumer
   exists in issue #38.
 
 Run:
@@ -487,7 +496,7 @@ issue rather than treating this comparison as authorization.
 
 ## 12. Accepted product, producer, and security policy
 
-Physical formats 1.0 and 1.1, semantic contracts 1.0 and 1.1, canonical
+Physical formats 1.0, 1.1, and 1.2 and semantic contracts 1.0, 1.1, and 1.2, canonical
 program-identity bytes, the `.fwir` extension, and the library and CLI
 spellings above are the stable FWIR v1 product contract. A compatible addition
 uses the same-major
