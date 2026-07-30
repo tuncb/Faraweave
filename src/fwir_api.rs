@@ -21,7 +21,14 @@ impl std::fmt::Display for CompileFwirError {
     }
 }
 
-impl std::error::Error for CompileFwirError {}
+impl std::error::Error for CompileFwirError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Compile(error) => Some(error),
+            Self::Encode(error) => Some(error),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum FwirInspectError {
@@ -36,7 +43,14 @@ impl std::fmt::Display for FwirInspectError {
     }
 }
 
-impl std::error::Error for FwirInspectError {}
+impl std::error::Error for FwirInspectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::SizeOverflow | Self::AllocationUnavailable => None,
+        }
+    }
+}
 
 /// Compiles source through the sole typed lowerer into a verified program.
 ///

@@ -42,7 +42,15 @@ impl std::fmt::Display for CompileError {
     }
 }
 
-impl std::error::Error for CompileError {}
+impl std::error::Error for CompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::Build(error) => Some(error),
+            Self::Verify(error) => Some(error),
+        }
+    }
+}
 
 impl CompileError {
     pub(crate) fn into_evaluation_error(self) -> Error {
@@ -3365,6 +3373,8 @@ fn scalar_constant(value: &Value) -> Option<ScalarConstant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Arena, Invariant, MalformedProgram, RecordKind};
+    use std::error::Error as _;
 
     fn debug_digest(program: &VerifiedProgram) -> u64 {
         let text = format!("{:?}", program.as_raw());
@@ -3386,6 +3396,33 @@ mod tests {
             Ok(_) => panic!("source unexpectedly compiled"),
             Err(error) => panic!("expected source diagnostic, got {error:?}"),
         }
+    }
+
+    #[test]
+    fn compile_error_exposes_each_wrapped_phase_error() {
+        let source = CompileError::Source(Error::new(
+            ErrorKind::SyntaxError,
+            SourceLocation::start(),
+            "invalid source",
+        ));
+        let source_error = source.source().expect("source phase error");
+        assert!(source_error.downcast_ref::<Error>().is_some());
+        assert!(source_error.source().is_none());
+
+        let build = CompileError::Build(BuildError::AllocationUnavailable { arena: Arena::Node });
+        let build_error = build.source().expect("build phase error");
+        assert!(build_error.downcast_ref::<BuildError>().is_some());
+        assert!(build_error.source().is_none());
+
+        let verify = CompileError::Verify(VerifyError::MalformedProgram(MalformedProgram {
+            invariant: Invariant::InvalidRecord,
+            record: RecordKind::Node,
+            index: Some(0),
+            field: "kind",
+        }));
+        let verify_error = verify.source().expect("verify phase error");
+        assert!(verify_error.downcast_ref::<VerifyError>().is_some());
+        assert!(verify_error.source().is_none());
     }
 
     #[test]

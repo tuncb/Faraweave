@@ -294,4 +294,8 @@ impl fmt::Display for LocatedError {
     }
 }
 
-impl std::error::Error for LocatedError {}
+impl std::error::Error for LocatedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
