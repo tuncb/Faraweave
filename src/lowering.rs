@@ -1,5 +1,7 @@
 use crate::parser::parse;
-use crate::parser::{CallSyntax, Expr, ExprKind, Program, validate_parameter_declarations};
+use crate::parser::{
+    CallSyntax, ConnectedTemplate, Expr, ExprKind, Program, validate_parameter_declarations,
+};
 use crate::primitive::resolve_names;
 use crate::semantic_registry::{
     Conversion as RegistryConversion, OperandConsumption, ResultCardinality, SemanticDescriptor,
@@ -13,7 +15,10 @@ use crate::typed_program::{
     ScalarConstant, ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
     VerifyError,
 };
-use crate::{Error, ErrorKind, ScalarType, SourceLocation, SourceSpan, Type, Value};
+use crate::{
+    ConnectedApplicationErrorContext, ConnectedApplicationErrorReason, Error, ErrorKind,
+    ScalarType, SourceLocation, SourceSpan, Type, Value,
+};
 use std::fmt::Write as _;
 
 #[derive(Debug)]
@@ -207,6 +212,66 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
                     pending.push((argument, operation_reference_position(name, index)));
                 }
             }
+            ExprKind::Connected { templates, operand } => {
+                let template_arguments = templates
+                    .iter()
+                    .try_fold(0usize, |count, template| {
+                        count.checked_add(template.arguments.len())
+                    })
+                    .ok_or(LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    }))?;
+                let operand_arguments = match &operand.kind {
+                    ExprKind::Tuple(elements) => elements.len(),
+                    _ => 1,
+                };
+                let additional =
+                    template_arguments
+                        .checked_add(operand_arguments)
+                        .ok_or(LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::Node,
+                        }))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                let Some(final_template) = templates.last() else {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::SyntaxError,
+                        expression.span,
+                        "connected application requires a template",
+                    )));
+                };
+                match &operand.kind {
+                    ExprKind::Tuple(elements) => {
+                        for (index, element) in elements.iter().enumerate().rev() {
+                            pending.push((
+                                element,
+                                operation_reference_position(
+                                    &final_template.name,
+                                    final_template.arguments.len().saturating_add(index),
+                                ),
+                            ));
+                        }
+                    }
+                    _ => pending.push((
+                        operand,
+                        operation_reference_position(
+                            &final_template.name,
+                            final_template.arguments.len(),
+                        ),
+                    )),
+                }
+                for template in templates.iter().rev() {
+                    for (index, argument) in template.arguments.iter().enumerate().rev() {
+                        pending.push((
+                            argument,
+                            operation_reference_position(&template.name, index),
+                        ));
+                    }
+                }
+            }
             ExprKind::Tuple(elements) => {
                 pending.try_reserve(elements.len()).map_err(|_| {
                     LowerError::Build(BuildError::AllocationUnavailable {
@@ -246,8 +311,12 @@ fn operation_reference_position(consumer: &str, zero_based_argument: usize) -> b
 }
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
+    let mut deferred_connected_error = None;
     for root in &program.roots {
-        let _ = validate_expr_arities(root, None)?;
+        let _ = validate_expr_arities(root, None, &mut deferred_connected_error)?;
+    }
+    if let Some(error) = deferred_connected_error {
+        return Err(LowerError::Source(error));
     }
     Ok(())
 }
@@ -255,6 +324,7 @@ fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
 fn validate_expr_arities(
     expression: &Expr,
     placeholder: Option<StructuralValue>,
+    deferred_connected_error: &mut Option<Error>,
 ) -> Result<StructuralValue, LowerError> {
     match &expression.kind {
         ExprKind::Call {
@@ -265,7 +335,7 @@ fn validate_expr_arities(
         } => {
             let mut spread_width = None;
             for argument in arguments {
-                let value = validate_expr_arities(argument, placeholder)?;
+                let value = validate_expr_arities(argument, placeholder, deferred_connected_error)?;
                 if arguments.len() == 1 {
                     spread_width = match value {
                         StructuralValue::Tuple(width) => Some(width),
@@ -281,16 +351,64 @@ fn validate_expr_arities(
             validate_arity(name, actual, expression.span.begin)?;
             Ok(StructuralValue::NonTuple)
         }
+        ExprKind::Connected { templates, operand } => {
+            for template in templates {
+                for argument in &template.arguments {
+                    let _ = validate_expr_arities(argument, placeholder, deferred_connected_error)?;
+                }
+            }
+            let operand_value =
+                validate_expr_arities(operand, placeholder, deferred_connected_error)?;
+            for (index, template) in templates.iter().enumerate().rev() {
+                let final_template = index + 1 == templates.len();
+                let (supplied_width, runtime_tuple, operand_span) = if final_template {
+                    match &operand.kind {
+                        ExprKind::Tuple(elements) => (elements.len(), false, operand.span),
+                        _ => (
+                            1,
+                            matches!(operand_value, StructuralValue::Tuple(_)),
+                            operand.span,
+                        ),
+                    }
+                } else {
+                    (
+                        1,
+                        false,
+                        SourceSpan {
+                            begin: templates[index + 1].span.begin,
+                            end: operand.span.end,
+                        },
+                    )
+                };
+                let completion = validate_connected_arity(
+                    &template.name,
+                    template.arguments.len(),
+                    supplied_width,
+                    runtime_tuple,
+                    template.span,
+                    operand_span,
+                );
+                match completion {
+                    Err(LowerError::Source(error)) if error.kind == ErrorKind::TypeError => {
+                        if deferred_connected_error.is_none() {
+                            *deferred_connected_error = Some(error);
+                        }
+                    }
+                    result => result?,
+                }
+            }
+            Ok(StructuralValue::NonTuple)
+        }
         ExprKind::Tuple(elements) => {
             for element in elements {
-                let _ = validate_expr_arities(element, placeholder)?;
+                let _ = validate_expr_arities(element, placeholder, deferred_connected_error)?;
             }
             Ok(StructuralValue::Tuple(elements.len()))
         }
         ExprKind::Fanout { operand, branches } => {
-            let operand = validate_expr_arities(operand, placeholder)?;
+            let operand = validate_expr_arities(operand, placeholder, deferred_connected_error)?;
             for branch in branches {
-                let _ = validate_expr_arities(branch, Some(operand))?;
+                let _ = validate_expr_arities(branch, Some(operand), deferred_connected_error)?;
             }
             Ok(StructuralValue::Tuple(branches.len()))
         }
@@ -400,6 +518,150 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
     error.actual_arity = Some(actual);
     error.expected_arity = accepted;
     Err(LowerError::Source(error))
+}
+
+fn validate_connected_arity(
+    name: &str,
+    template_arity: usize,
+    supplied_width: usize,
+    runtime_tuple: bool,
+    template_span: SourceSpan,
+    operand_span: SourceSpan,
+) -> Result<(), LowerError> {
+    let primitive = match primitive_from_name(name) {
+        Ok(primitive) => primitive,
+        Err(_) => {
+            return Err(LowerError::Source(unknown_primitive_diagnostic(
+                name,
+                template_span.begin,
+            )?));
+        }
+    };
+    let reference_arguments = usize::from(matches!(name, "foldl" | "scanl" | "filter"));
+    let mut accepted = Vec::new();
+    for descriptor in descriptors(primitive) {
+        let arity = descriptor
+            .parameters
+            .len()
+            .checked_add(reference_arguments)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Node,
+            }))?;
+        if !accepted.contains(&arity) {
+            accepted.try_reserve(1).map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Node,
+                })
+            })?;
+            accepted.push(arity);
+        }
+    }
+    accepted.sort_unstable();
+    let actual = template_arity
+        .checked_add(supplied_width)
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::Node,
+        }))?;
+    let reason =
+        connected_completion_reason(&accepted, template_arity, supplied_width, runtime_tuple);
+    if reason.is_none() {
+        return Ok(());
+    }
+    let reason = reason.unwrap_or(ConnectedApplicationErrorReason::AmbiguousCompletion);
+    let reason_name = reason.name();
+    let capacity = name
+        .len()
+        .checked_add(reason_name.len())
+        .and_then(|length| length.checked_add(96))
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::Node,
+        }))?;
+    let mut message = String::new();
+    message.try_reserve_exact(capacity).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    write!(
+        &mut message,
+        "{name} connected completion failed: {reason_name} \
+         (template_arity={template_arity}, supplied_width={supplied_width})"
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    let primary_span = if reason == ConnectedApplicationErrorReason::AlreadyComplete {
+        template_span
+    } else {
+        operand_span
+    };
+    let kind = if matches!(
+        reason,
+        ConnectedApplicationErrorReason::AmbiguousCompletion
+            | ConnectedApplicationErrorReason::RuntimeTupleOperand
+    ) {
+        ErrorKind::TypeError
+    } else {
+        ErrorKind::ArityError
+    };
+    let mut error = Error::at_span(kind, primary_span, message);
+    error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
+    error.expected_arity = accepted;
+    error.actual_arity = Some(actual);
+    error.connected_application = Some(ConnectedApplicationErrorContext {
+        reason,
+        template_arity,
+        supplied_width,
+        template_span,
+        operand_span,
+    });
+    Err(LowerError::Source(error))
+}
+
+fn connected_completion_reason(
+    accepted: &[usize],
+    template_arity: usize,
+    supplied_width: usize,
+    runtime_tuple: bool,
+) -> Option<ConnectedApplicationErrorReason> {
+    if accepted.contains(&template_arity) {
+        return Some(ConnectedApplicationErrorReason::AlreadyComplete);
+    }
+    if supplied_width == 0 {
+        return Some(ConnectedApplicationErrorReason::EmptyTupleOperand);
+    }
+    if runtime_tuple {
+        return Some(ConnectedApplicationErrorReason::RuntimeTupleOperand);
+    }
+    let Some(actual) = template_arity.checked_add(supplied_width) else {
+        return Some(ConnectedApplicationErrorReason::SurplusCompletion);
+    };
+    let exact = accepted.iter().filter(|arity| **arity == actual).count();
+    if exact == 1 {
+        return None;
+    }
+    if exact > 1 {
+        return Some(ConnectedApplicationErrorReason::AmbiguousCompletion);
+    }
+    let mut candidates = accepted
+        .iter()
+        .copied()
+        .filter(|arity| *arity > template_arity);
+    let Some(first) = candidates.next() else {
+        return Some(ConnectedApplicationErrorReason::SurplusCompletion);
+    };
+    let (minimum, maximum) = candidates.fold((first, first), |(minimum, maximum), arity| {
+        (minimum.min(arity), maximum.max(arity))
+    });
+    if actual < minimum {
+        Some(ConnectedApplicationErrorReason::MissingCompletion)
+    } else if actual > maximum {
+        Some(ConnectedApplicationErrorReason::SurplusCompletion)
+    } else {
+        Some(ConnectedApplicationErrorReason::AmbiguousCompletion)
+    }
 }
 
 fn unknown_primitive_diagnostic(name: &str, location: SourceLocation) -> Result<Error, LowerError> {
@@ -739,6 +1001,9 @@ impl Lowerer {
                 origin,
                 expression.span.begin,
             ),
+            ExprKind::Connected { templates, operand } => {
+                self.lower_connected(expression, templates, operand, origin)
+            }
             ExprKind::Placeholder => {
                 let mut placeholder = self.placeholder.take().ok_or_else(|| {
                     LowerError::Source(Error::at_span(
@@ -1069,6 +1334,263 @@ impl Lowerer {
         }
         self.needs_tuples |= depth != 0;
         Ok(current)
+    }
+
+    fn lower_connected<'a>(
+        &mut self,
+        expression: &Expr,
+        templates: &'a [ConnectedTemplate],
+        operand: &'a Expr,
+        origin: OriginIndex,
+    ) -> Result<Lowered, LowerError> {
+        if templates.is_empty() {
+            return Err(LowerError::Source(Error::at_span(
+                ErrorKind::SyntaxError,
+                expression.span,
+                "connected application requires a template",
+            )));
+        }
+        let mut lowered_templates: Vec<Vec<AuthoredCallOperand<'a>>> = Vec::new();
+        let mut call_origins = Vec::new();
+        let mut primitive_origins = Vec::new();
+        lowered_templates
+            .try_reserve_exact(templates.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Node,
+                })
+            })?;
+        call_origins
+            .try_reserve_exact(templates.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Origin,
+                })
+            })?;
+        primitive_origins
+            .try_reserve_exact(templates.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Origin,
+                })
+            })?;
+        for (index, template) in templates.iter().enumerate() {
+            let call_origin = if index == 0 {
+                origin
+            } else {
+                self.push_origin(SourceSpan {
+                    begin: template.span.begin,
+                    end: operand.span.end,
+                })?
+            };
+            let primitive_origin = self.push_origin(template.name_span)?;
+            let mut arguments = Vec::new();
+            arguments
+                .try_reserve_exact(template.arguments.len())
+                .map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+            for argument in &template.arguments {
+                arguments.push(self.lower_authored_call_operand(argument)?);
+            }
+            call_origins.push(call_origin);
+            primitive_origins.push(primitive_origin);
+            lowered_templates.push(arguments);
+        }
+
+        let supplied_expressions: &[Expr] = match &operand.kind {
+            ExprKind::Tuple(elements) => elements,
+            _ => std::slice::from_ref(operand),
+        };
+        let mut supplied = Vec::new();
+        supplied
+            .try_reserve_exact(supplied_expressions.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Node,
+                })
+            })?;
+        for supplied_expression in supplied_expressions {
+            supplied.push(self.lower_authored_call_operand(supplied_expression)?);
+        }
+
+        let mut current = None;
+        for index in (0..templates.len()).rev() {
+            let mut arguments = std::mem::take(&mut lowered_templates[index]);
+            if index + 1 == templates.len() {
+                arguments.append(&mut supplied);
+            } else {
+                let Some(inner) = current.take() else {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::TypeError,
+                        expression.span,
+                        "connected application has no inner result",
+                    )));
+                };
+                arguments.try_reserve(1).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Edge,
+                    })
+                })?;
+                arguments.push(AuthoredCallOperand::Value(inner));
+            }
+            current = Some(self.lower_connected_selected_call(
+                &templates[index].name,
+                primitive_origins[index],
+                call_origins[index],
+                templates[index].span.begin,
+                arguments,
+            )?);
+        }
+        current.ok_or_else(|| {
+            LowerError::Source(Error::at_span(
+                ErrorKind::TypeError,
+                expression.span,
+                "connected application has no result",
+            ))
+        })
+    }
+
+    fn lower_authored_call_operand<'a>(
+        &mut self,
+        expression: &'a Expr,
+    ) -> Result<AuthoredCallOperand<'a>, LowerError> {
+        if let ExprKind::OperationReference { name, name_span } = &expression.kind {
+            return Ok(AuthoredCallOperand::OperationReference {
+                name,
+                name_span: *name_span,
+                origin: self.push_origin(expression.span)?,
+            });
+        }
+        self.lower_expr(expression).map(AuthoredCallOperand::Value)
+    }
+
+    fn lower_connected_selected_call(
+        &mut self,
+        name: &str,
+        primitive_origin: OriginIndex,
+        origin: OriginIndex,
+        location: SourceLocation,
+        arguments: Vec<AuthoredCallOperand<'_>>,
+    ) -> Result<Lowered, LowerError> {
+        if name == "filter" {
+            let mut arguments = arguments.into_iter();
+            let (Some(reference), Some(vector), None) =
+                (arguments.next(), arguments.next(), arguments.next())
+            else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::ArityError,
+                    location,
+                    "connected filter application has invalid arity",
+                )));
+            };
+            let AuthoredCallOperand::OperationReference {
+                name: reference_name,
+                name_span,
+                origin: reference_origin,
+            } = reference
+            else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    location,
+                    "connected filter argument 1 must be an operation reference",
+                )));
+            };
+            let AuthoredCallOperand::Value(vector) = vector else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    location,
+                    "connected filter vector cannot be an operation reference",
+                )));
+            };
+            let mut operands = Vec::new();
+            operands.try_reserve_exact(1).map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Edge,
+                })
+            })?;
+            operands.push(CallOperand::Whole(vector));
+            return self.lower_selected_call(
+                name,
+                primitive_origin,
+                origin,
+                location,
+                operands,
+                Some((reference_name, name_span, reference_origin)),
+            );
+        }
+        if matches!(name, "foldl" | "scanl") {
+            let mut arguments = arguments.into_iter();
+            let (Some(reference), Some(initializer), Some(vector), None) = (
+                arguments.next(),
+                arguments.next(),
+                arguments.next(),
+                arguments.next(),
+            ) else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::ArityError,
+                    location,
+                    "connected reducer application has invalid arity",
+                )));
+            };
+            let AuthoredCallOperand::OperationReference {
+                name: reference_name,
+                name_span,
+                origin: reference_origin,
+            } = reference
+            else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    location,
+                    "connected reducer argument 1 must be an operation reference",
+                )));
+            };
+            let (AuthoredCallOperand::Value(initializer), AuthoredCallOperand::Value(vector)) =
+                (initializer, vector)
+            else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    location,
+                    "connected reducer value arguments cannot be operation references",
+                )));
+            };
+            let mut operands = Vec::new();
+            operands.try_reserve_exact(2).map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Edge,
+                })
+            })?;
+            operands.push(CallOperand::Whole(initializer));
+            operands.push(CallOperand::Whole(vector));
+            return self.lower_selected_call(
+                name,
+                primitive_origin,
+                origin,
+                location,
+                operands,
+                Some((reference_name, name_span, reference_origin)),
+            );
+        }
+
+        let mut operands = Vec::new();
+        operands.try_reserve_exact(arguments.len()).map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        for argument in arguments {
+            let AuthoredCallOperand::Value(value) = argument else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::SyntaxError,
+                    location,
+                    "operation reference is not accepted by this connected application",
+                )));
+            };
+            operands.push(CallOperand::Whole(value));
+        }
+        self.lower_selected_call(name, primitive_origin, origin, location, operands, None)
     }
 
     fn lower_call(
@@ -1837,6 +2359,15 @@ impl Lowerer {
     }
 }
 
+enum AuthoredCallOperand<'a> {
+    Value(Lowered),
+    OperationReference {
+        name: &'a str,
+        name_span: SourceSpan,
+        origin: OriginIndex,
+    },
+}
+
 enum CallOperand {
     Whole(Lowered),
     TupleElement {
@@ -2314,6 +2845,11 @@ fn placeholder_span(expression: &Expr) -> Option<SourceSpan> {
         ExprKind::Call { arguments, .. } | ExprKind::Tuple(arguments) => {
             arguments.iter().find_map(placeholder_span)
         }
+        ExprKind::Connected { templates, operand } => templates
+            .iter()
+            .flat_map(|template| &template.arguments)
+            .find_map(placeholder_span)
+            .or_else(|| placeholder_span(operand)),
         ExprKind::Fanout { operand, branches } => {
             placeholder_span(operand).or_else(|| branches.iter().find_map(placeholder_span))
         }
@@ -2656,6 +3192,132 @@ mod tests {
         assert_eq!(applies[3].4, LiftMode::DynamicVector);
         assert_eq!(applies[3].0.cardinality, Some(Cardinality::DynamicVector));
         assert_ne!(raw.edges[0].origin, raw.nodes[2].origin);
+    }
+
+    #[test]
+    fn connected_completion_erases_to_existing_selected_calls_in_authored_order() {
+        let program = must_compile("add[10] mul[2] 20\n");
+        let raw = program.as_raw();
+        assert_eq!(raw.module.semantic_major, 1);
+        assert_eq!(raw.module.semantic_minor, 0);
+        assert_eq!(raw.features, vec![Feature::StableSemanticIds.numeric()]);
+        assert_eq!(raw.nodes.len(), 5);
+        assert_eq!(
+            raw.nodes
+                .iter()
+                .filter_map(|node| match node.kind {
+                    NodeKind::SelectedApply {
+                        primitive_id,
+                        implementation_id,
+                        ..
+                    } => Some((primitive_id, implementation_id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [(7, 13), (5, 9)]
+        );
+        assert!(!raw.nodes.iter().any(|node| matches!(
+            node.kind,
+            NodeKind::TupleConstruct | NodeKind::PrefixSpreadPrepare
+        )));
+
+        let tuple_bundle = must_compile("add[] [(1 2) (3 4)]\n");
+        let tuple_raw = tuple_bundle.as_raw();
+        assert_eq!(
+            tuple_raw.features,
+            vec![Feature::StableSemanticIds.numeric()]
+        );
+        assert_eq!(tuple_raw.module.semantic_minor, 0);
+        assert_eq!(tuple_raw.nodes.len(), 3);
+        assert!(
+            !tuple_raw
+                .nodes
+                .iter()
+                .any(|node| matches!(node.kind, NodeKind::TupleConstruct))
+        );
+        assert_eq!(
+            tuple_raw
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, NodeKind::SelectedApply { .. }))
+                .count(),
+            1
+        );
+
+        let filter = must_compile("filter[@odd] (1 2 3)\n");
+        assert_eq!(filter.as_raw().operation_references.len(), 1);
+        assert!(filter.as_raw().nodes.iter().any(|node| matches!(
+            node.kind,
+            NodeKind::SelectedApply {
+                primitive_id: 39,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn connected_completion_diagnostics_are_structured_and_deterministic() {
+        for (source, kind, reason, template_arity, supplied_width, offset) in [
+            (
+                "add[] 1",
+                ErrorKind::ArityError,
+                ConnectedApplicationErrorReason::MissingCompletion,
+                0,
+                1,
+                7,
+            ),
+            (
+                "inc[] [1 2]",
+                ErrorKind::ArityError,
+                ConnectedApplicationErrorReason::SurplusCompletion,
+                0,
+                2,
+                7,
+            ),
+            (
+                "add[1 2] 3",
+                ErrorKind::ArityError,
+                ConnectedApplicationErrorReason::AlreadyComplete,
+                2,
+                1,
+                1,
+            ),
+            (
+                "add[] []",
+                ErrorKind::ArityError,
+                ConnectedApplicationErrorReason::EmptyTupleOperand,
+                0,
+                0,
+                7,
+            ),
+            (
+                "add[] fanout[1 {inc[_]} {inc[_]}]",
+                ErrorKind::TypeError,
+                ConnectedApplicationErrorReason::RuntimeTupleOperand,
+                0,
+                1,
+                7,
+            ),
+        ] {
+            let error = must_source_error(source);
+            assert_eq!(error.kind, kind, "{source}");
+            assert_eq!(error.location.offset, offset, "{source}");
+            assert_eq!(error.primitive.as_deref(), Some(&source[..3]), "{source}");
+            assert!(error.message.contains(reason.name()), "{source}");
+            let context = error
+                .connected_application
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing connected context for {source}"));
+            assert_eq!(context.reason, reason, "{source}");
+            assert_eq!(context.template_arity, template_arity, "{source}");
+            assert_eq!(context.supplied_width, supplied_width, "{source}");
+        }
+
+        assert_eq!(
+            connected_completion_reason(&[1, 3], 0, 2, false),
+            Some(ConnectedApplicationErrorReason::AmbiguousCompletion)
+        );
+        assert_eq!(connected_completion_reason(&[2], 1, 1, false), None);
     }
 
     #[test]
@@ -3481,6 +4143,30 @@ mod tests {
                         .count(),
                     unary_depth
                 );
+
+                let mut connected = String::new();
+                connected.reserve(unary_depth * 6 + 2);
+                for _ in 0..unary_depth {
+                    connected.push_str("inc[] ");
+                }
+                connected.push('1');
+                let connected_program = must_compile(&connected);
+                assert_eq!(connected_program.as_raw().nodes.len(), unary_depth + 1);
+                assert_eq!(
+                    connected_program
+                        .as_raw()
+                        .nodes
+                        .iter()
+                        .filter(|node| matches!(
+                            node.kind,
+                            NodeKind::SelectedApply {
+                                implementation_id: 1,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    unary_depth
+                );
             });
         let Ok(join) = join else {
             panic!("failed to spawn reduced-stack lowering thread");
@@ -3492,6 +4178,7 @@ mod tests {
     fn allocation_refusal_reaches_every_lowering_arena() {
         let source = "parameters[x Int]\n\
                       add [x 1]\n\
+                      add[x] 1\n\
                       inc[(1 2)]\n\
                       fanout[iota[x] {add[_ iota[1]]}]\n";
         let program = match parse(source) {
@@ -3688,6 +4375,25 @@ mod tests {
         assert_eq!(arity_before_shape.kind, ErrorKind::ArityError);
         assert_eq!(arity_before_shape.location.line, 2);
 
+        let connected_type_before_arity =
+            must_source_error("add[] fanout[1 {inc[_]} {inc[_]}]\nadd[1]\n");
+        assert_eq!(connected_type_before_arity.kind, ErrorKind::ArityError);
+        assert_eq!(connected_type_before_arity.location.line, 2);
+
+        let connected_child_type_before_parent_arity =
+            must_source_error("inc[1] add[] fanout[1 {inc[_]} {inc[_]}]\n");
+        assert_eq!(
+            connected_child_type_before_parent_arity.kind,
+            ErrorKind::ArityError
+        );
+        assert_eq!(
+            connected_child_type_before_parent_arity
+                .connected_application
+                .as_ref()
+                .map(|context| context.reason),
+            Some(ConnectedApplicationErrorReason::AlreadyComplete)
+        );
+
         let shape = must_source_error("add[(1 2) (3 4 5)]\n");
         assert_eq!(shape.kind, ErrorKind::ShapeMismatch);
         assert_eq!(shape.location.column, 11);
@@ -3729,9 +4435,10 @@ mod tests {
              scanl[@sub 10 (1 2)]\n\
              filter[@odd (1 2)]\n\
              add [1 2]\n\
+             add[1] 2\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 12_977_681_809_875_020_142);
+        assert_eq!(debug_digest(&matrix), 13_466_000_927_988_326_391);
 
         let depth = 256;
         let mut deep = String::new();

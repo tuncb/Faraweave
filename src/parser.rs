@@ -32,6 +32,14 @@ pub(crate) struct UnaryStep {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ConnectedTemplate {
+    pub name: String,
+    pub arguments: Vec<Expr>,
+    pub name_span: SourceSpan,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum ExprKind {
     Literal(Value),
     Vector(ScalarType, Vec<Value>),
@@ -55,6 +63,10 @@ pub(crate) enum ExprKind {
         syntax: CallSyntax,
         arguments: Vec<Expr>,
         name_span: SourceSpan,
+    },
+    Connected {
+        templates: Vec<ConnectedTemplate>,
+        operand: Box<Expr>,
     },
     UnresolvedName {
         name: String,
@@ -419,6 +431,14 @@ fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
             .or_else(|| branches.iter().find_map(first_tuple_in_expression))
             .or(Some(expression.span.begin)),
         ExprKind::Call { arguments, .. } => arguments.iter().find_map(first_tuple_in_expression),
+        ExprKind::Connected { templates, operand } => templates
+            .iter()
+            .flat_map(|template| &template.arguments)
+            .find_map(first_tuple_in_expression)
+            .or_else(|| match &operand.kind {
+                ExprKind::Tuple(elements) => elements.iter().find_map(first_tuple_in_expression),
+                _ => first_tuple_in_expression(operand),
+            }),
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
         | ExprKind::Parameter(_)
@@ -433,6 +453,16 @@ fn expression_contains_tuple(expression: &Expr) -> bool {
         ExprKind::Tuple(_) | ExprKind::DeepTuple { .. } | ExprKind::Fanout { .. } => true,
         ExprKind::UnaryChain { .. } => false,
         ExprKind::Call { arguments, .. } => arguments.iter().any(expression_contains_tuple),
+        ExprKind::Connected { templates, operand } => {
+            templates
+                .iter()
+                .flat_map(|template| &template.arguments)
+                .any(expression_contains_tuple)
+                || match &operand.kind {
+                    ExprKind::Tuple(elements) => elements.iter().any(expression_contains_tuple),
+                    _ => expression_contains_tuple(operand),
+                }
+        }
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
         | ExprKind::Parameter(_)
@@ -918,6 +948,15 @@ impl Parser {
         if allow_newline {
             self.skip_inside();
         }
+        let expression = self.parse_primary_expr()?;
+        if allow_newline {
+            Ok(expression)
+        } else {
+            self.parse_connected_tail(expression)
+        }
+    }
+
+    fn parse_primary_expr(&mut self) -> Result<Expr, Error> {
         let token = self
             .peek()
             .cloned()
@@ -987,6 +1026,98 @@ impl Parser {
                 "expected an expression",
             )),
         }
+    }
+
+    fn parse_connected_tail(&mut self, first: Expr) -> Result<Expr, Error> {
+        if !matches!(
+            &first.kind,
+            ExprKind::Call {
+                syntax: CallSyntax::Direct,
+                ..
+            }
+        ) || !self.has_horizontal_operand()
+        {
+            return Ok(first);
+        }
+
+        let begin = first.span.begin;
+        let mut templates = Vec::new();
+        let mut current = first;
+        loop {
+            let Expr {
+                kind:
+                    ExprKind::Call {
+                        name,
+                        syntax: CallSyntax::Direct,
+                        arguments,
+                        name_span,
+                    },
+                span,
+            } = current
+            else {
+                return Err(Error::at_span(
+                    ErrorKind::SyntaxError,
+                    current.span,
+                    "connected application template must be an adjacent bracket call",
+                ));
+            };
+            templates
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(span.begin))?;
+            templates.push(ConnectedTemplate {
+                name,
+                arguments,
+                name_span,
+                span,
+            });
+            self.skip_spaces();
+            let next = self.parse_primary_expr()?;
+            if matches!(
+                &next.kind,
+                ExprKind::Call {
+                    syntax: CallSyntax::Direct,
+                    ..
+                }
+            ) && self.has_horizontal_operand()
+            {
+                current = next;
+                continue;
+            }
+            let span = SourceSpan {
+                begin,
+                end: next.span.end,
+            };
+            return Ok(Expr {
+                kind: ExprKind::Connected {
+                    templates,
+                    operand: Box::new(next),
+                },
+                span,
+            });
+        }
+    }
+
+    fn has_horizontal_operand(&self) -> bool {
+        if !self.peek_kind().is_some_and(is_horizontal_trivia) {
+            return false;
+        }
+        let mut index = self.index;
+        while self
+            .tokens
+            .get(index)
+            .is_some_and(|token| is_horizontal_trivia(token.kind))
+        {
+            index += 1;
+        }
+        self.tokens.get(index).is_some_and(|token| {
+            !matches!(
+                token.kind,
+                TokenKind::Newline
+                    | TokenKind::RightParenthesis
+                    | TokenKind::RightBracket
+                    | TokenKind::RightBrace
+            )
+        })
     }
 
     fn parse_typed_empty(&mut self) -> Result<Expr, Error> {
@@ -1590,6 +1721,18 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
             ExprKind::Call { arguments, .. } => {
                 pending.extend(arguments.iter().rev().map(|argument| (argument, owned)));
             }
+            ExprKind::Connected { templates, operand } => {
+                pending.push((operand, owned));
+                for template in templates.iter().rev() {
+                    pending.extend(
+                        template
+                            .arguments
+                            .iter()
+                            .rev()
+                            .map(|argument| (argument, owned)),
+                    );
+                }
+            }
             ExprKind::Fanout { operand, branches } => {
                 pending.push((operand, owned));
                 pending.extend(branches.iter().rev().map(|branch| (branch, owned)));
@@ -1663,6 +1806,61 @@ mod tests {
         let program = parse(source).expect("valid program");
         assert_eq!(program.parameters.len(), 2);
         assert_eq!(program.roots.len(), 3);
+    }
+
+    #[test]
+    fn connected_applications_are_flat_right_associated_and_stop_at_list_boundaries() {
+        let program =
+            parse("add[10] mul[2] 20\ninc[add[1] 2]\n[add[1] 2]\n").expect("connected syntax");
+        let ExprKind::Connected { templates, operand } = &program.roots[0].kind else {
+            panic!("expected connected chain");
+        };
+        assert_eq!(
+            templates
+                .iter()
+                .map(|template| template.name.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "mul"]
+        );
+        assert!(matches!(operand.kind, ExprKind::Literal(Value::Int(20))));
+
+        let ExprKind::Call { arguments, .. } = &program.roots[1].kind else {
+            panic!("bracket sibling list must retain its direct call");
+        };
+        assert_eq!(arguments.len(), 2);
+        assert!(matches!(
+            arguments[0].kind,
+            ExprKind::Call {
+                syntax: CallSyntax::Direct,
+                ..
+            }
+        ));
+        let ExprKind::Tuple(elements) = &program.roots[2].kind else {
+            panic!("tuple sibling list must remain a tuple");
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(
+            elements[0].kind,
+            ExprKind::Call {
+                syntax: CallSyntax::Direct,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn connected_application_requires_horizontal_operand_input() {
+        let program = parse("add[10]# line end\n20\nadd[10]# eof").expect("three roots");
+        assert_eq!(program.roots.len(), 3);
+        assert!(
+            program
+                .roots
+                .iter()
+                .all(|root| { !matches!(root.kind, ExprKind::Connected { .. }) })
+        );
+        let error = parse("add[_] 20").expect_err("placeholder remains fanout-only");
+        assert_eq!(error.kind, ErrorKind::SyntaxError);
+        assert_eq!(error.location.column, 5);
     }
 
     #[test]
