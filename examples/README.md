@@ -30,3 +30,9 @@ cargo run -- run examples/parameters.faraweave -- 4 2.5 true
 
 In Faraweave source, `#` begins a line comment. The checked-in runnable files
 remain concise, with longer explanations here.
+
+UTF-8 strings can be tried directly without another example file:
+
+```faraweave
+["Málaga café" length["aé🦀"] sort[("é" "alpha" "")]]
+```

@@ -109,6 +109,7 @@ struct Lowerer {
     needs_backend_native_math: bool,
     needs_connected_bindings: bool,
     needs_user_bindings: bool,
+    needs_strings: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
     binding_resolution: BindingResolution,
@@ -1420,6 +1421,7 @@ fn lower_program_with_builder_and_resolution(
         needs_backend_native_math: false,
         needs_connected_bindings: false,
         needs_user_bindings: false,
+        needs_strings: false,
         placeholder: None,
         releases: Vec::new(),
         binding_resolution,
@@ -1450,6 +1452,7 @@ fn lower_program_with_builder_and_resolution(
             })
         })?;
     for (slot, parameter) in program.parameters.iter().enumerate() {
+        lowerer.needs_strings |= parameter.scalar_type == ScalarType::String;
         let declaration_origin = lowerer.push_origin(parameter.span)?;
         let name_origin = lowerer.push_origin(parameter.name_span)?;
         let slot = u32::try_from(slot).map_err(|_| {
@@ -1602,6 +1605,10 @@ fn lower_program_with_builder_and_resolution(
         lowerer
             .builder
             .push_feature(Feature::ImmutableBindings.numeric())?;
+    }
+    if lowerer.needs_strings {
+        lowerer.builder.set_semantic_minor(4);
+        lowerer.builder.push_feature(Feature::Strings.numeric())?;
     }
     Ok(lowerer.builder.finish()?.verify()?)
 }
@@ -1980,7 +1987,7 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
-        let scalar = scalar_constant(value).ok_or_else(|| {
+        let scalar = self.scalar_constant(value)?.ok_or_else(|| {
             LowerError::Source(Error::new(
                 ErrorKind::TypeError,
                 SourceLocation::start(),
@@ -2028,9 +2035,10 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
+        self.needs_strings |= element_type == ScalarType::String;
         let start = self.builder.finish_preview_constant_elements()?;
         for value in values {
-            let scalar = scalar_constant(value).ok_or_else(|| {
+            let scalar = self.scalar_constant(value)?.ok_or_else(|| {
                 LowerError::Source(Error::new(
                     ErrorKind::TypeError,
                     SourceLocation::start(),
@@ -2072,6 +2080,28 @@ impl Lowerer {
             tuple_elements: Vec::new(),
             access: ValueAccess::WholeValue,
             binding: None,
+        })
+    }
+
+    fn scalar_constant(&mut self, value: &Value) -> Result<Option<ScalarConstant>, LowerError> {
+        Ok(match value {
+            Value::Bool(value) => Some(ScalarConstant::Bool(*value)),
+            Value::Int(value) => Some(ScalarConstant::Int(*value)),
+            Value::Double(value) => Some(ScalarConstant::DoubleBits(value.to_bits())),
+            Value::String(value) => {
+                self.needs_strings = true;
+                let mut copy = String::new();
+                copy.try_reserve_exact(value.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::StringValue,
+                    })
+                })?;
+                copy.push_str(value);
+                Some(ScalarConstant::String(
+                    self.builder.push_string_value(copy)?,
+                ))
+            }
+            _ => None,
         })
     }
 
@@ -3092,6 +3122,15 @@ impl Lowerer {
                     "selected whole-vector operand is not a vector",
                 )));
             }
+            if accepted.consumption == OperandConsumption::AtomicScalar
+                && !matches!(value_type, Type::Scalar(_))
+            {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    SourceLocation::start(),
+                    "selected atomic-scalar operand is not a scalar",
+                )));
+            }
             if accepted.consumption == OperandConsumption::Elementwise
                 && matches!(value_type, Type::Vector(_))
             {
@@ -3790,6 +3829,11 @@ fn select_descriptor_with_argument_offset(
                 {
                     return None;
                 }
+                if accepted.consumption == OperandConsumption::AtomicScalar
+                    && !matches!(operand.parts().2, Type::Scalar(_))
+                {
+                    return None;
+                }
                 let actual = scalar_element(operand.parts().2)?;
                 match conversion(actual, accepted.element_type)? {
                     RegistryConversion::Identity => {}
@@ -3815,7 +3859,10 @@ fn select_descriptor_with_argument_offset(
                     .zip(operands)
                     .take_while(|(accepted, operand)| {
                         (accepted.consumption == OperandConsumption::Elementwise
-                            || matches!(operand.parts().2, Type::Vector(_)))
+                            || (accepted.consumption == OperandConsumption::WholeVector
+                                && matches!(operand.parts().2, Type::Vector(_)))
+                            || (accepted.consumption == OperandConsumption::AtomicScalar
+                                && matches!(operand.parts().2, Type::Scalar(_))))
                             && scalar_element(operand.parts().2).is_some_and(|actual| {
                                 conversion(actual, accepted.element_type).is_some_and(|selected| {
                                     selected == RegistryConversion::Identity
@@ -4183,15 +4230,6 @@ fn origin_position(location: SourceLocation) -> Result<OriginPosition, BuildErro
         line: convert(location.line)?,
         column: convert(location.column)?,
     })
-}
-
-fn scalar_constant(value: &Value) -> Option<ScalarConstant> {
-    match value {
-        Value::Bool(value) => Some(ScalarConstant::Bool(*value)),
-        Value::Int(value) => Some(ScalarConstant::Int(*value)),
-        Value::Double(value) => Some(ScalarConstant::DoubleBits(value.to_bits())),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -5785,7 +5823,7 @@ mod tests {
              add[1] 2\n\
              fanout[[1 2] {add _}]\n",
         );
-        assert_eq!(debug_digest(&matrix), 13_466_000_927_988_326_391);
+        assert_eq!(debug_digest(&matrix), 2_422_886_676_315_912_113);
 
         let depth = 256;
         let mut deep = String::new();
@@ -5799,7 +5837,7 @@ mod tests {
         }
         assert_eq!(
             debug_digest(&must_compile(&deep)),
-            13_509_599_112_709_267_319
+            6_491_665_898_151_316_895
         );
 
         let mut unary = String::new();
@@ -5810,7 +5848,7 @@ mod tests {
         unary.push('1');
         assert_eq!(
             debug_digest(&must_compile(&unary)),
-            9_029_834_920_760_033_112
+            11_657_226_798_462_061_452
         );
     }
 

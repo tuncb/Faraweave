@@ -415,7 +415,7 @@ fn cli_repl_internal_reports_registry_without_evaluating_source() {
             .lines()
             .filter(|line| line.starts_with("  signature "))
             .count(),
-        66
+        73
     );
     assert!(stdout.ends_with("kernel=filter_double\n> 6\n> "));
 }
@@ -862,6 +862,53 @@ fn cli_unicode_space_paths_roundtrip_through_verified_fwir() {
     assert!(directory.is_dir());
 
     fs::remove_dir_all(directory.parent().expect("test parent")).expect("cleanup");
+}
+
+#[test]
+fn cli_string_arguments_are_raw_exact_for_source_and_verified_fwir() {
+    let directory = unique("string-arguments");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("strings.faraweave");
+    let artifact = directory.join("strings.fwir");
+    fs::write(
+        &source,
+        "parameters[value String]\n[value length[value] equals[value \"Málaga café\"]]\n",
+    )
+    .expect("source");
+
+    for command in ["run", "run-ir"] {
+        if command == "run-ir" {
+            let compiled = Command::new(binary())
+                .arg("compile-ir")
+                .arg(&source)
+                .arg("-o")
+                .arg(&artifact)
+                .output()
+                .expect("compile");
+            assert!(compiled.status.success(), "{:?}", compiled.stderr);
+        }
+        let input = if command == "run" { &source } else { &artifact };
+        let result = Command::new(binary())
+            .arg(command)
+            .arg(input)
+            .arg("--")
+            .arg("Málaga café")
+            .output()
+            .expect(command);
+        assert!(result.status.success(), "{:?}", result.stderr);
+        assert_eq!(result.stdout, b"[\"M\xc3\xa1laga caf\xc3\xa9\" 11 true]\n");
+
+        let empty = Command::new(binary())
+            .arg(command)
+            .arg(input)
+            .arg("--")
+            .arg("")
+            .output()
+            .expect("empty");
+        assert!(empty.status.success(), "{:?}", empty.stderr);
+        assert_eq!(empty.stdout, b"[\"\" 0 false]\n");
+    }
+    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]

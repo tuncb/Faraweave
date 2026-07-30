@@ -105,16 +105,48 @@ fn evaluate_verified_program_observed(
         releases,
         resources,
     };
+    if let Err(mut error) = admit_string_parameters(&mut interpreter.resources, arguments) {
+        error.usage = Some(interpreter.resources.usage);
+        return Err(error);
+    }
     let execution = interpreter.execute();
     match execution {
-        Ok(values) => Ok(ProgramResult {
-            values,
-            usage: interpreter.resources.usage,
-        }),
+        Ok(values) => {
+            release_string_parameters(&mut interpreter.resources, arguments);
+            Ok(ProgramResult {
+                values,
+                usage: interpreter.resources.usage,
+            })
+        }
         Err(mut error) => {
             interpreter.cleanup_all();
+            release_string_parameters(&mut interpreter.resources, arguments);
             error.usage = Some(interpreter.resources.usage);
             Err(error)
+        }
+    }
+}
+
+fn admit_string_parameters(
+    resources: &mut ResourceContext,
+    arguments: &[Value],
+) -> Result<(), Error> {
+    for (index, argument) in arguments.iter().enumerate() {
+        if let Value::String(value) = argument
+            && let Err(error) =
+                resources.admit_string(value.len(), 0, SourceLocation::start(), "parameter")
+        {
+            release_string_parameters(resources, &arguments[..index]);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn release_string_parameters(resources: &mut ResourceContext, arguments: &[Value]) {
+    for argument in arguments.iter().rev() {
+        if matches!(argument, Value::String(_)) {
+            resources.release(argument);
         }
     }
 }
@@ -131,7 +163,15 @@ impl<'a> Interpreter<'a> {
             .try_reserve_exact(self.raw.roots.len())
             .map_err(|_| execution_allocation_error(SourceLocation::start(), "program"))?;
         for root in &self.raw.roots {
-            values.push(self.take_output(root.node)?);
+            match self.take_output(root.node) {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    for value in values.iter().rev() {
+                        self.resources.release(value);
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(values)
     }
@@ -197,19 +237,38 @@ impl<'a> Interpreter<'a> {
         values
             .try_reserve_exact(edges.len())
             .map_err(|_| execution_allocation_error(location, "tuple_literal"))?;
-        self.resources
+        let table_bytes = self
+            .resources
             .admit_tuple(edges.len(), location, "tuple_literal")?;
         for edge in &edges {
-            let value = match edge.ownership {
+            let result = match edge.ownership {
                 OwnershipMode::InfallibleTransfer => {
-                    self.take_infallible_transfer(edge.producer, location)?
+                    self.take_infallible_transfer(edge.producer, location)
                 }
-                OwnershipMode::ImmutableBorrow => self.edge_value(*edge)?.clone(),
-                OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
+                OwnershipMode::ImmutableBorrow => match edge_value(self.raw, &self.slots, *edge) {
+                    Ok(borrowed) => clone_borrowed_value(
+                        &mut self.resources,
+                        borrowed,
+                        location,
+                        "tuple_literal",
+                    ),
+                    Err(error) => Err(error),
+                },
+                OwnershipMode::OwnedInput => Err(execution_invariant_error(location)),
             };
-            values.push(value);
+            match result {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    for value in values.iter().rev() {
+                        self.resources.release(value);
+                    }
+                    self.resources.refund(table_bytes);
+                    return Err(error);
+                }
+            }
         }
-        self.put_owned(index, Value::Tuple(values.into()), !edges.is_empty())?;
+        let value = Value::Tuple(values.into());
+        self.put_owned(index, value, !edges.is_empty())?;
         self.release_after(index);
         Ok(())
     }
@@ -478,18 +537,58 @@ impl<'a> Interpreter<'a> {
             .get(index)
             .ok_or_else(|| execution_invariant_error(location))?
         {
-            ConstantRecord::Scalar(value) => Ok((scalar_value(value), false)),
+            ConstantRecord::Scalar(value) => {
+                let value = scalar_value(self.raw, value, location)?;
+                if let Value::String(text) = &value {
+                    let admitted =
+                        self.resources
+                            .admit_string(text.len(), 0, location, "string_literal")?;
+                    if admitted == 0 {
+                        Ok((value, false))
+                    } else {
+                        Ok((value, true))
+                    }
+                } else {
+                    Ok((value, false))
+                }
+            }
             ConstantRecord::Vector {
                 element_type,
                 elements,
             } => {
                 let count = elements.count as usize;
-                let admitted =
-                    self.resources
-                        .admit_vector(element_type, count, location, "vector_literal")?;
                 let values = &self.raw.constant_elements
                     [elements.start as usize..elements.start as usize + count];
-                match build_vector(element_type, values) {
+                let payload_bytes = if element_type == ScalarType::String {
+                    values.iter().try_fold(0usize, |total, value| {
+                        let ScalarConstant::String(index) = value else {
+                            return Err(execution_invariant_error(location));
+                        };
+                        let text = self
+                            .raw
+                            .string_values
+                            .get(index.0 as usize)
+                            .ok_or_else(|| execution_invariant_error(location))?;
+                        total
+                            .checked_add(text.len())
+                            .ok_or_else(|| execution_invariant_error(location))
+                    })?
+                } else {
+                    0
+                };
+                let admitted = if element_type == ScalarType::String {
+                    self.resources.admit_string_vector(
+                        count,
+                        payload_bytes,
+                        0,
+                        location,
+                        "vector_literal",
+                    )?
+                } else {
+                    self.resources
+                        .admit_vector(element_type, count, location, "vector_literal")?
+                };
+                match build_vector(self.raw, element_type, values) {
                     Ok(value) => Ok((value, count != 0)),
                     Err(error) => {
                         self.resources.refund(admitted);
@@ -532,13 +631,17 @@ impl<'a> Interpreter<'a> {
                 Value::Bool(value) => Ok(Value::Bool(*value)),
                 Value::Int(value) => Ok(Value::Int(*value)),
                 Value::Double(value) => Ok(Value::Double(*value)),
-                _ => Err(execution_invariant_error(location)),
+                value => {
+                    clone_borrowed_value(&mut self.resources, value, location, "binding_transfer")
+                }
             },
             Some(Slot::Borrowed(value)) => match value {
                 Value::Bool(value) => Ok(Value::Bool(*value)),
                 Value::Int(value) => Ok(Value::Int(*value)),
                 Value::Double(value) => Ok(Value::Double(*value)),
-                _ => Err(execution_invariant_error(location)),
+                value => {
+                    clone_borrowed_value(&mut self.resources, value, location, "binding_transfer")
+                }
             },
             None => Err(execution_invariant_error(location)),
         }
@@ -549,7 +652,14 @@ impl<'a> Interpreter<'a> {
         for _ in 0..=self.slots.len() {
             match self.slots.get(index).and_then(Option::as_ref) {
                 Some(Slot::Alias(next)) => index = next.0 as usize,
-                Some(Slot::Borrowed(value)) => return Ok((*value).clone()),
+                Some(Slot::Borrowed(value)) => {
+                    return clone_borrowed_value(
+                        &mut self.resources,
+                        value,
+                        SourceLocation::start(),
+                        "program_result",
+                    );
+                }
                 Some(Slot::Owned { .. }) => {
                     return match self.slots.get_mut(index).and_then(Option::take) {
                         Some(Slot::Owned { value, .. }) => Ok(value),
@@ -665,6 +775,90 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+fn admit_borrowed_copy(
+    resources: &mut ResourceContext,
+    value: &Value,
+    location: SourceLocation,
+    producer: &str,
+) -> Result<usize, Error> {
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(1)
+        .map_err(|_| execution_allocation_error(location, producer))?;
+    pending.push(value);
+    let mut admitted = 0usize;
+    while let Some(value) = pending.pop() {
+        let result = match value {
+            Value::Bool(_) | Value::Int(_) | Value::Double(_) => Ok(0),
+            Value::String(value) => resources.admit_string(value.len(), 0, location, producer),
+            Value::BoolVector(values) => {
+                resources.admit_vector(ScalarType::Bool, values.len(), location, producer)
+            }
+            Value::IntVector(values) => {
+                resources.admit_vector(ScalarType::Int, values.len(), location, producer)
+            }
+            Value::DoubleVector(values) => {
+                resources.admit_vector(ScalarType::Double, values.len(), location, producer)
+            }
+            Value::StringVector(values) => {
+                let payload = values.iter().try_fold(0usize, |total, value| {
+                    total.checked_add(value.len()).ok_or_else(|| {
+                        resources.size_overflow(Some(values.len()), location, producer)
+                    })
+                });
+                match payload {
+                    Ok(payload) => {
+                        resources.admit_string_vector(values.len(), payload, 0, location, producer)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Value::Tuple(values) => match resources.admit_tuple(values.len(), location, producer) {
+                Ok(bytes) => {
+                    if pending.try_reserve(values.len()).is_err() {
+                        resources.refund(admitted.saturating_add(bytes));
+                        return Err(execution_allocation_error(location, producer));
+                    }
+                    pending.extend(values.iter());
+                    Ok(bytes)
+                }
+                Err(error) => Err(error),
+            },
+        };
+        match result {
+            Ok(bytes) => {
+                let Some(total) = admitted.checked_add(bytes) else {
+                    resources.refund(admitted);
+                    resources.refund(bytes);
+                    return Err(resources.size_overflow(None, location, producer));
+                };
+                admitted = total;
+            }
+            Err(error) => {
+                resources.refund(admitted);
+                return Err(error);
+            }
+        }
+    }
+    Ok(admitted)
+}
+
+fn clone_borrowed_value(
+    resources: &mut ResourceContext,
+    value: &Value,
+    location: SourceLocation,
+    producer: &str,
+) -> Result<Value, Error> {
+    let admitted = admit_borrowed_copy(resources, value, location, producer)?;
+    match value.try_clone() {
+        Ok(value) => Ok(value),
+        Err(()) => {
+            resources.refund(admitted);
+            Err(execution_allocation_error(location, producer))
+        }
+    }
+}
+
 fn slot_value<'slots, 'values>(
     slots: &'slots [Option<Slot<'values>>],
     producer: NodeIndex,
@@ -738,15 +932,35 @@ fn range_indices(range: crate::IndexRange) -> std::ops::Range<usize> {
     range.start as usize..range.start as usize + range.count as usize
 }
 
-fn scalar_value(value: ScalarConstant) -> Value {
-    match value {
+fn scalar_value(
+    raw: &crate::RawProgram,
+    value: ScalarConstant,
+    location: SourceLocation,
+) -> Result<Value, Error> {
+    Ok(match value {
         ScalarConstant::Bool(value) => Value::Bool(value),
         ScalarConstant::Int(value) => Value::Int(value),
         ScalarConstant::DoubleBits(value) => Value::Double(f64::from_bits(value)),
-    }
+        ScalarConstant::String(index) => {
+            let source = raw
+                .string_values
+                .get(index.0 as usize)
+                .ok_or_else(|| execution_invariant_error(location))?;
+            let mut result = String::new();
+            result
+                .try_reserve_exact(source.len())
+                .map_err(|_| execution_allocation_error(location, "string_literal"))?;
+            result.push_str(source);
+            Value::String(result)
+        }
+    })
 }
 
-fn build_vector(element_type: ScalarType, values: &[ScalarConstant]) -> Result<Value, Error> {
+fn build_vector(
+    raw: &crate::RawProgram,
+    element_type: ScalarType,
+    values: &[ScalarConstant],
+) -> Result<Value, Error> {
     match element_type {
         ScalarType::Bool => {
             let mut result = Vec::new();
@@ -786,6 +1000,28 @@ fn build_vector(element_type: ScalarType, values: &[ScalarConstant]) -> Result<V
                 result.push(f64::from_bits(*value));
             }
             Ok(Value::DoubleVector(result))
+        }
+        ScalarType::String => {
+            let mut result = Vec::new();
+            result.try_reserve_exact(values.len()).map_err(|_| {
+                execution_allocation_error(SourceLocation::start(), "vector_literal")
+            })?;
+            for value in values {
+                let ScalarConstant::String(index) = value else {
+                    return Err(execution_invariant_error(SourceLocation::start()));
+                };
+                let source = raw
+                    .string_values
+                    .get(index.0 as usize)
+                    .ok_or_else(|| execution_invariant_error(SourceLocation::start()))?;
+                let mut copy = String::new();
+                copy.try_reserve_exact(source.len()).map_err(|_| {
+                    execution_allocation_error(SourceLocation::start(), "vector_literal")
+                })?;
+                copy.push_str(source);
+                result.push(copy);
+            }
+            Ok(Value::StringVector(result))
         }
     }
 }
@@ -902,6 +1138,17 @@ pub(crate) fn decode_verified_arguments(
             },
             ScalarType::Int => decode_int(spelling).map(Value::Int),
             ScalarType::Double => decode_double(spelling).map(Value::Double),
+            ScalarType::String => {
+                let mut value = String::new();
+                if value.try_reserve_exact(spelling.len()).is_err() {
+                    return Err(execution_allocation_error(
+                        SourceLocation::start(),
+                        "argument decoding",
+                    ));
+                }
+                value.push_str(spelling);
+                Ok(Value::String(value))
+            }
         };
         match value {
             Ok(value) => decoded.push(value),

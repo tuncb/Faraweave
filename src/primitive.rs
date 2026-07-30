@@ -154,6 +154,7 @@ pub(crate) fn apply_implementation(
         ScalarKernel::LengthBoolVector
             | ScalarKernel::LengthIntVector
             | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::LengthStringVector
     ) {
         let [argument] = arguments else {
             return Err(type_runtime_error(producer, location));
@@ -168,6 +169,7 @@ pub(crate) fn apply_implementation(
             (ScalarKernel::LengthBoolVector, Value::BoolVector(values)) => values.len(),
             (ScalarKernel::LengthIntVector, Value::IntVector(values)) => values.len(),
             (ScalarKernel::LengthDoubleVector, Value::DoubleVector(values)) => values.len(),
+            (ScalarKernel::LengthStringVector, Value::StringVector(values)) => values.len(),
             _ => return Err(type_runtime_error(producer, location)),
         };
         let work = admitted_work(application_plan, 1, arguments, producer, location)?;
@@ -175,9 +177,30 @@ pub(crate) fn apply_implementation(
             .map(|value| (value, false));
     }
 
+    if descriptor.kernel == ScalarKernel::LengthString {
+        let [argument] = arguments else {
+            return Err(type_runtime_error(producer, location));
+        };
+        let Value::String(value) = argument.value else {
+            return Err(type_runtime_error(producer, location));
+        };
+        if lift != crate::LiftMode::ContainerScalar
+            || result_type != ScalarType::Int
+            || argument.conversion != crate::Conversion::Identity
+        {
+            return Err(type_runtime_error(producer, location));
+        }
+        let work = admitted_work(application_plan, 1, arguments, producer, location)?;
+        return apply_vector_length(value.chars().count(), work, location, producer, resources)
+            .map(|value| (value, false));
+    }
+
     if matches!(
         descriptor.kernel,
-        ScalarKernel::SortBoolVector | ScalarKernel::SortIntVector | ScalarKernel::SortDoubleVector
+        ScalarKernel::SortBoolVector
+            | ScalarKernel::SortIntVector
+            | ScalarKernel::SortDoubleVector
+            | ScalarKernel::SortStringVector
     ) {
         let [argument] = arguments else {
             return Err(type_runtime_error(producer, location));
@@ -204,6 +227,25 @@ pub(crate) fn apply_implementation(
             resources,
         )
         .map(|value| (value, true));
+    }
+
+    if matches!(
+        descriptor.kernel,
+        ScalarKernel::EqualsString
+            | ScalarKernel::NotEqualsString
+            | ScalarKernel::LessThanString
+            | ScalarKernel::GreaterThanString
+    ) {
+        return apply_string_comparison(
+            descriptor.kernel,
+            application_plan,
+            arguments,
+            lift,
+            result_type,
+            location,
+            producer,
+            resources,
+        );
     }
 
     if matches!(
@@ -672,6 +714,7 @@ fn allocate_filter_output(element_type: ScalarType, length: usize) -> Result<Val
             values.try_reserve_exact(length).map_err(|_| ())?;
             Ok(Value::DoubleVector(values))
         }
+        ScalarType::String => Err(()),
     }
 }
 
@@ -739,6 +782,7 @@ fn allocate_scan_output(element_type: ScalarType, length: usize) -> Result<Value
             values.resize(length, 0.0);
             Ok(Value::DoubleVector(values))
         }
+        ScalarType::String => Err(()),
     }
 }
 
@@ -816,6 +860,99 @@ pub(crate) fn implementation_name(implementation_id: u16) -> Option<&'static str
         .map(|descriptor| descriptor.primitive_name)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_string_comparison(
+    kernel: ScalarKernel,
+    application_plan: ApplicationPlan,
+    arguments: &[SelectedApplicationArgument<'_>],
+    lift: crate::LiftMode,
+    result_type: ScalarType,
+    location: SourceLocation,
+    producer: &str,
+    resources: &mut ResourceContext,
+) -> Result<(Value, bool), Error> {
+    let [left, right] = arguments else {
+        return Err(type_runtime_error(producer, location));
+    };
+    if result_type != ScalarType::Bool
+        || left.conversion != crate::Conversion::Identity
+        || right.conversion != crate::Conversion::Identity
+        || !matches!(
+            lift,
+            crate::LiftMode::Scalar | crate::LiftMode::Vector | crate::LiftMode::DynamicVector
+        )
+    {
+        return Err(type_runtime_error(producer, location));
+    }
+    let accounted = !matches!(lift, crate::LiftMode::Scalar);
+    let count = if accounted {
+        arguments
+            .iter()
+            .find(|argument| argument.value.is_vector())
+            .map_or(0, |argument| argument.value.len())
+    } else {
+        1
+    };
+    let work = admitted_work(application_plan, count, arguments, producer, location)?;
+    let admitted = if accounted {
+        resources.admit_vector_with_work(ScalarType::Bool, count, work, location, producer)?
+    } else {
+        resources.charge_work(work, location, producer)?;
+        0
+    };
+    let mut results = Vec::new();
+    if results.try_reserve_exact(count).is_err() {
+        resources.refund(admitted);
+        return Err(allocation_error(producer, location));
+    }
+    for index in 0..count {
+        let left = match string_at(left.value, index) {
+            Ok(value) => value,
+            Err(error) => {
+                resources.refund(admitted);
+                return Err(error);
+            }
+        };
+        let right = match string_at(right.value, index) {
+            Ok(value) => value,
+            Err(error) => {
+                resources.refund(admitted);
+                return Err(error);
+            }
+        };
+        let ordering = left.as_bytes().cmp(right.as_bytes());
+        results.push(match kernel {
+            ScalarKernel::EqualsString => ordering.is_eq(),
+            ScalarKernel::NotEqualsString => !ordering.is_eq(),
+            ScalarKernel::LessThanString => ordering.is_lt(),
+            ScalarKernel::GreaterThanString => ordering.is_gt(),
+            _ => {
+                resources.refund(admitted);
+                return Err(type_runtime_error(producer, location));
+            }
+        });
+    }
+    if accounted {
+        Ok((Value::BoolVector(results), true))
+    } else {
+        results
+            .pop()
+            .map(|value| (Value::Bool(value), false))
+            .ok_or_else(|| type_runtime_error(producer, location))
+    }
+}
+
+fn string_at(value: &Value, index: usize) -> Result<&str, Error> {
+    match value {
+        Value::String(value) => Ok(value),
+        Value::StringVector(values) => values
+            .get(index)
+            .map(String::as_str)
+            .ok_or_else(|| type_runtime_error("application", SourceLocation::start())),
+        _ => Err(type_runtime_error("application", SourceLocation::start())),
+    }
+}
+
 fn scalar_at(value: &Value, index: usize) -> Result<Value, Error> {
     match value {
         Value::Bool(value) => Ok(Value::Bool(*value)),
@@ -836,6 +973,9 @@ fn scalar_at(value: &Value, index: usize) -> Result<Value, Error> {
             .copied()
             .map(Value::Double)
             .ok_or_else(|| type_runtime_error("application", SourceLocation::start())),
+        Value::String(_) | Value::StringVector(_) => {
+            Err(type_runtime_error("application", SourceLocation::start()))
+        }
         Value::Tuple(_) => Err(type_runtime_error("application", SourceLocation::start())),
     }
 }
@@ -928,9 +1068,11 @@ fn invoke_kernel(
         (ScalarKernel::EqualsBool, [left, right])
         | (ScalarKernel::EqualsInt, [left, right])
         | (ScalarKernel::EqualsDouble, [left, right]) => Some(Value::Bool(equals(left, right))),
+        (ScalarKernel::EqualsString, [left, right]) => Some(Value::Bool(equals(left, right))),
         (ScalarKernel::NotEqualsBool, [left, right])
         | (ScalarKernel::NotEqualsInt, [left, right])
         | (ScalarKernel::NotEqualsDouble, [left, right]) => Some(Value::Bool(!equals(left, right))),
+        (ScalarKernel::NotEqualsString, [left, right]) => Some(Value::Bool(!equals(left, right))),
         (ScalarKernel::NotBool, [Value::Bool(value)]) => Some(Value::Bool(!value)),
         (ScalarKernel::AndBool, [Value::Bool(left), Value::Bool(right)]) => {
             Some(Value::Bool(*left && *right))
@@ -959,6 +1101,12 @@ fn invoke_kernel(
         }
         (ScalarKernel::GreaterThanDouble, [Value::Double(left), Value::Double(right)]) => {
             Some(Value::Bool(strict_float::less_than(*right, *left)))
+        }
+        (ScalarKernel::LessThanString, [Value::String(left), Value::String(right)]) => {
+            Some(Value::Bool(left.as_bytes() < right.as_bytes()))
+        }
+        (ScalarKernel::GreaterThanString, [Value::String(left), Value::String(right)]) => {
+            Some(Value::Bool(left.as_bytes() > right.as_bytes()))
         }
         (ScalarKernel::SqrtDouble, [Value::Double(value)]) => {
             Some(Value::Double(strict_float::backend_native_sqrt(*value)))
@@ -995,9 +1143,12 @@ fn invoke_kernel(
             | ScalarKernel::LengthBoolVector
             | ScalarKernel::LengthIntVector
             | ScalarKernel::LengthDoubleVector
+            | ScalarKernel::LengthString
+            | ScalarKernel::LengthStringVector
             | ScalarKernel::SortBoolVector
             | ScalarKernel::SortIntVector
             | ScalarKernel::SortDoubleVector
+            | ScalarKernel::SortStringVector
             | ScalarKernel::SumIntVector
             | ScalarKernel::SumDoubleVector
             | ScalarKernel::AllOfBoolVector
@@ -1055,10 +1206,21 @@ fn apply_vector_sort(
         (ScalarKernel::SortDoubleVector, Value::DoubleVector(values)) => {
             (ScalarType::Double, values.len())
         }
+        (ScalarKernel::SortStringVector, Value::StringVector(values)) => {
+            (ScalarType::String, values.len())
+        }
         _ => return Err(type_runtime_error(producer, location)),
     };
-    let admitted =
-        resources.admit_vector_with_work(element_type, length, work, location, producer)?;
+    let admitted = if let Value::StringVector(values) = input {
+        let payload = values.iter().try_fold(0usize, |total, value| {
+            total
+                .checked_add(value.len())
+                .ok_or_else(|| resources.size_overflow(Some(length), location, producer))
+        })?;
+        resources.admit_string_vector(length, payload, work, location, producer)?
+    } else {
+        resources.admit_vector_with_work(element_type, length, work, location, producer)?
+    };
     let result = match (kernel, input) {
         (ScalarKernel::SortBoolVector, Value::BoolVector(input)) => {
             let mut output = Vec::new();
@@ -1089,6 +1251,24 @@ fn apply_vector_sort(
             output.extend_from_slice(input);
             output.sort_unstable_by(f64::total_cmp);
             Value::DoubleVector(output)
+        }
+        (ScalarKernel::SortStringVector, Value::StringVector(input)) => {
+            let mut output = Vec::new();
+            if output.try_reserve_exact(length).is_err() {
+                resources.refund(admitted);
+                return Err(allocation_error(producer, location));
+            }
+            for value in input {
+                let mut copy = String::new();
+                if copy.try_reserve_exact(value.len()).is_err() {
+                    resources.refund(admitted);
+                    return Err(allocation_error(producer, location));
+                }
+                copy.push_str(value);
+                output.push(copy);
+            }
+            output.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            Value::StringVector(output)
         }
         _ => {
             resources.refund(admitted);
@@ -1225,6 +1405,7 @@ fn equals(left: &Value, right: &Value) -> bool {
         (Value::Double(left), Value::Int(right)) => {
             strict_float::equal(*left, strict_float::int_to_binary64(*right))
         }
+        (Value::String(left), Value::String(right)) => left == right,
         _ => false,
     }
 }
@@ -1255,6 +1436,14 @@ fn vector_from_scalars(element_type: ScalarType, values: Vec<Value>) -> Result<V
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::DoubleVector),
+        ScalarType::String => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(value) => Ok(value),
+                _ => Err(type_runtime_error("application", SourceLocation::start())),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::StringVector),
     }
 }
 

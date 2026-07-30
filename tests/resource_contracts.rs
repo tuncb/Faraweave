@@ -36,6 +36,9 @@ static CONNECTED_BINDING_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> =
     Mutex::new(Vec::new());
 static IMMUTABLE_BINDING_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> =
     Mutex::new(Vec::new());
+static STRING_COMPARISON_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static STRING_PARAMETER_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static STRING_SORT_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
@@ -988,6 +991,338 @@ fn sort_admits_owned_output_with_input_live_and_cleans_up_refused_output() {
     assert_eq!(empty.usage.peak_live_evaluation_bytes, 0);
     assert_eq!(empty.usage.work_units, 0);
     assert_eq!(empty.usage.allocation_attempts, 0);
+}
+
+fn observe_string_comparison_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = STRING_COMPARISON_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_string_parameter_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = STRING_PARAMETER_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_string_sort_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = STRING_SORT_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+#[test]
+fn string_payload_and_descriptor_accounting_is_checked_and_cleanup_exact() {
+    STRING_SORT_EVENTS.lock().expect("event lock").clear();
+    let result = evaluate_expression_with_observer(
+        "sort[(\"a\" \"é\" \"\")]",
+        EvaluationConfiguration::default(),
+        observe_string_sort_event,
+    )
+    .expect("String sort");
+    assert_eq!(
+        result.value,
+        Value::StringVector(vec!["".to_owned(), "a".to_owned(), "é".to_owned()])
+    );
+    assert_eq!(
+        result.usage,
+        faraweave::ResourceUsage {
+            live_evaluation_bytes: 51,
+            peak_live_evaluation_bytes: 102,
+            work_units: 3,
+            allocation_attempts: 2,
+        }
+    );
+    let events = STRING_SORT_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(events[0].bytes, Some(51));
+    assert_eq!(events[1].bytes, Some(51));
+    assert_eq!(events[1].work, 3);
+    assert_eq!(events[2].usage.live_evaluation_bytes, 51);
+
+    let vector_limit = evaluate_expression_with_configuration(
+        "sort[(\"a\" \"é\" \"\")]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(50),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("descriptor plus payload limit");
+    assert_eq!(
+        resource(&vector_limit).reason,
+        ResourceErrorReason::ProfileLimit
+    );
+    assert_eq!(resource(&vector_limit).requested_bytes, Some(51));
+
+    let live_limit = evaluate_expression_with_configuration(
+        "sort[(\"a\" \"é\" \"\")]",
+        bounded(ResourceLimits {
+            max_vector_bytes: Some(51),
+            max_live_evaluation_bytes: Some(101),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("input plus output live limit");
+    assert_eq!(
+        resource(&live_limit).reason,
+        ResourceErrorReason::ProfileLimit
+    );
+    assert_eq!(live_limit.usage.expect("cleanup").live_evaluation_bytes, 0);
+
+    let allocation = evaluate_expression_with_configuration(
+        "sort[(\"a\" \"é\" \"\")]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("String sort allocation");
+    assert_eq!(
+        resource(&allocation).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(allocation.usage.expect("cleanup").live_evaluation_bytes, 0);
+
+    let scalar = evaluate_expression("length[\"é\"]").expect("scalar length");
+    assert_eq!(scalar.value, Value::Int(1));
+    assert_eq!(scalar.usage.peak_live_evaluation_bytes, 2);
+    assert_eq!(scalar.usage.allocation_attempts, 1);
+}
+
+#[test]
+fn string_comparisons_borrow_payloads_and_allocate_only_vector_results() {
+    STRING_COMPARISON_EVENTS.lock().expect("event lock").clear();
+    let scalar = evaluate_expression_with_observer(
+        "equals[\"é\" \"é\"]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(2),
+            },
+            ..EvaluationConfiguration::default()
+        },
+        observe_string_comparison_event,
+    )
+    .expect("scalar comparison has no result allocation");
+    assert_eq!(scalar.value, Value::Bool(true));
+    assert_eq!(scalar.usage.allocation_attempts, 2);
+    let scalar_events = STRING_COMPARISON_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(
+        scalar_events
+            .iter()
+            .filter(|event| event.kind == faraweave::ResourceEventKind::Admission)
+            .map(|event| (event.producer.as_str(), event.bytes))
+            .collect::<Vec<_>>(),
+        vec![
+            ("string_literal", Some(2)),
+            ("string_literal", Some(2)),
+            ("equals", None)
+        ]
+    );
+
+    STRING_COMPARISON_EVENTS.lock().expect("event lock").clear();
+    let vector = evaluate_expression_with_observer(
+        "less_than[(\"a\" \"é\") (\"b\" \"é\")]",
+        EvaluationConfiguration::default(),
+        observe_string_comparison_event,
+    )
+    .expect("String vector comparison");
+    assert_eq!(vector.value, Value::BoolVector(vec![true, false]));
+    assert_eq!(vector.usage.allocation_attempts, 3);
+    let vector_events = STRING_COMPARISON_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(
+        vector_events
+            .iter()
+            .filter(|event| event.kind == faraweave::ResourceEventKind::Admission)
+            .map(|event| (event.producer.as_str(), event.bytes))
+            .collect::<Vec<_>>(),
+        vec![
+            ("vector_literal", Some(35)),
+            ("vector_literal", Some(35)),
+            ("less_than", Some(2)),
+        ]
+    );
+
+    let refusal = evaluate_expression_with_configuration(
+        "less_than[(\"a\" \"é\") (\"b\" \"é\")]",
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(2),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("only the Bool result is the third allocation");
+    assert_eq!(
+        resource(&refusal).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(refusal.usage.expect("cleanup").live_evaluation_bytes, 0);
+}
+
+#[test]
+fn string_parameters_and_borrowed_copies_are_admitted_and_cleanup_exactly() {
+    let argument = [Value::String("é".to_owned())];
+    STRING_PARAMETER_EVENTS.lock().expect("event lock").clear();
+    let consumed = evaluate_source_with_arguments_and_observer(
+        "parameters[x String]\nlength[x]\n",
+        &argument,
+        EvaluationConfiguration::default(),
+        observe_string_parameter_event,
+    )
+    .expect("consumed String parameter");
+    assert_eq!(consumed.values, vec![Value::Int(1)]);
+    assert_eq!(consumed.usage.peak_live_evaluation_bytes, 2);
+    assert_eq!(consumed.usage.live_evaluation_bytes, 0);
+    assert_eq!(consumed.usage.allocation_attempts, 1);
+    let consumed_events = STRING_PARAMETER_EVENTS.lock().expect("event lock").clone();
+    assert_eq!(
+        consumed_events
+            .iter()
+            .map(|event| (event.kind, event.producer.as_str(), event.bytes))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                faraweave::ResourceEventKind::Admission,
+                "parameter",
+                Some(2),
+            ),
+            (faraweave::ResourceEventKind::Admission, "length", None,),
+            (
+                faraweave::ResourceEventKind::Release,
+                "value_release",
+                Some(2),
+            ),
+        ]
+    );
+
+    let bounded = faraweave::evaluate_source_with_arguments(
+        "parameters[x String]\nlength[x]\n",
+        &argument,
+        bounded(ResourceLimits {
+            max_live_evaluation_bytes: Some(1),
+            ..ResourceLimits::default()
+        }),
+    )
+    .expect_err("parameter payload exceeds live limit");
+    assert_eq!(resource(&bounded).reason, ResourceErrorReason::ProfileLimit);
+    assert_eq!(bounded.usage.expect("cleanup").live_evaluation_bytes, 0);
+
+    let direct = faraweave::evaluate_source_with_arguments(
+        "parameters[x String]\nx\n",
+        &argument,
+        EvaluationConfiguration::default(),
+    )
+    .expect("copied String parameter result");
+    assert_eq!(direct.values, argument);
+    assert_eq!(direct.usage.peak_live_evaluation_bytes, 4);
+    assert_eq!(direct.usage.live_evaluation_bytes, 2);
+    assert_eq!(direct.usage.allocation_attempts, 2);
+
+    let through_binding = faraweave::evaluate_source_with_arguments(
+        "parameters[x String]\nlet y = x\n[y]\n",
+        &argument,
+        EvaluationConfiguration::default(),
+    )
+    .expect("parameter binding moved into tuple");
+    assert_eq!(
+        through_binding.values,
+        vec![Value::Tuple(vec![Value::String("é".to_owned())].into())]
+    );
+    assert_eq!(through_binding.usage.peak_live_evaluation_bytes, 20);
+    assert_eq!(through_binding.usage.live_evaluation_bytes, 18);
+    assert_eq!(through_binding.usage.allocation_attempts, 3);
+
+    STRING_PARAMETER_EVENTS.lock().expect("event lock").clear();
+    let nested_source = "parameters[x String]\n[[x] x]\n";
+    let nested_failure = evaluate_source_with_arguments_and_observer(
+        nested_source,
+        &argument,
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(4),
+            },
+            ..EvaluationConfiguration::default()
+        },
+        observe_string_parameter_event,
+    )
+    .expect_err("late nested-tuple String copy refusal");
+    assert_eq!(
+        resource(&nested_failure).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(
+        nested_failure
+            .usage
+            .expect("post-cleanup usage")
+            .live_evaluation_bytes,
+        0
+    );
+    let nested_events = STRING_PARAMETER_EVENTS.lock().expect("event lock").clone();
+    let refusal = nested_events
+        .iter()
+        .position(|event| event.kind == faraweave::ResourceEventKind::Refusal)
+        .expect("late refusal event");
+    assert_eq!(nested_events[refusal].producer, "tuple_literal");
+    assert_eq!(nested_events[refusal].bytes, Some(2));
+    assert_eq!(nested_events[refusal].usage.live_evaluation_bytes, 52);
+    assert_eq!(
+        nested_events[refusal + 1..]
+            .iter()
+            .map(|event| (event.kind, event.bytes, event.usage.live_evaluation_bytes))
+            .collect::<Vec<_>>(),
+        vec![
+            (faraweave::ResourceEventKind::Release, Some(18), 34),
+            (faraweave::ResourceEventKind::Release, Some(2), 0),
+        ]
+    );
+
+    let root_failure = faraweave::evaluate_source_with_arguments(
+        "parameters[x String]\nx\nx\n",
+        &argument,
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(2),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("late String root copy refusal");
+    assert_eq!(
+        resource(&root_failure).reason,
+        ResourceErrorReason::AllocationUnavailable
+    );
+    assert_eq!(
+        root_failure
+            .usage
+            .expect("post-cleanup usage")
+            .live_evaluation_bytes,
+        0
+    );
 }
 
 #[test]

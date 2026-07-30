@@ -146,6 +146,10 @@ limits.string_bytes	canonical-complete	string-byte-limit
 decoder.truncation	canonical-complete	all-truncations
 decoder.deterministic_first_error	canonical-complete	combined-directory-record-error
 decoder.no_backend_before_verify	canonical-complete	public-backend-gate
+strings.feature_version	canonical-strings	string-feature-version
+strings.scalar_pool_reference	canonical-strings	string-scalar-reference
+strings.vector_pool_reference	canonical-strings	string-vector-reference
+strings.semantic_identity	canonical-strings	string-semantic-identity
 canonical.byte_identity	canonical-complete	corpus-hash
 canonical.host_neutral	canonical-complete	corpus-host-neutral
 surfaces.source_memory_decoded	canonical-complete	differential-runtime

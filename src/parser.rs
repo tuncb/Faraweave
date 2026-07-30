@@ -110,9 +110,11 @@ enum TokenKind {
     Bool,
     Int,
     Double,
+    String,
     BoolType,
     IntType,
     DoubleType,
+    StringType,
     LeftBracket,
     RightBracket,
     LeftParenthesis,
@@ -141,7 +143,7 @@ struct Token {
 }
 
 pub(crate) fn parse(source: &str) -> Result<Program, Error> {
-    let tokens = tokenize(source);
+    let tokens = tokenize(source)?;
     if let Some(result) = parse_deep_singleton_tuple(&tokens) {
         return result;
     }
@@ -182,7 +184,10 @@ fn parse_prefix_chain(
         return None;
     }
     let leaf_token = tokens.get(index)?;
-    let leaf = leaf_token.value.clone()?;
+    let leaf = match leaf_token.value.as_ref()?.try_clone() {
+        Ok(value) => value,
+        Err(()) => return Some(Err(parser_allocation_error(leaf_token.span.begin))),
+    };
     index += 1;
     while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
         index += 1;
@@ -242,7 +247,10 @@ fn parse_bracket_chain(
             "expected an expression",
         )));
     };
-    let leaf = leaf_token.value.clone()?;
+    let leaf = match leaf_token.value.as_ref()?.try_clone() {
+        Ok(value) => value,
+        Err(()) => return Some(Err(parser_allocation_error(leaf_token.span.begin))),
+    };
     index += 1;
     let mut steps = Vec::new();
     if steps.try_reserve_exact(names.len()).is_err() {
@@ -372,7 +380,10 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
             "expected an expression",
         )));
     };
-    let leaf = leaf_token.value.clone()?;
+    let leaf = match leaf_token.value.as_ref()?.try_clone() {
+        Ok(value) => value,
+        Err(()) => return Some(Err(parser_allocation_error(leaf_token.span.begin))),
+    };
     index += 1;
     let mut closed = 0usize;
     let mut closing_end = leaf_token.span.end;
@@ -522,7 +533,7 @@ fn expression_contains_tuple(expression: &Expr) -> bool {
     }
 }
 
-fn tokenize(source: &str) -> Vec<Token> {
+fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -530,6 +541,27 @@ fn tokenize(source: &str) -> Vec<Token> {
     while index < bytes.len() {
         let begin = location;
         let byte = bytes[index];
+        if byte == b'"' {
+            let (next_index, next_location, value, valid) =
+                tokenize_string_literal(source, index, location)?;
+            tokens
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(begin))?;
+            tokens.push(token(
+                if valid {
+                    TokenKind::String
+                } else {
+                    TokenKind::MalformedLiteral
+                },
+                begin,
+                next_location,
+                "",
+                value.map(Value::String),
+            ));
+            index = next_index;
+            location = next_location;
+            continue;
+        }
         if matches!(byte, b' ' | b'\t') {
             while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
                 advance_ascii(&mut location);
@@ -630,6 +662,7 @@ fn tokenize(source: &str) -> Vec<Token> {
                 "Bool" => TokenKind::BoolType,
                 "Int" => TokenKind::IntType,
                 "Double" => TokenKind::DoubleType,
+                "String" => TokenKind::StringType,
                 _ => TokenKind::Invalid,
             };
             tokens.push(token(kind, begin, location, spelling, None));
@@ -670,7 +703,96 @@ fn tokenize(source: &str) -> Vec<Token> {
         let spelling = &source[begin.offset - 1..location.offset - 1];
         tokens.push(token(kind, begin, location, spelling, None));
     }
-    tokens
+    Ok(tokens)
+}
+
+fn tokenize_string_literal(
+    source: &str,
+    start: usize,
+    mut location: SourceLocation,
+) -> Result<(usize, SourceLocation, Option<String>, bool), Error> {
+    let mut index = start + 1;
+    advance_ascii(&mut location);
+    let mut output = String::new();
+    let bytes = source.as_bytes();
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            advance_ascii(&mut location);
+            return Ok((index + 1, location, Some(output), true));
+        }
+        if matches!(bytes[index], b'\n' | b'\r') {
+            return Ok((index, location, None, false));
+        }
+        if bytes[index] != b'\\' {
+            let Some(character) = source[index..].chars().next() else {
+                return Ok((index, location, None, false));
+            };
+            output
+                .try_reserve(character.len_utf8())
+                .map_err(|_| parser_allocation_error(location))?;
+            output.push(character);
+            let width = character.len_utf8();
+            index += width;
+            location.offset += width;
+            location.column += 1;
+            continue;
+        }
+        advance_ascii(&mut location);
+        index += 1;
+        let Some(escape) = bytes.get(index).copied() else {
+            return Ok((index, location, None, false));
+        };
+        let character = match escape {
+            b'"' => '"',
+            b'\\' => '\\',
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
+            b'0' => '\0',
+            b'u' => {
+                advance_ascii(&mut location);
+                index += 1;
+                if bytes.get(index) != Some(&b'{') {
+                    return Ok((index, location, None, false));
+                }
+                advance_ascii(&mut location);
+                index += 1;
+                let digits_start = index;
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| byte.is_ascii_hexdigit())
+                {
+                    advance_ascii(&mut location);
+                    index += 1;
+                }
+                if index == digits_start || bytes.get(index) != Some(&b'}') {
+                    return Ok((index, location, None, false));
+                }
+                let digits = &source[digits_start..index];
+                let Ok(value) = u32::from_str_radix(digits, 16) else {
+                    return Ok((index, location, None, false));
+                };
+                let Some(character) = char::from_u32(value) else {
+                    return Ok((index, location, None, false));
+                };
+                advance_ascii(&mut location);
+                index += 1;
+                output
+                    .try_reserve(character.len_utf8())
+                    .map_err(|_| parser_allocation_error(location))?;
+                output.push(character);
+                continue;
+            }
+            _ => return Ok((index, location, None, false)),
+        };
+        output
+            .try_reserve(character.len_utf8())
+            .map_err(|_| parser_allocation_error(location))?;
+        output.push(character);
+        advance_ascii(&mut location);
+        index += 1;
+    }
+    Ok((index, location, None, false))
 }
 
 fn advance_ascii(location: &mut SourceLocation) {
@@ -902,7 +1024,10 @@ impl Parser {
         if name.kind != TokenKind::Name {
             if matches!(
                 name.kind,
-                TokenKind::BoolType | TokenKind::IntType | TokenKind::DoubleType
+                TokenKind::BoolType
+                    | TokenKind::IntType
+                    | TokenKind::DoubleType
+                    | TokenKind::StringType
             ) || matches!(
                 name.spelling.as_str(),
                 "true" | "false" | "inf" | "nan" | "let"
@@ -1156,7 +1281,7 @@ impl Parser {
             .cloned()
             .ok_or_else(|| self.eof_error("expected an expression"))?;
         match token.kind {
-            TokenKind::Bool | TokenKind::Int | TokenKind::Double => {
+            TokenKind::Bool | TokenKind::Int | TokenKind::Double | TokenKind::String => {
                 self.index += 1;
                 Ok(Expr {
                     kind: ExprKind::Literal(
@@ -1183,9 +1308,10 @@ impl Parser {
                     "scalar literal is outside its accepted range",
                 ))
             }
-            TokenKind::BoolType | TokenKind::IntType | TokenKind::DoubleType => {
-                self.parse_typed_empty()
-            }
+            TokenKind::BoolType
+            | TokenKind::IntType
+            | TokenKind::DoubleType
+            | TokenKind::StringType => self.parse_typed_empty(),
             TokenKind::LeftParenthesis => self.parse_vector(),
             TokenKind::LeftBracket => self.parse_tuple(),
             TokenKind::Name => self.parse_name_expr(),
@@ -1345,7 +1471,7 @@ impl Parser {
             return Err(Error::at_span(
                 ErrorKind::SyntaxError,
                 type_token.span,
-                "empty vector requires Bool(), Int(), or Double()",
+                "empty vector requires Bool(), Int(), Double(), or String()",
             ));
         }
         self.index += 1;
@@ -1382,7 +1508,7 @@ impl Parser {
                     begin: open.span.begin,
                     end: close.span.end,
                 },
-                "empty vector requires Bool(), Int(), or Double()",
+                "empty vector requires Bool(), Int(), Double(), or String()",
             ));
         }
         let mut values = Vec::new();
@@ -1783,6 +1909,7 @@ fn token_scalar_type(kind: TokenKind) -> Option<ScalarType> {
         TokenKind::BoolType => Some(ScalarType::Bool),
         TokenKind::IntType => Some(ScalarType::Int),
         TokenKind::DoubleType => Some(ScalarType::Double),
+        TokenKind::StringType => Some(ScalarType::String),
         _ => None,
     }
 }
@@ -2264,7 +2391,7 @@ mod tests {
     #[test]
     fn tokenizes_utf8_comments_without_retaining_their_text() {
         let source = "1# café\r\n2#終";
-        let tokens = tokenize(source);
+        let tokens = tokenize(source).expect("tokenize");
         assert_eq!(
             tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
             vec![

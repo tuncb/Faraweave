@@ -65,9 +65,9 @@ pub use typed_program::{
     NodeKind, OperationReference, OperationReferenceIndex, Origin, OriginIndex, OriginPosition,
     OriginSpan, Ownership, OwnershipMode, Parameter, ParameterIndex, ProgramRanges, RawProgram,
     RawProgramBuilder, RecordKind, ReleaseAfter, Root, RootIndex, SUPPORTED_SEMANTIC_MAJOR,
-    SUPPORTED_SEMANTIC_MINOR, ScalarConstant, ShapePlan, SourceUnit, SourceUnitIndex, TypeIndex,
-    TypeRecord, ValueAccess, VerifiedProgram, VerifyAllocationFailureInjection,
-    VerifyAllocationSite, VerifyError,
+    SUPPORTED_SEMANTIC_MINOR, ScalarConstant, ShapePlan, SourceUnit, SourceUnitIndex,
+    StringValueIndex, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
+    VerifyAllocationFailureInjection, VerifyAllocationSite, VerifyError,
 };
 pub use value::{ScalarType, TupleValues, Type, Value, format_type, format_value};
 

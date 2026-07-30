@@ -224,6 +224,56 @@ impl ResourceContext {
         Ok(bytes)
     }
 
+    pub(crate) fn admit_string(
+        &mut self,
+        length: usize,
+        work: usize,
+        location: SourceLocation,
+        producer: &str,
+    ) -> Result<usize, Error> {
+        self.admit_request(None, length, work, None, Some(length), location, producer)?;
+        Ok(length)
+    }
+
+    pub(crate) fn admit_string_vector(
+        &mut self,
+        length: usize,
+        payload_bytes: usize,
+        work: usize,
+        location: SourceLocation,
+        producer: &str,
+    ) -> Result<usize, Error> {
+        let bytes = length
+            .checked_mul(16)
+            .and_then(|descriptors| descriptors.checked_add(payload_bytes))
+            .ok_or_else(|| {
+                self.refusal(
+                    ResourceErrorReason::SizeOverflow,
+                    location,
+                    producer,
+                    Some(length),
+                    None,
+                    work,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })?;
+        self.admit_request(
+            self.limits
+                .max_vector_bytes
+                .map(|limit| ("max_vector_bytes", limit)),
+            bytes,
+            work,
+            Some(length),
+            Some(bytes),
+            location,
+            producer,
+        )?;
+        Ok(bytes)
+    }
+
     pub(crate) fn admit_tuple(
         &mut self,
         count: usize,

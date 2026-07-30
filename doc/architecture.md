@@ -43,6 +43,11 @@ visibility or ownership escapes, and then lowering emits explicit `Binding`,
 provenance, scope-safe consumers, one final move, and the binding owner's exact
 logical release before execution.
 
+Semantic/physical FWIR 1.4 adds feature 10 for UTF-8 String scalars and vectors.
+Lowering selects appended stable String operation identities, the canonical
+encoder interns literal payloads into `STRS`, and the shared interpreter keeps
+payload copying, resource admission, and cleanup explicit and fallible.
+
 `VerifiedProgram` is an in-process trust boundary, not a serialized ABI.
 Callers may build `RawProgram`, but only complete verification can construct a
 `VerifiedProgram`; decoding likewise returns nothing until physical checks and
