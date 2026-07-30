@@ -3453,6 +3453,40 @@ mod tests {
     }
 
     #[test]
+    fn typed_empty_trivia_preserves_canonical_lowering() {
+        for (canonical_source, trivia_source, scalar_type) in [
+            ("Bool()", "Bool( \t)", ScalarType::Bool),
+            ("Int()", "Int(\n)", ScalarType::Int),
+            ("Double()", "Double(\t# empty\r\n )", ScalarType::Double),
+        ] {
+            let canonical = must_compile(canonical_source);
+            let with_trivia = must_compile(trivia_source);
+            let canonical = canonical.as_raw();
+            let with_trivia = with_trivia.as_raw();
+
+            assert_eq!(with_trivia.types, canonical.types, "{trivia_source}");
+            assert_eq!(
+                with_trivia.constants, canonical.constants,
+                "{trivia_source}"
+            );
+            assert_eq!(with_trivia.nodes, canonical.nodes, "{trivia_source}");
+            assert_eq!(with_trivia.edges, canonical.edges, "{trivia_source}");
+            assert_eq!(with_trivia.roots, canonical.roots, "{trivia_source}");
+            assert_eq!(
+                with_trivia.constants,
+                [ConstantRecord::Vector {
+                    element_type: scalar_type,
+                    elements: IndexRange { start: 0, count: 0 },
+                }]
+            );
+            assert_eq!(
+                with_trivia.nodes[0].cardinality,
+                Some(Cardinality::StaticVector(0))
+            );
+        }
+    }
+
+    #[test]
     fn operation_references_are_rejected_outside_registered_consumer_positions() {
         for (source, offset) in [
             ("@add\n", 2),

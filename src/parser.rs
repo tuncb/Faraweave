@@ -1187,7 +1187,7 @@ impl Parser {
             ));
         }
         self.index += 1;
-        self.skip_comment_trivia();
+        self.skip_inside();
         let close = self
             .take()
             .ok_or_else(|| self.eof_error("missing closing delimiter"))?;
@@ -1560,18 +1560,6 @@ impl Parser {
 
     fn skip_inside(&mut self) {
         self.skip_newlines_and_spaces();
-    }
-
-    fn skip_comment_trivia(&mut self) {
-        let mut index = self.index;
-        let mut saw_comment = false;
-        while let Some(token) = self.tokens.get(index).filter(|token| is_trivia(token.kind)) {
-            saw_comment |= token.kind == TokenKind::Comment;
-            index += 1;
-        }
-        if saw_comment {
-            self.index = index;
-        }
     }
 
     fn has_separator(&self) -> bool {
@@ -2142,13 +2130,16 @@ mod tests {
     }
 
     #[test]
-    fn typed_empty_vectors_accept_comment_trivia_and_preserve_close_diagnostics() {
+    fn typed_empty_vectors_accept_all_trivia_and_preserve_failure_diagnostics() {
         for (source, expected_type) in [
+            ("Bool( )", ScalarType::Bool),
+            ("Int(\n)", ScalarType::Int),
+            ("Double(\t\r\n)", ScalarType::Double),
             ("Bool(# LF\n)", ScalarType::Bool),
             ("Int( # CRLF\r\n )", ScalarType::Int),
-            ("Double(\n# UTF-8 🦀\n)", ScalarType::Double),
+            ("Double(\t\n# UTF-8 🦀\r\n \t)", ScalarType::Double),
         ] {
-            let program = parse(source).expect("commented typed empty");
+            let program = parse(source).expect("typed empty with trivia");
             let root = program.roots.first().expect("typed empty root");
             match &root.kind {
                 ExprKind::Vector(actual_type, values) => {
@@ -2161,15 +2152,17 @@ mod tests {
             assert_eq!(root.span.end.offset, source.len() + 1);
         }
 
-        let eof_source = "Int(# no close";
-        let eof_error = parse(eof_source).expect_err("commented typed empty missing close");
-        assert_eq!(eof_error.kind, ErrorKind::SyntaxError);
-        assert_eq!(eof_error.message, "missing closing delimiter");
-        let eof_span = eof_error.span.expect("missing close insertion span");
-        assert_eq!(eof_span.begin.offset, eof_source.len() + 1);
-        assert_eq!(eof_span.begin, eof_span.end);
+        for eof_source in ["Int(\t\n", "Int(# no close"] {
+            let eof_error = parse(eof_source).expect_err("typed empty missing close");
+            assert_eq!(eof_error.kind, ErrorKind::SyntaxError);
+            assert_eq!(eof_error.message, "missing closing delimiter");
+            let eof_span = eof_error.span.expect("missing close insertion span");
+            assert_eq!(eof_span.begin.offset, eof_source.len() + 1);
+            assert_eq!(eof_span.begin, eof_span.end);
+        }
 
-        let invalid_close = parse("Bool(# comment\r\n]").expect_err("invalid typed empty close");
+        let invalid_close =
+            parse("Bool(\t# comment\r\n]").expect_err("mismatched typed empty close");
         assert_eq!(invalid_close.kind, ErrorKind::SyntaxError);
         assert_eq!(
             invalid_close.message,
@@ -2179,15 +2172,15 @@ mod tests {
         assert_eq!(invalid_span.begin.offset, 1);
         assert_eq!(invalid_span.end.offset, 5);
 
-        let whitespace_only = parse("Int( )").expect_err("whitespace-only typed empty");
-        assert_eq!(whitespace_only.kind, ErrorKind::SyntaxError);
+        let invalid_content = parse("Double(\n 1.0 )").expect_err("typed empty scalar content");
+        assert_eq!(invalid_content.kind, ErrorKind::SyntaxError);
         assert_eq!(
-            whitespace_only.message,
+            invalid_content.message,
             "vector elements must be scalar literals"
         );
-        let whitespace_span = whitespace_only.span.expect("whitespace type span");
-        assert_eq!(whitespace_span.begin.offset, 1);
-        assert_eq!(whitespace_span.end.offset, 4);
+        let invalid_content_span = invalid_content.span.expect("invalid content type span");
+        assert_eq!(invalid_content_span.begin.offset, 1);
+        assert_eq!(invalid_content_span.end.offset, 7);
     }
 
     #[test]

@@ -71,6 +71,8 @@ const RewriteValidFixture rewrite_valid_fixtures[] = {
    R"snapshot(roots=[0];nodes=[{kind=vector_literal,span=[1:1:1,10:4:2),element_type=integer,boolean=0,integer=0,double_precision=bits:0,first_element=0,element_count=2,first_element_span=0,call_index=0}];arguments=[];argument_spans=[];calls=[];boolean_elements=[];integer_elements=[1,2];double_elements=[];vector_element_spans=[[4:2:2,5:2:3),[7:3:2,8:3:3)])snapshot"},
   {"Int typed empty vector", "Int()", true,
    R"snapshot(roots=[0];nodes=[{kind=vector_literal,span=[1:1:1,6:1:6),element_type=integer,boolean=0,integer=0,double_precision=bits:0,first_element=0,element_count=0,first_element_span=0,call_index=0}];arguments=[];argument_spans=[];calls=[];boolean_elements=[];integer_elements=[];double_elements=[];vector_element_spans=[])snapshot"},
+  {"Int typed empty vector with internal trivia", "Int( )", true,
+   R"snapshot(roots=[0];nodes=[{kind=vector_literal,span=[1:1:1,7:1:7),element_type=integer,boolean=0,integer=0,double_precision=bits:0,first_element=0,element_count=0,first_element_span=0,call_index=0}];arguments=[];argument_spans=[];calls=[];boolean_elements=[];integer_elements=[];double_elements=[];vector_element_spans=[])snapshot"},
   {"Double singleton vector", "(1.0)", true,
    R"snapshot(roots=[0];nodes=[{kind=vector_literal,span=[1:1:1,6:1:6),element_type=double_precision,boolean=0,integer=0,double_precision=bits:0,first_element=0,element_count=1,first_element_span=0,call_index=0}];arguments=[];argument_spans=[];calls=[];boolean_elements=[];integer_elements=[];double_elements=[bits:3ff0000000000000];vector_element_spans=[[2:1:2,5:1:5)])snapshot"},
   {"Double nonempty vector", "(1.0 2.5 3.0)", true,
@@ -194,7 +196,6 @@ const RewriteInvalidFixture rewrite_invalid_fixtures[] = {
   {"capitalized NaN", "NAN", false, RewriteParseError::invalid_byte, {{1U, 1U, 1U}, {4U, 1U, 4U}}},
   {"NaN payload", "nan(payload)", false, RewriteParseError::trailing_input, {{4U, 1U, 4U}, {5U, 1U, 5U}}},
 
-  {"typed empty internal space", "Int( )", false, RewriteParseError::invalid_vector_element, {{1U, 1U, 1U}, {4U, 1U, 4U}}},
   {"literal trailing input", "true false", false, RewriteParseError::trailing_input, {{6U, 1U, 6U}, {11U, 1U, 11U}}},
 
   {"missing prefix operand", "inc ", false, RewriteParseError::expected_expression, {{5U, 1U, 5U}, {5U, 1U, 5U}}},

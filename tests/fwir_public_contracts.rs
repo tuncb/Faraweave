@@ -266,6 +266,33 @@ fn line_comments_preserve_source_length_and_interpreter_result() {
 }
 
 #[test]
+fn typed_empty_trivia_survives_verified_fwir_roundtrip() {
+    let source = "Bool( \t)\nInt(\n)\nDouble(\t# empty\r\n )\n";
+    let program =
+        compile_source_to_verified_program(source, "typed-empty.faraweave").expect("compile");
+    let bytes = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode");
+    let decoded = decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode");
+    let result =
+        evaluate_verified_program_with_arguments(&decoded, &[], EvaluationConfiguration::default())
+            .expect("interpret");
+
+    assert_eq!(result.formatted, ["()", "()", "()"]);
+    assert_eq!(
+        decoded
+            .as_raw()
+            .nodes
+            .iter()
+            .map(|node| node.cardinality)
+            .collect::<Vec<_>>(),
+        [
+            Some(faraweave::Cardinality::StaticVector(0)),
+            Some(faraweave::Cardinality::StaticVector(0)),
+            Some(faraweave::Cardinality::StaticVector(0)),
+        ]
+    );
+}
+
+#[test]
 fn public_compile_errors_and_argument_errors_preserve_phase_and_provenance() {
     let invalid =
         compile_source_to_fwir("inc[", &FwirEncodeOptions::default()).expect_err("invalid source");
