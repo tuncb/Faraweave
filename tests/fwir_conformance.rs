@@ -463,6 +463,134 @@ fn canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral() {
 }
 
 #[test]
+fn immutable_binding_artifact_versions_tags_and_provenance_are_conformant() {
+    let program = compile_source_to_verified_program(
+        "let value = iota[3]\nsum[value]\n",
+        "binding-conformance.faraweave",
+    )
+    .expect("compile immutable binding");
+    let bytes =
+        encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode immutable binding");
+    assert_eq!(read_u16(&bytes, 8), 1);
+    assert_eq!(read_u16(&bytes, 10), 3);
+    let decoded =
+        decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode immutable binding");
+    assert_eq!(decoded.as_raw().module.semantic_minor, 3);
+    assert!(
+        decoded
+            .as_raw()
+            .features
+            .contains(&Feature::ImmutableBindings.numeric())
+    );
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("canonical reencode"),
+        bytes
+    );
+    let inspection = inspect_fwir(&decoded).expect("inspect immutable binding");
+    assert!(inspection.contains("id=9"));
+    assert!(inspection.contains("Binding {"));
+    assert!(inspection.contains("BindingBorrowWhole"));
+
+    let (_, features, feature_length) = section(&bytes, 2);
+    let feature_record = (0..feature_length / 4)
+        .find(|index| {
+            read_u16(&bytes, features + index * 4) == Feature::ImmutableBindings.numeric()
+        })
+        .map(|index| features + index * 4)
+        .expect("feature 9 record");
+    let binding_node = record_with_tag(&bytes, 14, 56, 8);
+    let (_, edges, edge_length) = section(&bytes, 11);
+    let binding_edge = (0..edge_length / 24)
+        .find(|index| matches!(bytes[edges + index * 24 + 8], 6..=8))
+        .map(|index| edges + index * 24)
+        .expect("binding access");
+
+    let mut missing_feature = bytes.clone();
+    put_u16(
+        &mut missing_feature,
+        feature_record,
+        Feature::ConnectedApplicationBindings.numeric(),
+    );
+    let missing_feature_error =
+        decode_fwir(&missing_feature, &FwirDecodeLimits::default()).expect_err("missing feature");
+    assert!(
+        matches!(
+            &missing_feature_error,
+            faraweave::FwirDecodeError {
+                kind: FwirDecodeErrorKind::NonCanonicalRecord { field: "access" },
+                ..
+            }
+        ),
+        "{missing_feature_error:?}"
+    );
+
+    let mut old_physical = bytes.clone();
+    put_u16(&mut old_physical, 10, 2);
+    assert!(matches!(
+        decode_fwir(&old_physical, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "feature_format_minor"
+            },
+            ..
+        })
+    ));
+
+    let mut old_semantics = bytes.clone();
+    let (_, module, _) = section(&old_semantics, 1);
+    put_u16(&mut old_semantics, module + 2, 2);
+    assert!(matches!(
+        decode_fwir(&old_semantics, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                faraweave::MalformedProgram {
+                    invariant: Invariant::UnsupportedVersion,
+                    ..
+                }
+            )),
+            ..
+        })
+    ));
+
+    let mut invalid_node = bytes.clone();
+    invalid_node[binding_node] = 11;
+    assert!(matches!(
+        decode_fwir(&invalid_node, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord { field: "kind" },
+            ..
+        })
+    ));
+
+    let mut invalid_access = bytes.clone();
+    invalid_access[binding_edge + 8] = 9;
+    assert!(matches!(
+        decode_fwir(&invalid_access, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord { field: "access" },
+            ..
+        })
+    ));
+
+    let mut invalid_provenance = bytes;
+    put_u32(&mut invalid_provenance, binding_node + 28, u32::MAX);
+    assert!(matches!(
+        decode_fwir(&invalid_provenance, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                faraweave::MalformedProgram {
+                    invariant: Invariant::IndexOutOfBounds,
+                    record: RecordKind::Node,
+                    field: "name_origin",
+                    ..
+                }
+            )),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn operation_reference_artifact_is_versioned_canonical_and_roundtrippable() {
     let bytes = operation_reference_artifact();
     assert_eq!(read_u16(&bytes, 8), 1);
@@ -2185,6 +2313,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "canonical-application-plans",
         "canonical-operation-references",
         "canonical-connected-bindings",
+        "canonical-immutable-bindings",
     ]);
     let behavioral_evidence = BTreeSet::from([
         ("header.section_count", "section-count-limit"),
@@ -2244,6 +2373,12 @@ fn traceability_references_complete_executable_evidence_sets() {
         ("binding.semantic_minor", "connected-binding-semantic-minor"),
         ("binding.node_kind", "connected-binding-node-kind"),
         ("binding.access_kind", "connected-binding-access-kind"),
+        ("user_binding.feature_required", "user-binding-feature"),
+        ("user_binding.format_minor", "user-binding-format-minor"),
+        ("user_binding.semantic_minor", "user-binding-semantic-minor"),
+        ("user_binding.node_kind", "user-binding-node-kind"),
+        ("user_binding.access_kind", "user-binding-access-kind"),
+        ("user_binding.provenance", "user-binding-provenance"),
         ("surfaces.source_memory_decoded", "differential-runtime"),
         (
             "surfaces.resources_faults_cleanup",
@@ -2293,6 +2428,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "appl.",
         "oprf.",
         "binding.",
+        "user_binding.",
         "ownr.",
         "root.",
         "prod.",

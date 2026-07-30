@@ -10,6 +10,9 @@ use crate::{
 };
 
 pub(crate) fn resolve_names(program: &Program) -> Result<(), Error> {
+    for declaration in &program.declarations {
+        validate_names(&declaration.initializer)?;
+    }
     for root in &program.roots {
         validate_names(root)?;
     }
@@ -75,16 +78,9 @@ fn validate_names(expression: &Expr) -> Result<(), Error> {
                 validate_names(branch)?;
             }
         }
-        ExprKind::UnresolvedName { name, name_span } => {
-            return Err(Error::at_span(
-                ErrorKind::UnknownPrimitive,
-                *name_span,
-                format!("unknown primitive '{name}'"),
-            ));
-        }
+        ExprKind::UnresolvedName { .. } => {}
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::ConnectedPlaceholder(_)
         | ExprKind::Placeholder => {}

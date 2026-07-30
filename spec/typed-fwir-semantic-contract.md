@@ -175,6 +175,10 @@ Semantic minor 2 adds mandatory feature
 `8=ConnectedApplicationBindings`. It is present exactly when a
 `ConnectedBinding` node or binding-only access is required; older semantic
 minors reject those records and a 1.2 module rejects a superfluous feature 8.
+Semantic minor 3 adds mandatory feature `9=ImmutableBindings`. It is present
+exactly when a source-binding node or binding-only access is required; older
+semantic minors reject those records and a 1.3 module rejects a superfluous
+feature 9.
 
 ## 6. Nodes, edges, and evaluation order (`FWIR-SEM-006`)
 
@@ -187,6 +191,9 @@ The abstract node kinds needed by the current language are:
 | TupleConstruct | Evaluate ordered children and construct one structural tuple. |
 | SelectedApply | Apply a lowering-selected primitive signature and implementation to explicit semantic operands, with an optional verified operation-reference link for a declared higher-order consumer. |
 | ConnectedBinding | Consume one connected operand after authored template nodes, retain its type/cardinality/owner once, and expose immutable binding-only accesses to exactly one SelectedApply. |
+| Binding | Evaluate and retain one source declaration initializer, with declaration, name, and initializer origins. |
+| BindingBorrow | Carry one immutable whole-binding borrow to a region such as fan-out without copying its value. |
+| BindingMove | Transfer the complete bound value into its one ownership-escaping consumer. |
 | FanOut | Evaluate one operand once, execute ordered branch regions with an explicit operand borrow, and produce one tuple. |
 
 Prefix-spread preparation may be represented as an explicit node or as
@@ -203,6 +210,9 @@ TupleElement(index)
 FanOutOperandBorrow
 ConnectedBindingWhole
 ConnectedBindingElement(index)
+BindingBorrowWhole
+BindingBorrowElement(index)
+BindingMove
 ```
 
 and one of these ownership modes:
@@ -218,6 +228,41 @@ Operands and roots preserve source order. An implementation may use a flat
 postorder arena, checked ranges, and an iterative execution stack, but forward
 or cyclic data dependencies, unreachable executable nodes, and ambiguous
 ownership are not valid programs.
+
+Source declarations have the full-line form `let name = expression`.
+Declaration lines are interleaved with roots in source order, evaluate their
+initializer exactly once, and publish no root or output. A name is visible
+only after its declaration; it cannot duplicate another declaration, shadow a
+parameter, or use a syntax/primitive-reserved spelling, and forward,
+self, and unknown references are invalid. Every declaration must have a later
+use.
+
+Static declaration, name, type, arity, and ownership failures are selected
+before argument decoding or execution. Within that analysis, malformed and
+invalid declaration names are rejected before reference resolution, reference
+visibility failures before unused-binding checks, and unused/multiple-move/use-
+after-move failures before lowering. Their `BindingError` context retains the
+declaration, name, initializer, primary reference, and related declaration or
+move spans needed by the applicable reason.
+
+A `Binding` consumes an owned initializer by infallible transfer, or aliases a
+scalar parameter borrow. Selected calls, connected applications, prefix
+spreads, reducers, scans, filters, and fan-out consume binding-only immutable
+whole/element accesses; a fan-out uses one explicit `BindingBorrow` carrier
+outside its branch region. A complete binding may escape only through one
+final `BindingMove`, used for a direct result or transfer into an owned tuple
+or later binding. The verifier rejects non-binding producers for binding
+accesses, branch/scope escape, cross-binding substitution, use after move,
+multiple moves, cycles, missing consumers, and any release other than the
+final consumer reached through permitted borrow carriers.
+
+Borrowing or moving a binding performs no semantic admission, allocation, or
+work charge and never clones a vector or tuple. The binding retains its
+initializer's existing reservation until its verified logical last consumer;
+a move transfers that reservation to the new owner. If an initializer or
+later root fails, execution publishes no partial result and releases completed
+root values and still-live bindings in reverse acquisition order, while
+preserving already committed work and the failure's normal precedence.
 
 ## 7. Complete lowering decisions (`FWIR-SEM-007`)
 

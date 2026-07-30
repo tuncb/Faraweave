@@ -2,7 +2,7 @@ use crate::ScalarType;
 use std::collections::TryReserveError;
 
 pub const SUPPORTED_SEMANTIC_MAJOR: u16 = 1;
-pub const SUPPORTED_SEMANTIC_MINOR: u16 = 2;
+pub const SUPPORTED_SEMANTIC_MINOR: u16 = 3;
 
 macro_rules! index_type {
     ($name:ident) => {
@@ -70,6 +70,7 @@ pub enum Feature {
     ApplicationPlans = 5,
     BackendNativeMathV1 = 7,
     ConnectedApplicationBindings = 8,
+    ImmutableBindings = 9,
 }
 
 impl Feature {
@@ -165,6 +166,9 @@ pub enum ValueAccess {
     FanOutOperandBorrow,
     ConnectedBindingWhole,
     ConnectedBindingElement(u32),
+    BindingBorrowWhole,
+    BindingBorrowElement(u32),
+    BindingMove,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +226,13 @@ pub enum NodeKind {
     },
     PrefixSpreadPrepare,
     ConnectedBinding,
+    Binding {
+        declaration_origin: OriginIndex,
+        name_origin: OriginIndex,
+        initializer_origin: OriginIndex,
+    },
+    BindingMove,
+    BindingBorrow,
     FanOut {
         branches: IndexRange,
         keyword_origin: OriginIndex,
@@ -368,6 +379,7 @@ pub enum VerifyAllocationSite {
     OwnershipLastUse,
     OwnershipRootOwner,
     ConnectedBindingOwners,
+    BindingUses,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -697,6 +709,7 @@ fn verify_program(
             Feature::OperationReferences.numeric(),
             Feature::BackendNativeMathV1.numeric(),
             Feature::ConnectedApplicationBindings.numeric(),
+            Feature::ImmutableBindings.numeric(),
         ]
         .contains(&feature)
         {
@@ -747,6 +760,28 @@ fn verify_program(
             RecordKind::Module,
             None,
             "connected_application_bindings_version",
+        ));
+    }
+    let has_user_bindings = has_feature(program, Feature::ImmutableBindings);
+    let uses_user_bindings = program.nodes.iter().any(|node| {
+        matches!(
+            node.kind,
+            NodeKind::Binding { .. } | NodeKind::BindingMove | NodeKind::BindingBorrow
+        )
+    }) || program.edges.iter().any(|edge| {
+        matches!(
+            edge.access,
+            ValueAccess::BindingBorrowWhole
+                | ValueAccess::BindingBorrowElement(_)
+                | ValueAccess::BindingMove
+        )
+    });
+    if program.module.semantic_minor < 3 && (has_user_bindings || uses_user_bindings) {
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "immutable_bindings_version",
         ));
     }
     if program.module.semantic_minor == 0
@@ -1301,6 +1336,24 @@ fn edge_type(program: &RawProgram, edge: Edge) -> Option<TypeIndex> {
                 _ => None,
             }
         }
+        ValueAccess::BindingBorrowWhole | ValueAccess::BindingMove => {
+            matches!(producer.kind, NodeKind::Binding { .. }).then_some(producer.result_type)
+        }
+        ValueAccess::BindingBorrowElement(element) => {
+            if !matches!(producer.kind, NodeKind::Binding { .. }) {
+                return None;
+            }
+            let TypeRecord::Tuple { elements } = type_record(program, producer.result_type)? else {
+                return None;
+            };
+            if element >= elements.count {
+                return None;
+            }
+            usize::try_from(elements.start.checked_add(element)?)
+                .ok()
+                .and_then(|index| program.type_elements.get(index))
+                .copied()
+        }
     }
 }
 
@@ -1376,7 +1429,10 @@ fn binding_element_cardinality(
     element: u32,
 ) -> Option<Option<Cardinality>> {
     let binding_node = program.nodes.get(binding.0 as usize)?;
-    if !matches!(binding_node.kind, NodeKind::ConnectedBinding) {
+    if !matches!(
+        binding_node.kind,
+        NodeKind::ConnectedBinding | NodeKind::Binding { .. }
+    ) {
         return None;
     }
     let binding_edges = range_bounds(
@@ -1534,6 +1590,26 @@ fn verify_node_and_edge_references(program: &RawProgram) -> Result<(), VerifyErr
                     ));
                 }
             }
+            NodeKind::Binding {
+                declaration_origin,
+                name_origin,
+                initializer_origin,
+            } => {
+                for (origin, field) in [
+                    (declaration_origin, "declaration_origin"),
+                    (name_origin, "name_origin"),
+                    (initializer_origin, "initializer_origin"),
+                ] {
+                    if !in_bounds(origin.0, program.origins.len()) {
+                        return Err(malformed(
+                            Invariant::IndexOutOfBounds,
+                            RecordKind::Node,
+                            Some(node_index),
+                            field,
+                        ));
+                    }
+                }
+            }
             NodeKind::FanOut {
                 branches,
                 keyword_origin,
@@ -1550,7 +1626,9 @@ fn verify_node_and_edge_references(program: &RawProgram) -> Result<(), VerifyErr
             }
             NodeKind::TupleConstruct
             | NodeKind::PrefixSpreadPrepare
-            | NodeKind::ConnectedBinding => {}
+            | NodeKind::ConnectedBinding
+            | NodeKind::BindingMove
+            | NodeKind::BindingBorrow => {}
         }
         next_edge = node.edges.checked_end().ok_or_else(|| {
             malformed(
@@ -1661,9 +1739,14 @@ fn verify_node_metadata(
                         _ => None,
                     }
                 }
+                ValueAccess::BindingBorrowElement(element) => {
+                    binding_element_cardinality(program, edge.producer, element)
+                }
                 ValueAccess::WholeValue
                 | ValueAccess::FanOutOperandBorrow
-                | ValueAccess::ConnectedBindingWhole => {
+                | ValueAccess::ConnectedBindingWhole
+                | ValueAccess::BindingBorrowWhole
+                | ValueAccess::BindingMove => {
                     Some(program.nodes[edge.producer.0 as usize].cardinality)
                 }
             };
@@ -1904,7 +1987,10 @@ fn verify_node(
                     .copied()
                     .ok_or_else(|| inconsistent("elements"))?;
                 if edge_type(program, edge) != Some(expected)
-                    || edge.access != ValueAccess::WholeValue
+                    || !matches!(
+                        edge.access,
+                        ValueAccess::WholeValue | ValueAccess::BindingMove
+                    )
                     || edge.conversion != Conversion::Identity
                 {
                     return Err(inconsistent("elements"));
@@ -1915,7 +2001,9 @@ fn verify_node(
             if edges.len() != 1
                 || !matches!(
                     edges[0].access,
-                    ValueAccess::WholeValue | ValueAccess::FanOutOperandBorrow
+                    ValueAccess::WholeValue
+                        | ValueAccess::FanOutOperandBorrow
+                        | ValueAccess::BindingBorrowWhole
                 )
                 || edges[0].conversion != Conversion::Identity
                 || !matches!(
@@ -1932,13 +2020,49 @@ fn verify_node(
             if edges.len() != 1
                 || !matches!(
                     edges[0].access,
-                    ValueAccess::WholeValue | ValueAccess::FanOutOperandBorrow
+                    ValueAccess::WholeValue
+                        | ValueAccess::FanOutOperandBorrow
+                        | ValueAccess::BindingBorrowWhole
                 )
                 || edges[0].conversion != Conversion::Identity
                 || edge_type(program, edges[0]) != Some(node.result_type)
                 || edges[0].cardinality != node.cardinality
             {
                 return Err(inconsistent("connected_binding"));
+            }
+        }
+        NodeKind::Binding { .. } => {
+            if edges.len() != 1
+                || !matches!(
+                    edges[0].access,
+                    ValueAccess::WholeValue | ValueAccess::BindingMove
+                )
+                || edges[0].conversion != Conversion::Identity
+                || edge_type(program, edges[0]) != Some(node.result_type)
+                || edges[0].cardinality != node.cardinality
+            {
+                return Err(inconsistent("binding"));
+            }
+        }
+        NodeKind::BindingMove => {
+            if edges.len() != 1
+                || edges[0].access != ValueAccess::BindingMove
+                || edges[0].conversion != Conversion::Identity
+                || edge_type(program, edges[0]) != Some(node.result_type)
+                || edges[0].cardinality != node.cardinality
+            {
+                return Err(inconsistent("binding_move"));
+            }
+        }
+        NodeKind::BindingBorrow => {
+            if edges.len() != 1
+                || edges[0].access != ValueAccess::BindingBorrowWhole
+                || edges[0].ownership != OwnershipMode::ImmutableBorrow
+                || edges[0].conversion != Conversion::Identity
+                || edge_type(program, edges[0]) != Some(node.result_type)
+                || edges[0].cardinality != node.cardinality
+            {
+                return Err(inconsistent("binding_borrow"));
             }
         }
         NodeKind::SelectedApply {
@@ -2902,6 +3026,7 @@ fn verify_semantic_ownership(
 ) -> Result<(), VerifyError> {
     verify_no_nested_fan_out(program)?;
     verify_connected_binding_owners(program, injection)?;
+    verify_user_binding_uses(program, injection)?;
     let mut fan_out_visits = FanOutContextVisits::default();
     let fan_out_borrow_context =
         build_fan_out_borrow_context(program, injection, &mut fan_out_visits)?;
@@ -2917,7 +3042,27 @@ fn verify_semantic_ownership(
             let producer_kind = program.nodes[edge.producer.0 as usize].kind;
             let parameter = matches!(producer_kind, NodeKind::ParameterBorrow { .. });
             let edge_index = node.edges.start as usize + offset;
-            let valid = if matches!(producer_kind, NodeKind::ConnectedBinding) {
+            let valid = if matches!(producer_kind, NodeKind::Binding { .. }) {
+                matches!(
+                    (node.kind, edge.access, edge.ownership),
+                    (
+                        NodeKind::SelectedApply { .. },
+                        ValueAccess::BindingBorrowWhole | ValueAccess::BindingBorrowElement(_),
+                        OwnershipMode::ImmutableBorrow
+                    ) | (
+                        NodeKind::PrefixSpreadPrepare
+                            | NodeKind::ConnectedBinding
+                            | NodeKind::BindingBorrow
+                            | NodeKind::FanOut { .. },
+                        ValueAccess::BindingBorrowWhole,
+                        OwnershipMode::ImmutableBorrow
+                    ) | (
+                        NodeKind::TupleConstruct | NodeKind::Binding { .. } | NodeKind::BindingMove,
+                        ValueAccess::BindingMove,
+                        OwnershipMode::InfallibleTransfer
+                    )
+                )
+            } else if matches!(producer_kind, NodeKind::ConnectedBinding) {
                 matches!(
                     (node.kind, edge.access, edge.ownership),
                     (
@@ -2969,6 +3114,13 @@ fn verify_semantic_ownership(
                                 .copied()
                                 .unwrap_or(false)
                     }
+                    (NodeKind::Binding { .. }, ValueAccess::WholeValue) => {
+                        if parameter {
+                            edge.ownership == OwnershipMode::ImmutableBorrow
+                        } else {
+                            edge.ownership == OwnershipMode::InfallibleTransfer
+                        }
+                    }
                     (NodeKind::SelectedApply { .. }, ValueAccess::WholeValue) => {
                         if parameter {
                             edge.ownership == OwnershipMode::ImmutableBorrow
@@ -2981,6 +3133,12 @@ fn verify_semantic_ownership(
                         NodeKind::SelectedApply { .. },
                         ValueAccess::ConnectedBindingWhole
                         | ValueAccess::ConnectedBindingElement(_),
+                    ) => false,
+                    (
+                        NodeKind::SelectedApply { .. },
+                        ValueAccess::BindingBorrowWhole
+                        | ValueAccess::BindingBorrowElement(_)
+                        | ValueAccess::BindingMove,
                     ) => false,
                     (NodeKind::SelectedApply { .. }, ValueAccess::FanOutOperandBorrow) => {
                         edge.ownership == OwnershipMode::ImmutableBorrow
@@ -2996,6 +3154,7 @@ fn verify_semantic_ownership(
                             edge.ownership == OwnershipMode::OwnedInput
                         }
                     }
+                    (NodeKind::BindingMove, _) => false,
                     _ => false,
                 }
             };
@@ -3019,6 +3178,77 @@ fn verify_semantic_ownership(
         }
     }
     verify_ownership(program, injection)
+}
+
+fn verify_user_binding_uses(
+    program: &RawProgram,
+    injection: VerifyAllocationFailureInjection,
+) -> Result<(), VerifyError> {
+    if !program
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::Binding { .. }))
+    {
+        return Ok(());
+    }
+    injected(injection, VerifyAllocationSite::BindingUses)?;
+    let mut states =
+        filled_verify_vec(program.nodes.len(), 0_u8, VerifyAllocationSite::BindingUses)?;
+    for (consumer, node) in program.nodes.iter().enumerate() {
+        let bounds = range_bounds(
+            node.edges,
+            program.edges.len(),
+            RecordKind::Node,
+            consumer as u32,
+            "edges",
+        )?;
+        for (offset, edge) in program.edges[bounds].iter().enumerate() {
+            if !matches!(
+                edge.access,
+                ValueAccess::BindingBorrowWhole
+                    | ValueAccess::BindingBorrowElement(_)
+                    | ValueAccess::BindingMove
+            ) {
+                continue;
+            }
+            let producer = edge.producer.0 as usize;
+            if !matches!(
+                program.nodes.get(producer).map(|node| node.kind),
+                Some(NodeKind::Binding { .. })
+            ) {
+                return Err(malformed(
+                    Invariant::AmbiguousOwnership,
+                    RecordKind::Edge,
+                    Some(node.edges.start.saturating_add(offset as u32)),
+                    "binding_owner",
+                ));
+            }
+            if states[producer] == 2 {
+                return Err(malformed(
+                    Invariant::AmbiguousOwnership,
+                    RecordKind::Edge,
+                    Some(node.edges.start.saturating_add(offset as u32)),
+                    "binding_use_after_move",
+                ));
+            }
+            states[producer] = if edge.access == ValueAccess::BindingMove {
+                2
+            } else {
+                1
+            };
+        }
+    }
+    for (index, node) in program.nodes.iter().enumerate() {
+        if matches!(node.kind, NodeKind::Binding { .. }) && states[index] == 0 {
+            return Err(malformed(
+                Invariant::AmbiguousOwnership,
+                RecordKind::Node,
+                checked_index(index),
+                "binding_consumer",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_connected_binding_owners(
@@ -3146,6 +3376,8 @@ fn verify_ownership(
     for (index, node) in program.nodes.iter().enumerate() {
         if matches!(node.kind, NodeKind::ConnectedBinding) {
             sinks[index] = sinks[index].saturating_add(1);
+        } else if matches!(node.kind, NodeKind::Binding { .. }) && sinks[index] == 0 {
+            sinks[index] = 1;
         }
     }
     for (fanout_index, node) in program.nodes.iter().enumerate() {
@@ -3237,8 +3469,25 @@ fn verify_ownership(
         let valid_release = if let Some(root) = root_owner[expected_owner] {
             ownership.release_after == ReleaseAfter::Root(root)
         } else {
-            last_use[expected_owner]
-                .is_some_and(|node| ownership.release_after == ReleaseAfter::Node(node))
+            let mut release = last_use[expected_owner];
+            if matches!(program.nodes[expected_owner].kind, NodeKind::Binding { .. }) {
+                for _ in 0..program.nodes.len() {
+                    let Some(node) = release else {
+                        break;
+                    };
+                    if !matches!(
+                        program.nodes[node.0 as usize].kind,
+                        NodeKind::BindingBorrow | NodeKind::ConnectedBinding
+                    ) {
+                        break;
+                    }
+                    let Some(next) = last_use[node.0 as usize] else {
+                        break;
+                    };
+                    release = Some(next);
+                }
+            }
+            release.is_some_and(|node| ownership.release_after == ReleaseAfter::Node(node))
         };
         if !valid_release {
             return Err(malformed(
@@ -3288,10 +3537,12 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
         .nodes
         .iter()
         .any(|node| matches!(node.kind, NodeKind::PrefixSpreadPrepare))
-        || program
-            .edges
-            .iter()
-            .any(|edge| matches!(edge.access, ValueAccess::TupleElement(_)));
+        || program.edges.iter().any(|edge| {
+            matches!(
+                edge.access,
+                ValueAccess::TupleElement(_) | ValueAccess::BindingBorrowElement(_)
+            )
+        });
     let needs_fan_out = program
         .nodes
         .iter()
@@ -3346,6 +3597,19 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
                 ValueAccess::ConnectedBindingWhole | ValueAccess::ConnectedBindingElement(_)
             )
         });
+    let needs_user_bindings = program.nodes.iter().any(|node| {
+        matches!(
+            node.kind,
+            NodeKind::Binding { .. } | NodeKind::BindingMove | NodeKind::BindingBorrow
+        )
+    }) || program.edges.iter().any(|edge| {
+        matches!(
+            edge.access,
+            ValueAccess::BindingBorrowWhole
+                | ValueAccess::BindingBorrowElement(_)
+                | ValueAccess::BindingMove
+        )
+    });
     for (required, needed, field) in [
         (Feature::StableSemanticIds, needs_ids, "stable_semantic_ids"),
         (Feature::Tuples, needs_tuples, "tuples"),
@@ -3371,6 +3635,11 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             needs_connected_bindings,
             "connected_application_bindings",
         ),
+        (
+            Feature::ImmutableBindings,
+            needs_user_bindings,
+            "immutable_bindings",
+        ),
     ] {
         if needed && !has_feature(program, required) {
             return Err(malformed(
@@ -3387,6 +3656,14 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             RecordKind::Module,
             None,
             "superfluous_connected_application_bindings",
+        ));
+    }
+    if has_feature(program, Feature::ImmutableBindings) && !needs_user_bindings {
+        return Err(malformed(
+            Invariant::InvalidRecord,
+            RecordKind::Module,
+            None,
+            "superfluous_immutable_bindings",
         ));
     }
     Ok(())
@@ -6560,6 +6837,13 @@ mod tests {
         missing_feature.module.ranges.features.count -= 1;
         verify_error(missing_feature, Invariant::MissingFeature);
 
+        let mut missing_spread = immutable_binding_program("let pair = [2 3]\nadd pair\n");
+        missing_spread
+            .features
+            .retain(|feature| *feature != Feature::PrefixSpread.numeric());
+        missing_spread.module.ranges.features.count -= 1;
+        verify_error(missing_spread, Invariant::MissingFeature);
+
         let mut old_semantics = connected_program("inc[_] 1\n");
         old_semantics.module.semantic_minor = 1;
         verify_error(old_semantics, Invariant::UnsupportedVersion);
@@ -6672,6 +6956,183 @@ mod tests {
             Ok(handle) => assert!(handle.join().is_ok()),
             Err(error) => panic!("failed to create reduced-stack verifier thread: {error}"),
         }
+    }
+
+    fn immutable_binding_program(source: &str) -> RawProgram {
+        match crate::lowering::compile_source_with_name(source, "binding-verifier.faraweave") {
+            Ok(program) => program.raw,
+            Err(error) => panic!("binding fixture failed: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn immutable_binding_feature_version_and_provenance_invariants_are_rejected() {
+        let mut missing_feature = immutable_binding_program("let value = iota[3]\nsum[value]\n");
+        missing_feature
+            .features
+            .retain(|feature| *feature != Feature::ImmutableBindings.numeric());
+        missing_feature.module.ranges.features.count -= 1;
+        verify_error(missing_feature, Invariant::MissingFeature);
+
+        let mut old_semantics = immutable_binding_program("let value = iota[3]\nsum[value]\n");
+        old_semantics.module.semantic_minor = 2;
+        verify_error(old_semantics, Invariant::UnsupportedVersion);
+
+        let mut superfluous = scalar_program();
+        superfluous.module.semantic_minor = 3;
+        superfluous
+            .features
+            .push(Feature::ImmutableBindings.numeric());
+        superfluous.module.ranges.features.count += 1;
+        verify_error(superfluous, Invariant::InvalidRecord);
+
+        let mut invalid_origin = immutable_binding_program("let value = iota[3]\nsum[value]\n");
+        let binding = invalid_origin
+            .nodes
+            .iter()
+            .position(|node| matches!(node.kind, NodeKind::Binding { .. }))
+            .unwrap_or(usize::MAX);
+        assert_ne!(binding, usize::MAX);
+        let NodeKind::Binding {
+            ref mut name_origin,
+            ..
+        } = invalid_origin.nodes[binding].kind
+        else {
+            panic!("missing binding");
+        };
+        *name_origin = OriginIndex(u32::MAX);
+        verify_error(invalid_origin, Invariant::IndexOutOfBounds);
+    }
+
+    #[test]
+    fn immutable_binding_cycles_access_moves_and_missing_consumers_are_rejected() {
+        let mut cycle = immutable_binding_program("let value = iota[3]\nsum[value]\n");
+        let binding = cycle
+            .nodes
+            .iter()
+            .position(|node| matches!(node.kind, NodeKind::Binding { .. }))
+            .unwrap_or(usize::MAX);
+        assert_ne!(binding, usize::MAX);
+        let initializer_edge = cycle.nodes[binding].edges.start as usize;
+        cycle.edges[initializer_edge].producer = NodeIndex(binding as u32);
+        verify_error(cycle, Invariant::NonPostorderReference);
+
+        let mut missing_consumer = immutable_binding_program("let value = iota[3]\nsum[value]\n");
+        let binding = missing_consumer
+            .nodes
+            .iter()
+            .position(|node| matches!(node.kind, NodeKind::Binding { .. }))
+            .unwrap_or(usize::MAX);
+        let consumer_edge = missing_consumer
+            .edges
+            .iter()
+            .position(|edge| edge.producer == NodeIndex(binding as u32))
+            .unwrap_or(usize::MAX);
+        assert_ne!(consumer_edge, usize::MAX);
+        missing_consumer.edges[consumer_edge].access = ValueAccess::WholeValue;
+        verify_error(missing_consumer, Invariant::AmbiguousOwnership);
+
+        for mutate_second in [false, true] {
+            let mut ownership =
+                immutable_binding_program("let value = iota[3]\nsum[value]\nlength[value]\n");
+            let binding = ownership
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, NodeKind::Binding { .. }))
+                .unwrap_or(usize::MAX);
+            let uses: Vec<_> = ownership
+                .edges
+                .iter()
+                .enumerate()
+                .filter_map(|(index, edge)| {
+                    (edge.producer == NodeIndex(binding as u32)
+                        && edge.access == ValueAccess::BindingBorrowWhole)
+                        .then_some(index)
+                })
+                .collect();
+            assert_eq!(uses.len(), 2);
+            let selected = if mutate_second { &uses[..] } else { &uses[..1] };
+            for edge in selected {
+                ownership.edges[*edge].access = ValueAccess::BindingMove;
+                ownership.edges[*edge].ownership = OwnershipMode::InfallibleTransfer;
+            }
+            verify_error(ownership, Invariant::AmbiguousOwnership);
+        }
+
+        let mut branch_escape =
+            immutable_binding_program("let value = iota[3]\nfanout[value {sum[_]} {length[_]}]\n");
+        let binding = branch_escape
+            .nodes
+            .iter()
+            .position(|node| matches!(node.kind, NodeKind::Binding { .. }))
+            .unwrap_or(usize::MAX);
+        let branch_edge = branch_escape
+            .edges
+            .iter()
+            .position(|edge| edge.access == ValueAccess::FanOutOperandBorrow)
+            .unwrap_or(usize::MAX);
+        assert_ne!(binding, usize::MAX);
+        assert_ne!(branch_edge, usize::MAX);
+        branch_escape.edges[branch_edge].producer = NodeIndex(binding as u32);
+        branch_escape.edges[branch_edge].access = ValueAccess::BindingBorrowWhole;
+        verify_error(branch_escape, Invariant::InvalidRecord);
+
+        let mut cross_binding = immutable_binding_program(
+            "let left = iota[3]\nlet right = iota[4]\nsum[left]\nsum[right]\n",
+        );
+        let bindings: Vec<_> = cross_binding
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                matches!(node.kind, NodeKind::Binding { .. }).then_some(NodeIndex(index as u32))
+            })
+            .collect();
+        assert_eq!(bindings.len(), 2);
+        let right_use = cross_binding
+            .edges
+            .iter()
+            .position(|edge| {
+                edge.producer == bindings[1] && edge.access == ValueAccess::BindingBorrowWhole
+            })
+            .unwrap_or(usize::MAX);
+        assert_ne!(right_use, usize::MAX);
+        cross_binding.edges[right_use].producer = bindings[0];
+        cross_binding.roots.push(Root {
+            node: bindings[1],
+            origin: cross_binding.roots[0].origin,
+        });
+        cross_binding.module.ranges.roots.count += 1;
+        verify_error(cross_binding, Invariant::AmbiguousOwnership);
+
+        let mut wrong_release =
+            immutable_binding_program("let value = iota[3]\nsum[value]\nlength[value]\n");
+        let binding = wrong_release
+            .nodes
+            .iter()
+            .position(|node| matches!(node.kind, NodeKind::Binding { .. }))
+            .unwrap_or(usize::MAX);
+        let binding_owner = wrong_release
+            .ownership
+            .iter_mut()
+            .find(|ownership| ownership.owner == NodeIndex(binding as u32));
+        let Some(binding_owner) = binding_owner else {
+            panic!("missing binding owner");
+        };
+        binding_owner.release_after = ReleaseAfter::Node(NodeIndex(binding as u32));
+        verify_error(wrong_release, Invariant::AmbiguousOwnership);
+
+        let allocation =
+            immutable_binding_program("let value = iota[3]\nsum[value]\nlength[value]\n")
+                .verify_with_allocation_failure(VerifyAllocationFailureInjection::at(
+                    VerifyAllocationSite::BindingUses,
+                ));
+        assert_eq!(
+            allocation,
+            Err(VerifyError::AllocationUnavailable {
+                site: VerifyAllocationSite::BindingUses,
+            })
+        );
     }
 
     #[test]

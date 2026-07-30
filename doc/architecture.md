@@ -4,8 +4,10 @@ Faraweave has one semantic pipeline:
 
 ```text
 source bytes
-  -> parser AST
-  -> name resolution and whole-program typed lowering
+  -> syntax-only parser AST
+  -> lexical declaration resolution
+  -> whole-program ownership analysis
+  -> typed lowering
   -> RawProgram verification
   -> VerifiedProgram
        -> Rust interpreter
@@ -33,6 +35,13 @@ Lowering emits one `ConnectedBinding` after authored template nodes and the
 operand, then binding-only whole/element borrow edges into exactly one selected
 call; verification rejects escape, cross-call use, cycles, and ambiguous
 ownership before the interpreter executes.
+
+Semantic/physical FWIR 1.3 adds feature 9 for immutable source bindings.
+Lexical analysis resolves parameters and declarations, rejects invalid
+visibility or ownership escapes, and then lowering emits explicit `Binding`,
+`BindingBorrow`, and `BindingMove` topology. The verifier independently checks
+provenance, scope-safe consumers, one final move, and the binding owner's exact
+logical release before execution.
 
 `VerifiedProgram` is an in-process trust boundary, not a serialized ABI.
 Callers may build `RawProgram`, but only complete verification can construct a

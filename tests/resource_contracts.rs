@@ -3,7 +3,8 @@ use faraweave::{
     EvaluationConfiguration, ExecutionProfile, ParameterErrorReason, ResourceErrorReason,
     ResourceLimits, Value, compile_source_to_verified_program, evaluate_expression,
     evaluate_expression_with_configuration, evaluate_expression_with_observer, evaluate_source,
-    evaluate_source_with_arguments, evaluate_source_with_configuration, evaluate_verified_program,
+    evaluate_source_with_arguments, evaluate_source_with_arguments_and_observer,
+    evaluate_source_with_configuration, evaluate_verified_program,
 };
 use std::sync::Mutex;
 
@@ -33,9 +34,25 @@ static FILTER_REFUSAL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex
 static CONNECTED_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static CONNECTED_BINDING_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> =
     Mutex::new(Vec::new());
+static IMMUTABLE_BINDING_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> =
+    Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_immutable_binding_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = IMMUTABLE_BINDING_RESOURCE_EVENTS.lock() {
         events.push(ObservedResourceEvent {
             kind: event.kind,
             producer: event.producer.to_owned(),
@@ -1877,6 +1894,137 @@ fn resource_observer_reports_commit_refusal_and_cleanup_order() {
     assert_eq!(events[2].kind, faraweave::ResourceEventKind::Release);
     assert_eq!(events[2].usage.live_evaluation_bytes, 0);
     assert_eq!(error.usage.expect("post-cleanup usage"), events[2].usage);
+}
+
+#[test]
+fn immutable_binding_initializer_is_admitted_once_and_failures_cleanup() {
+    let source = "let shared = iota[4]\nadd[sum[shared] length[shared]]\n";
+    let success = evaluate_source_with_configuration(source, EvaluationConfiguration::default())
+        .expect("binding resource success");
+    assert_eq!(success.values, vec![Value::Int(14)]);
+    assert_eq!(success.usage.allocation_attempts, 1);
+    assert_eq!(success.usage.live_evaluation_bytes, 0);
+
+    let exact_work = evaluate_source_with_configuration(
+        source,
+        EvaluationConfiguration {
+            profile: ExecutionProfile::BoundedV2,
+            limits: ResourceLimits {
+                max_work_units: Some(success.usage.work_units),
+                ..ResourceLimits::default()
+            },
+            allocation_failure: AllocationFailureInjection::default(),
+        },
+    )
+    .expect("exact binding work");
+    assert_eq!(exact_work.usage.work_units, success.usage.work_units);
+
+    let allocation_two = evaluate_source_with_configuration(
+        source,
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(1),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("initializer has only one allocation");
+    assert_eq!(allocation_two.usage.allocation_attempts, 1);
+
+    let allocation_one = evaluate_source_with_configuration(
+        source,
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(0),
+            },
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect_err("initializer allocation refusal");
+    assert_eq!(allocation_one.kind, ErrorKind::ResourceError);
+    assert_eq!(
+        allocation_one
+            .usage
+            .expect("allocation cleanup usage")
+            .live_evaluation_bytes,
+        0
+    );
+
+    let initializer_failure =
+        evaluate_source("let held = iota[3]\nlet failed = div[1 0]\nadd[failed sum[held]]\n")
+            .expect_err("initializer failure");
+    assert_eq!(initializer_failure.kind, ErrorKind::DomainError);
+    assert_eq!(
+        initializer_failure
+            .usage
+            .expect("initializer cleanup usage")
+            .live_evaluation_bytes,
+        0
+    );
+
+    let later_root_failure = evaluate_source("let held = iota[3]\nsum[held]\ndiv[1 0]\n")
+        .expect_err("later root failure");
+    assert_eq!(later_root_failure.kind, ErrorKind::DomainError);
+    assert_eq!(
+        later_root_failure
+            .usage
+            .expect("root cleanup usage")
+            .live_evaluation_bytes,
+        0
+    );
+
+    for source in [
+        "let first = iota[2]\nlet second = iota[3]\nlet failed = div[1 0]\nadd[failed add[sum[first] sum[second]]]\n",
+        "let first = iota[2]\nlet second = iota[3]\ndiv[1 0]\nadd[sum[first] sum[second]]\n",
+    ] {
+        IMMUTABLE_BINDING_RESOURCE_EVENTS
+            .lock()
+            .expect("event lock")
+            .clear();
+        let failure = evaluate_source_with_arguments_and_observer(
+            source,
+            &[],
+            EvaluationConfiguration::default(),
+            observe_immutable_binding_resource_event,
+        )
+        .expect_err("observed binding failure");
+        assert_eq!(failure.kind, ErrorKind::DomainError);
+        assert_eq!(
+            failure
+                .usage
+                .expect("observed cleanup usage")
+                .live_evaluation_bytes,
+            0
+        );
+        let events = IMMUTABLE_BINDING_RESOURCE_EVENTS
+            .lock()
+            .expect("event lock")
+            .clone();
+        assert_eq!(events.len(), 5, "{source}");
+        let memory_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.bytes.is_some())
+            .collect();
+        assert_eq!(memory_events.len(), 4, "{source}");
+        assert_eq!(
+            memory_events[0].kind,
+            faraweave::ResourceEventKind::Admission
+        );
+        assert_eq!(memory_events[0].producer, "iota");
+        assert_eq!(memory_events[0].bytes, Some(16));
+        assert_eq!(
+            memory_events[1].kind,
+            faraweave::ResourceEventKind::Admission
+        );
+        assert_eq!(memory_events[1].producer, "iota");
+        assert_eq!(memory_events[1].bytes, Some(24));
+        assert_eq!(memory_events[2].kind, faraweave::ResourceEventKind::Release);
+        assert_eq!(memory_events[2].bytes, Some(24));
+        assert_eq!(memory_events[2].usage.live_evaluation_bytes, 16);
+        assert_eq!(memory_events[3].kind, faraweave::ResourceEventKind::Release);
+        assert_eq!(memory_events[3].bytes, Some(16));
+        assert_eq!(memory_events[3].usage.live_evaluation_bytes, 0);
+    }
 }
 
 trait DoubleBits {

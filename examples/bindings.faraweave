@@ -1,0 +1,5 @@
+# Immutable declarations evaluate once and do not print a result.
+let values = iota[4]
+let doubled = mul[values 2]
+sum[doubled]
+length[values]
