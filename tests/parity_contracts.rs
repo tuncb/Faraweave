@@ -1,7 +1,8 @@
 use faraweave::{
-    AllocationFailureInjection, DomainErrorReason, ErrorKind, EvaluationConfiguration,
-    ExecutionProfile, ResourceLimits, ScalarType, SourceLocation, Type, Value, evaluate_expression,
-    evaluate_expression_with_configuration, evaluate_source, format_type, format_value,
+    AllocationFailureInjection, ConnectedApplicationErrorReason, DomainErrorReason, ErrorKind,
+    EvaluationConfiguration, ExecutionProfile, ResourceLimits, ScalarType, SourceLocation, Type,
+    Value, evaluate_expression, evaluate_expression_with_configuration, evaluate_source,
+    format_type, format_value,
 };
 
 fn formatted(source: &str) -> String {
@@ -1200,6 +1201,77 @@ fn tup_structural_format_spread_and_direct_preservation() {
 }
 
 #[test]
+fn connected_completion_scalar_vector_tuple_chain_and_boundaries_are_exact() {
+    for (source, expected) in [
+        ("add[10] 20", "30"),
+        ("add[] [10 20]", "30"),
+        ("add[10] (20 30)", "(30 40)"),
+        ("add[10] mul[2] 20", "50"),
+        ("foldl[@add 0] (1 2 3)", "6"),
+        ("foldl[] [@add 0 (1 2 3)]", "6"),
+        ("filter[@odd] (1 2 3 4)", "(1 3)"),
+        ("filter[] [@odd (1 2 3 4)]", "(1 3)"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+    let parameterized = faraweave::evaluate_source_with_arguments(
+        "parameters[x Int]\nadd[] [x 2]\n",
+        &[Value::Int(3)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("authored parameter element remains statically available");
+    assert_eq!(parameterized.values, [Value::Int(5)]);
+
+    for source in ["inc[add[1] 2]", "[add[1] 2]"] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::ArityError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("add"), "{source}");
+        assert!(error.connected_application.is_none(), "{source}");
+    }
+    let placeholder = evaluate_expression("add[_] 20").expect_err("placeholder not exposed");
+    assert_eq!(placeholder.kind, ErrorKind::SyntaxError);
+}
+
+#[test]
+fn connected_completion_negative_contract_is_structured() {
+    for (source, reason) in [
+        (
+            "add[] 1",
+            ConnectedApplicationErrorReason::MissingCompletion,
+        ),
+        (
+            "inc[] [1 2]",
+            ConnectedApplicationErrorReason::SurplusCompletion,
+        ),
+        (
+            "add[1 2] 3",
+            ConnectedApplicationErrorReason::AlreadyComplete,
+        ),
+        (
+            "add[] []",
+            ConnectedApplicationErrorReason::EmptyTupleOperand,
+        ),
+        (
+            "add[] fanout[1 {inc[_]} {inc[_]}]",
+            ConnectedApplicationErrorReason::RuntimeTupleOperand,
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(
+            error
+                .connected_application
+                .as_ref()
+                .map(|context| context.reason),
+            Some(reason),
+            "{source}"
+        );
+    }
+    let incomplete = evaluate_expression("add[10]").expect_err("no callable partial value");
+    assert_eq!(incomplete.kind, ErrorKind::ArityError);
+    assert!(incomplete.connected_application.is_none());
+}
+
+#[test]
 fn fan_stable_id_matrix() {
     assert_eq!(formatted("fanout[1 {inc[_]}]"), "[2]");
     assert_eq!(
@@ -1294,6 +1366,15 @@ fn deep_unary_programs_use_iterative_parse_analysis_and_evaluation() {
     let span = error.span.expect("deep syntax error span");
     assert_eq!(span.begin.offset, bracketed.len() + 1);
     assert_eq!(span.begin, span.end);
+
+    let mut connected = String::with_capacity(DEPTH * 6 + 1);
+    for _ in 0..DEPTH {
+        connected.push_str("inc[] ");
+    }
+    connected.push('1');
+    let evaluated = evaluate_expression(&connected).expect("4,000-deep connected program");
+    assert_eq!(evaluated.value, Value::Int(4_001));
+    assert_eq!(evaluated.usage.work_units, DEPTH);
 }
 
 #[test]

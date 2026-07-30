@@ -35,6 +35,23 @@ fn validate_names(expression: &Expr) -> Result<(), Error> {
                 ));
             }
         }
+        ExprKind::Connected { templates, operand } => {
+            for template in templates {
+                for argument in &template.arguments {
+                    validate_names(argument)?;
+                }
+            }
+            validate_names(operand)?;
+            for template in templates.iter().rev() {
+                if primitive_from_name(&template.name).is_err() {
+                    return Err(Error::at_span(
+                        ErrorKind::UnknownPrimitive,
+                        template.name_span,
+                        format!("unknown primitive '{}'", template.name),
+                    ));
+                }
+            }
+        }
         ExprKind::Tuple(elements) => {
             for element in elements {
                 validate_names(element)?;
