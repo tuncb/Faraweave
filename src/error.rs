@@ -148,6 +148,38 @@ pub struct ArgumentErrorContext {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectedApplicationErrorReason {
+    MissingCompletion,
+    SurplusCompletion,
+    AmbiguousCompletion,
+    AlreadyComplete,
+    EmptyTupleOperand,
+    RuntimeTupleOperand,
+}
+
+impl ConnectedApplicationErrorReason {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MissingCompletion => "missing_completion",
+            Self::SurplusCompletion => "surplus_completion",
+            Self::AmbiguousCompletion => "ambiguous_completion",
+            Self::AlreadyComplete => "already_complete",
+            Self::EmptyTupleOperand => "empty_tuple_operand",
+            Self::RuntimeTupleOperand => "runtime_tuple_operand",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectedApplicationErrorContext {
+    pub reason: ConnectedApplicationErrorReason,
+    pub template_arity: usize,
+    pub supplied_width: usize,
+    pub template_span: SourceSpan,
+    pub operand_span: SourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParameterErrorReason {
     SecondParameterHeader,
     ParameterHeaderAfterRoot,
@@ -188,6 +220,7 @@ pub struct Error {
     pub resource: Option<ResourceErrorContext>,
     pub domain: Option<DomainErrorContext>,
     pub argument: Option<ArgumentErrorContext>,
+    pub connected_application: Option<ConnectedApplicationErrorContext>,
     pub parameter: Option<ParameterErrorContext>,
     pub usage: Option<ResourceUsage>,
 }
@@ -210,6 +243,7 @@ impl Error {
             resource: None,
             domain: None,
             argument: None,
+            connected_application: None,
             parameter: None,
             usage: None,
         }

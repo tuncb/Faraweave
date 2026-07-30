@@ -2,8 +2,8 @@ use faraweave::{
     AllocationFailureInjection, ArgumentErrorReason, DomainErrorReason, Error, ErrorKind,
     EvaluationConfiguration, ExecutionProfile, ParameterErrorReason, ResourceErrorReason,
     ResourceLimits, Value, compile_source_to_verified_program, evaluate_expression,
-    evaluate_expression_with_configuration, evaluate_source, evaluate_source_with_arguments,
-    evaluate_source_with_configuration, evaluate_verified_program,
+    evaluate_expression_with_configuration, evaluate_expression_with_observer, evaluate_source,
+    evaluate_source_with_arguments, evaluate_source_with_configuration, evaluate_verified_program,
 };
 use std::sync::Mutex;
 
@@ -30,6 +30,7 @@ static SCANL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec
 static SCANL_FAULT_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static FILTER_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 static FILTER_REFUSAL_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
+static CONNECTED_RESOURCE_EVENTS: Mutex<Vec<ObservedResourceEvent>> = Mutex::new(Vec::new());
 
 fn observe_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = RESOURCE_EVENTS.lock() {
@@ -187,6 +188,20 @@ fn observe_filter_resource_event(event: &faraweave::ResourceEvent<'_>) {
 
 fn observe_filter_refusal_resource_event(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = FILTER_REFUSAL_RESOURCE_EVENTS.lock() {
+        events.push(ObservedResourceEvent {
+            kind: event.kind,
+            producer: event.producer.to_owned(),
+            bytes: event.requested_bytes,
+            work: event.requested_work_units,
+            ordinal: event.allocation_ordinal,
+            refusal: event.refusal_reason,
+            usage: event.usage,
+        });
+    }
+}
+
+fn observe_connected_resource_event(event: &faraweave::ResourceEvent<'_>) {
+    if let Ok(mut events) = CONNECTED_RESOURCE_EVENTS.lock() {
         events.push(ObservedResourceEvent {
             kind: event.kind,
             producer: event.producer.to_owned(),
@@ -546,6 +561,71 @@ fn failure_usage_is_post_cleanup_and_work_remains_monotonic() {
     assert_eq!(usage.live_evaluation_bytes, 0);
     assert_eq!(usage.work_units, 1);
     assert_eq!(usage.allocation_attempts, 2);
+}
+
+#[test]
+fn connected_completion_preserves_template_first_operand_once_resource_order() {
+    let configuration = EvaluationConfiguration::default();
+    let sources = [
+        "add[(1 2) (3 4)]",
+        "add[(1 2)] (3 4)",
+        "add[] [(1 2) (3 4)]",
+    ];
+    let mut outcomes = Vec::new();
+    for source in sources {
+        CONNECTED_RESOURCE_EVENTS
+            .lock()
+            .expect("event lock")
+            .clear();
+        let result = evaluate_expression_with_observer(
+            source,
+            configuration,
+            observe_connected_resource_event,
+        )
+        .expect(source);
+        outcomes.push((
+            result,
+            CONNECTED_RESOURCE_EVENTS
+                .lock()
+                .expect("event lock")
+                .clone(),
+        ));
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(outcomes[0], outcomes[2]);
+    assert_eq!(outcomes[0].0.value, Value::IntVector(vec![4, 6]));
+    assert_eq!(outcomes[0].0.usage.allocation_attempts, 3);
+    assert_eq!(outcomes[0].0.usage.work_units, 2);
+
+    let template_failure =
+        evaluate_expression("add[div[1 0]] iota[3]").expect_err("template fails first");
+    assert_eq!(template_failure.kind, ErrorKind::DomainError);
+    assert_eq!(
+        template_failure
+            .domain
+            .as_ref()
+            .map(|context| context.reason),
+        Some(DomainErrorReason::DivisionByZero)
+    );
+    assert_eq!(
+        template_failure.usage,
+        Some(faraweave::ResourceUsage {
+            live_evaluation_bytes: 0,
+            peak_live_evaluation_bytes: 0,
+            work_units: 1,
+            allocation_attempts: 0,
+        })
+    );
+
+    let v1 = evaluate_expression_with_configuration(
+        "add[] [10 20]",
+        EvaluationConfiguration {
+            profile: ExecutionProfile::TrustedLocalV1,
+            ..EvaluationConfiguration::default()
+        },
+    )
+    .expect("erased authored tuple requires no tuple profile");
+    assert_eq!(v1.value, Value::Int(30));
 }
 
 #[test]
