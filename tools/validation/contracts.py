@@ -26,8 +26,16 @@ def require(condition: bool, message: str) -> None:
 
 def static_contracts() -> None:
     cargo = (ROOT / "Cargo.toml").read_text()
-    require('name = "faraweave"' in cargo and 'version = "0.1.0"' in cargo, "Cargo identity")
-    require((ROOT / "Cargo.lock").is_file(), "Cargo.lock missing")
+    require('name = "faraweave"' in cargo and 'version = "0.2.0"' in cargo, "Cargo identity")
+    locked_packages = tomllib.loads((ROOT / "Cargo.lock").read_text()).get("package", [])
+    require(
+        any(
+            package.get("name") == "faraweave"
+            and package.get("version") == VERSION
+            for package in locked_packages
+        ),
+        "Cargo.lock identity",
+    )
     toolchain = (ROOT / "rust-toolchain.toml").read_text()
     require('channel = "1.97.1"' in toolchain and "clippy" in toolchain, "toolchain pin")
     main = (ROOT / ".github/workflows/main.yml").read_text()
@@ -142,9 +150,10 @@ def validate_action_pins_without_mutations(workflows: dict[str, str]) -> None:
 
 
 def validate_release_workflows() -> None:
-    initial = (ROOT / ".github/workflows/release.yml").read_text()
+    release = (ROOT / ".github/workflows/release.yml").read_text()
     future = (ROOT / ".github/workflows/future-release.yml").read_text()
-    for text, name in [(initial, "initial"), (future, "future")]:
+    publish = (ROOT / "tools/release/publish.sh").read_text()
+    for text, name in [(release, "release"), (future, "future")]:
         actions = re.findall(r"uses:\s*([^@\s]+)@([^\s]+)", text)
         require(
             all(
@@ -156,12 +165,14 @@ def validate_release_workflows() -> None:
         )
         require("persist-credentials: false" in text, f"{name} checkout credentials")
     for needle in [
-        "v0.1.0",
-        "git cat-file -t refs/tags/v0.1.0",
-        "git rev-parse refs/tags/v0.1.0^{commit}",
-        "! gh release view v0.1.0",
+        "tags: [v0.2.0]",
+        'test "${GITHUB_REF_NAME}" = v0.2.0',
+        r'''test "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = 0.2.0''',
+        "git cat-file -t refs/tags/v0.2.0",
+        "git rev-parse refs/tags/v0.2.0^{commit}",
+        "! gh release view v0.2.0",
     ]:
-        require(needle in initial, f"initial release missing {needle}")
+        require(needle in release, f"release workflow missing {needle}")
     for needle in [
         "linux-x64",
         "windows-x64",
@@ -172,6 +183,14 @@ def validate_release_workflows() -> None:
         "publish.sh",
     ]:
         require(needle in future, f"future release missing {needle}")
+    for needle in [
+        'notes="doc/releases/${tag}.md"',
+        'test -f "${notes}"',
+        '--notes-file "${notes}"',
+    ]:
+        require(needle in publish, f"release publisher missing {needle}")
+    notes = ROOT / f"doc/releases/v{VERSION}.md"
+    require(notes.is_file(), f"release notes missing: {notes.relative_to(ROOT)}")
 
 
 def fnv1a64(data: bytes) -> int:

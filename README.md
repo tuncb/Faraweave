@@ -1,6 +1,6 @@
 # Faraweave
 
-Faraweave 0.1.0 is a standalone Rust implementation of the data-oriented
+Faraweave 0.2.0 is a standalone Rust implementation of the data-oriented
 language defined by the current Bennu specifications at source commit
 `d0adce00a67446f2883e24029682d54b9809b0d7`. Bennu was used only as a
 development-time differential oracle; the shipped library and executable
@@ -341,13 +341,13 @@ executable evidence are checked by the conformance suite.
 
 Release tooling creates exactly:
 
-- `faraweave-v0.1.0-linux-x64.tar.gz`
-- `faraweave-v0.1.0-windows-x64.zip`
-- `faraweave-v0.1.0-macos-arm64.tar.gz`
+- `faraweave-v0.2.0-linux-x64.tar.gz`
+- `faraweave-v0.2.0-windows-x64.zip`
+- `faraweave-v0.2.0-macos-arm64.tar.gz`
 
 Each archive contains only the target executable and `LICENSE`. The compact,
 newline-terminated `release-manifest.json` binds the exact source commit,
-annotated `v0.1.0` tag, archive SHA-256, contained executable SHA-256, target,
+annotated `v0.2.0` tag, archive SHA-256, contained executable SHA-256, target,
 and version. Production publication refuses existing tags/releases/assets,
 re-downloads and compares every remote byte, attests every archive and the
 manifest through GitHub OIDC, and publishes as its final mutation.
