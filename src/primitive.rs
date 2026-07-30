@@ -10,11 +10,19 @@ use crate::{
 };
 
 pub(crate) fn resolve_names(program: &Program) -> Result<(), Error> {
-    for declaration in &program.declarations {
-        validate_names(&declaration.initializer)?;
-    }
-    for root in &program.roots {
-        validate_names(root)?;
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            validate_names(&program.declarations[declaration].initializer)?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            validate_names(root)?;
+        }
     }
     Ok(())
 }

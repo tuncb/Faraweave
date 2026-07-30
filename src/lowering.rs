@@ -602,30 +602,33 @@ enum StructuralValue {
 }
 
 fn validate_operation_reference_positions(program: &Program) -> Result<(), LowerError> {
-    let mut pending = Vec::new();
-    pending
-        .try_reserve(
-            program
-                .roots
-                .len()
-                .checked_add(program.declarations.len())
-                .ok_or(LowerError::Build(BuildError::CountOverflow {
-                    arena: crate::Arena::Node,
-                }))?,
-        )
-        .map_err(|_| {
-            LowerError::Build(BuildError::AllocationUnavailable {
-                arena: crate::Arena::Node,
-            })
-        })?;
-    pending.extend(program.roots.iter().rev().map(|root| (root, false)));
-    pending.extend(
-        program
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
             .declarations
-            .iter()
-            .rev()
-            .map(|declaration| (&declaration.initializer, false)),
-    );
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            validate_operation_reference_expression(
+                &program.declarations[declaration].initializer,
+            )?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            validate_operation_reference_expression(root)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_reference_expression(expression: &Expr) -> Result<(), LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.push((expression, false));
     while let Some((expression, accepted)) = pending.pop() {
         match &expression.kind {
             ExprKind::OperationReference { .. } if accepted => {}
@@ -750,15 +753,23 @@ fn operation_reference_position(consumer: &str, zero_based_argument: usize) -> b
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
     let mut deferred_connected_error = None;
-    for declaration in &program.declarations {
-        let _ = validate_expr_arities(
-            &declaration.initializer,
-            None,
-            &mut deferred_connected_error,
-        )?;
-    }
-    for root in &program.roots {
-        let _ = validate_expr_arities(root, None, &mut deferred_connected_error)?;
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            let _ = validate_expr_arities(
+                &program.declarations[declaration].initializer,
+                None,
+                &mut deferred_connected_error,
+            )?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            let _ = validate_expr_arities(root, None, &mut deferred_connected_error)?;
+        }
     }
     if let Some(error) = deferred_connected_error {
         return Err(LowerError::Source(error));

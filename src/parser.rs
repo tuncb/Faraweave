@@ -444,11 +444,29 @@ pub(crate) fn program_contains_tuple(program: &Program) -> bool {
 }
 
 pub(crate) fn first_tuple_location(program: &Program) -> Option<SourceLocation> {
-    program
-        .declarations
-        .iter()
-        .find_map(|declaration| first_tuple_in_expression(&declaration.initializer))
-        .or_else(|| program.roots.iter().find_map(first_tuple_in_expression))
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            if let Some(location) =
+                first_tuple_in_expression(&program.declarations[declaration].initializer)
+            {
+                return Some(location);
+            }
+            declaration += 1;
+        }
+        if let Some(location) = program
+            .roots
+            .get(boundary)
+            .and_then(first_tuple_in_expression)
+        {
+            return Some(location);
+        }
+    }
+    None
 }
 
 fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
@@ -2120,6 +2138,15 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn first_tuple_location_follows_interleaved_source_order() {
+        let program = parse("[1]\nlet value = [2]\nvalue\n").expect("program");
+        assert_eq!(
+            first_tuple_location(&program).map(|location| location.offset),
+            Some(1)
+        );
     }
 
     #[test]

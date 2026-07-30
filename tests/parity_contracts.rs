@@ -1757,6 +1757,27 @@ fn immutable_binding_duplicate_precedence_follows_source_order() {
 }
 
 #[test]
+fn binding_static_passes_preserve_interleaved_source_error_order() {
+    for (source, kind, offset) in [
+        (
+            "earlier[1]\nlet value = later[1]\nvalue\n",
+            ErrorKind::UnknownPrimitive,
+            1,
+        ),
+        (
+            "add[1]\nlet value = sub[1]\nvalue\n",
+            ErrorKind::ArityError,
+            1,
+        ),
+        ("@add\nlet value = @sub\nvalue\n", ErrorKind::SyntaxError, 2),
+    ] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+        assert_eq!(error.location.offset, offset, "{source}");
+    }
+}
+
+#[test]
 fn immutable_binding_static_failures_precede_argument_decoding() {
     let error = faraweave::evaluate_source_with_arguments(
         "parameters[n Int]\nlet value = missing\nadd[value n]\n",
