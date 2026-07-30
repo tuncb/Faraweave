@@ -82,6 +82,11 @@ pub(crate) enum ExprKind {
         arguments: Vec<Expr>,
         name_span: SourceSpan,
     },
+    Format {
+        raw: bool,
+        arguments: Vec<Expr>,
+        keyword_span: SourceSpan,
+    },
     Connected {
         templates: Vec<ConnectedTemplate>,
         operand: Box<Expr>,
@@ -569,7 +574,9 @@ fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
         ExprKind::Fanout { operand, branches } => first_tuple_in_expression(operand)
             .or_else(|| branches.iter().find_map(first_tuple_in_expression))
             .or(Some(expression.span.begin)),
-        ExprKind::Call { arguments, .. } => arguments.iter().find_map(first_tuple_in_expression),
+        ExprKind::Call { arguments, .. } | ExprKind::Format { arguments, .. } => {
+            arguments.iter().find_map(first_tuple_in_expression)
+        }
         ExprKind::Connected { templates, operand } => templates
             .iter()
             .flat_map(|template| &template.arguments)
@@ -591,7 +598,9 @@ fn expression_contains_tuple(expression: &Expr) -> bool {
     match &expression.kind {
         ExprKind::Tuple(_) | ExprKind::DeepTuple { .. } | ExprKind::Fanout { .. } => true,
         ExprKind::UnaryChain { .. } => false,
-        ExprKind::Call { arguments, .. } => arguments.iter().any(expression_contains_tuple),
+        ExprKind::Call { arguments, .. } | ExprKind::Format { arguments, .. } => {
+            arguments.iter().any(expression_contains_tuple)
+        }
         ExprKind::Connected { templates, operand } => {
             templates
                 .iter()
@@ -1684,13 +1693,22 @@ impl Parser {
             loop {
                 self.skip_inside();
                 if let Some(close) = self.take_kind(TokenKind::RightBracket) {
-                    return Ok(Expr {
-                        kind: ExprKind::Call {
+                    let kind = if matches!(name.spelling.as_str(), "format" | "printf") {
+                        ExprKind::Format {
+                            raw: name.spelling == "printf",
+                            arguments,
+                            keyword_span: name.span,
+                        }
+                    } else {
+                        ExprKind::Call {
                             name: name.spelling,
                             syntax: CallSyntax::Direct,
                             arguments,
                             name_span: name.span,
-                        },
+                        }
+                    };
+                    return Ok(Expr {
+                        kind,
                         span: SourceSpan {
                             begin: name.span.begin,
                             end: close.span.end,
@@ -2171,7 +2189,7 @@ fn reserved_parameter_name(name: &str) -> bool {
 pub(crate) fn reserved_syntax_name(name: &str) -> bool {
     matches!(
         name,
-        "true" | "false" | "inf" | "nan" | "parameters" | "let" | "fanout"
+        "true" | "false" | "inf" | "nan" | "parameters" | "let" | "fanout" | "format" | "printf"
     )
 }
 
@@ -2192,6 +2210,9 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
                 pending.extend(elements.iter().rev().map(|element| (element, true)));
             }
             ExprKind::Call { arguments, .. } => {
+                pending.extend(arguments.iter().rev().map(|argument| (argument, owned)));
+            }
+            ExprKind::Format { arguments, .. } => {
                 pending.extend(arguments.iter().rev().map(|argument| (argument, owned)));
             }
             ExprKind::Connected { templates, operand } => {

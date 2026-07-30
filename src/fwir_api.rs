@@ -1,7 +1,7 @@
 use crate::{
     Error, ErrorKind, EvaluationConfiguration, FwirEncodeError, FwirEncodeOptions, ProgramResult,
     RunnerEvaluationResult, SourceLocation, VerifiedProgram, encode_fwir,
-    evaluate_verified_program, format_value,
+    evaluate_verified_program,
 };
 use std::fmt::Write as _;
 
@@ -109,20 +109,11 @@ pub fn evaluate_verified_program_with_arguments(
     let decoded = crate::interpreter::decode_verified_arguments(program, arguments)?;
     let ProgramResult { values, usage } =
         evaluate_verified_program(program, &decoded, configuration)?;
-    let mut formatted = Vec::new();
-    formatted.try_reserve_exact(values.len()).map_err(|_| {
-        Error::new(
-            ErrorKind::FormattingError,
-            SourceLocation::start(),
-            "unable to allocate formatted output",
-        )
-    })?;
-    for value in &values {
-        formatted.push(format_value(value)?);
-    }
+    let (formatted, presentations) = crate::evaluator::format_runner_values(program, &values)?;
     Ok(RunnerEvaluationResult {
         values,
         formatted,
+        presentations,
         usage,
     })
 }
@@ -207,6 +198,9 @@ pub fn inspect_fwir(program: &VerifiedProgram) -> Result<String, FwirInspectErro
             &mut output,
             format_args!("ownership[{index}] {ownership:?}\n"),
         )?;
+    }
+    for (index, root) in raw.roots.iter().enumerate() {
+        append_format(&mut output, format_args!("root[{index}] {root:?}\n"))?;
     }
     output.push_str("canonical-hex ")?;
     for byte in canonical {

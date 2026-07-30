@@ -71,6 +71,64 @@ fn cli_help_version_and_unknown_contracts() {
 }
 
 #[test]
+fn cli_format_and_printf_bytes_match_for_source_and_verified_fwir() {
+    let directory = unique("value-formatting");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("formatting.faraweave");
+    let artifact = directory.join("formatting.fwir");
+    fs::write(
+        &source,
+        "1\nprintf[\"raw={}\\0\" \"é\"]\nformat[\"tail={}\\n\" [true \"x\"]]\n",
+    )
+    .expect("source");
+
+    let source_run = Command::new(binary())
+        .arg("run")
+        .arg(&source)
+        .output()
+        .expect("run source");
+    assert!(source_run.status.success(), "{:?}", source_run.stderr);
+    assert!(source_run.stderr.is_empty());
+    let expected = b"1\nraw=\xc3\xa9\0\"tail=[true \\\"x\\\"]\\n\"\n";
+    assert_eq!(source_run.stdout, expected);
+
+    let compile = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&source)
+        .args(["-o"])
+        .arg(&artifact)
+        .output()
+        .expect("compile");
+    assert!(compile.status.success(), "{:?}", compile.stderr);
+    assert!(compile.stdout.is_empty());
+    assert!(compile.stderr.is_empty());
+
+    let artifact_run = Command::new(binary())
+        .arg("run-ir")
+        .arg(&artifact)
+        .output()
+        .expect("run artifact");
+    assert!(artifact_run.status.success(), "{:?}", artifact_run.stderr);
+    assert!(artifact_run.stderr.is_empty());
+    assert_eq!(artifact_run.stdout, expected);
+
+    let inspect = Command::new(binary())
+        .arg("inspect-ir")
+        .arg(&artifact)
+        .output()
+        .expect("inspect");
+    assert!(inspect.status.success(), "{:?}", inspect.stderr);
+    assert!(
+        inspect
+            .stdout
+            .windows(b"presentation: RawString".len())
+            .any(|window| window == b"presentation: RawString")
+    );
+
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
 fn cli_explicit_fwir_lifecycle_is_deterministic_and_phase_separated() {
     let directory = unique("fwir-lifecycle");
     fs::create_dir_all(&directory).expect("mkdir");

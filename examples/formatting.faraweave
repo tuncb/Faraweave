@@ -1,0 +1,4 @@
+# Canonical interpolation, escaped braces, and raw root output
+format["{} = {}" "answer" 42]
+format["{{nested}} {}" [1 (true "x")]]
+printf["raw utf-8: {}\0" "Málaga"]

@@ -13,8 +13,8 @@ use crate::typed_program::{
     BuildError, Cardinality, ConstantRecord, Edge, FanOutBranch, Feature, IndexRange, LiftMode,
     Node, NodeIndex, NodeKind, OperationReference, Origin, OriginIndex, OriginPosition, OriginSpan,
     Ownership, OwnershipMode, Parameter, RawProgramBuilder, ReleaseAfter, Root, RootIndex,
-    ScalarConstant, ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
-    VerifyError,
+    RootPresentation, ScalarConstant, ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess,
+    VerifiedProgram, VerifyError,
 };
 use crate::{
     BindingErrorContext, BindingErrorReason, ConnectedApplicationErrorContext,
@@ -110,6 +110,7 @@ struct Lowerer {
     needs_connected_bindings: bool,
     needs_user_bindings: bool,
     needs_strings: bool,
+    needs_value_formatting: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
     binding_resolution: BindingResolution,
@@ -211,6 +212,7 @@ pub(crate) fn compile_parsed_source_with_name(
     program: &Program,
 ) -> Result<VerifiedProgram, CompileError> {
     validate_parameter_declarations(program)?;
+    validate_format_forms(program)?;
     let binding_resolution = analyze_bindings(program)?;
     validate_operation_reference_positions(program)?;
     resolve_names(program)?;
@@ -492,6 +494,14 @@ fn analyze_expression_bindings(
                 })?;
                 pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
             }
+            ExprKind::Format { arguments, .. } => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
+            }
             ExprKind::Connected { templates, operand } => {
                 let additional = templates
                     .iter()
@@ -602,6 +612,220 @@ enum StructuralValue {
     Tuple(usize),
 }
 
+fn validate_format_forms(program: &Program) -> Result<(), LowerError> {
+    let mut declaration = 0usize;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            validate_format_expression(&program.declarations[declaration].initializer, false)?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            validate_format_expression(root, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_format_expression(expression: &Expr, root: bool) -> Result<(), LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.push((expression, root));
+    while let Some((current, is_root)) = pending.pop() {
+        match &current.kind {
+            ExprKind::Format {
+                raw,
+                arguments,
+                keyword_span,
+            } => {
+                let keyword = if *raw { "printf" } else { "format" };
+                if *raw && !is_root {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::TypeError,
+                        *keyword_span,
+                        "printf is valid only as a program root",
+                    )));
+                }
+                let Some(template_expression) = arguments.first() else {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::ArityError,
+                        *keyword_span,
+                        if *raw {
+                            "printf requires a String literal template"
+                        } else {
+                            "format requires a String literal template"
+                        },
+                    )));
+                };
+                let ExprKind::Literal(Value::String(template)) = &template_expression.kind else {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::TypeError,
+                        template_expression.span,
+                        if *raw {
+                            "printf template must be a String literal"
+                        } else {
+                            "format template must be a String literal"
+                        },
+                    )));
+                };
+                let placeholder_count =
+                    validate_format_template(template, template_expression.span, keyword)?;
+                let supplied = arguments.len().saturating_sub(1);
+                if placeholder_count != supplied {
+                    return Err(format_count_mismatch_error(
+                        template_expression.span,
+                        keyword,
+                        placeholder_count,
+                        supplied,
+                    )?);
+                }
+                pending.try_reserve(supplied).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(
+                    arguments
+                        .iter()
+                        .skip(1)
+                        .rev()
+                        .map(|argument| (argument, false)),
+                );
+            }
+            ExprKind::Call { arguments, .. } | ExprKind::Tuple(arguments) => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
+            }
+            ExprKind::Connected { templates, operand } => {
+                let count = templates
+                    .iter()
+                    .try_fold(1usize, |count, template| {
+                        count.checked_add(template.arguments.len())
+                    })
+                    .ok_or(LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    }))?;
+                pending.try_reserve(count).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.push((operand, false));
+                for template in templates.iter().rev() {
+                    pending.extend(
+                        template
+                            .arguments
+                            .iter()
+                            .rev()
+                            .map(|argument| (argument, false)),
+                    );
+                }
+            }
+            ExprKind::Fanout { operand, branches } => {
+                pending
+                    .try_reserve(branches.len().saturating_add(1))
+                    .map_err(|_| {
+                        LowerError::Build(BuildError::AllocationUnavailable {
+                            arena: crate::Arena::Node,
+                        })
+                    })?;
+                pending.extend(branches.iter().rev().map(|branch| (branch, false)));
+                pending.push((operand, false));
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Vector(_, _)
+            | ExprKind::DeepTuple { .. }
+            | ExprKind::UnaryChain { .. }
+            | ExprKind::OperationReference { .. }
+            | ExprKind::UnresolvedName { .. }
+            | ExprKind::ConnectedPlaceholder(_)
+            | ExprKind::Placeholder => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_format_template(
+    template: &str,
+    span: SourceSpan,
+    keyword: &str,
+) -> Result<usize, LowerError> {
+    let bytes = template.as_bytes();
+    let mut index = 0usize;
+    let mut placeholders = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' if bytes.get(index + 1) == Some(&b'{') => index += 2,
+            b'}' if bytes.get(index + 1) == Some(&b'}') => index += 2,
+            b'{' if bytes.get(index + 1) == Some(&b'}') => {
+                placeholders = placeholders.checked_add(1).ok_or(LowerError::Build(
+                    BuildError::CountOverflow {
+                        arena: crate::Arena::Edge,
+                    },
+                ))?;
+                index += 2;
+            }
+            b'{' | b'}' => {
+                let message = if keyword == "printf" {
+                    "malformed printf template brace"
+                } else {
+                    "malformed format template brace"
+                };
+                return Err(LowerError::Source(Error::at_span(
+                    ErrorKind::FormattingError,
+                    span,
+                    message,
+                )));
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(placeholders)
+}
+
+fn format_count_mismatch_error(
+    span: SourceSpan,
+    keyword: &str,
+    placeholders: usize,
+    supplied: usize,
+) -> Result<LowerError, LowerError> {
+    let mut message = String::new();
+    message.try_reserve_exact(112).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    write!(
+        &mut message,
+        "{keyword} template has {placeholders} placeholder(s) but received {supplied} interpolation argument(s)"
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    let mut error = Error::at_span(ErrorKind::ArityError, span, message);
+    error.actual_arity = Some(supplied);
+    error.expected_arity.try_reserve_exact(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    error.expected_arity.push(placeholders);
+    Ok(LowerError::Source(error))
+}
+
 fn validate_operation_reference_positions(program: &Program) -> Result<(), LowerError> {
     let mut declaration = 0;
     for boundary in 0..=program.roots.len() {
@@ -653,6 +877,14 @@ fn validate_operation_reference_expression(expression: &Expr) -> Result<(), Lowe
                 for (index, argument) in arguments.iter().enumerate().rev() {
                     pending.push((argument, operation_reference_position(name, index)));
                 }
+            }
+            ExprKind::Format { arguments, .. } => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
             }
             ExprKind::Connected { templates, operand } => {
                 let template_arguments = templates
@@ -837,6 +1069,12 @@ fn validate_expr_arities(
                 return Ok(StructuralValue::NonTuple);
             }
             validate_arity(name, actual, expression.span.begin)?;
+            Ok(StructuralValue::NonTuple)
+        }
+        ExprKind::Format { arguments, .. } => {
+            for argument in arguments.iter().skip(1) {
+                let _ = validate_expr_arities(argument, placeholder, deferred_connected_error)?;
+            }
             Ok(StructuralValue::NonTuple)
         }
         ExprKind::Connected { templates, operand } => {
@@ -1028,7 +1266,9 @@ fn first_unbound_connected_placeholder(
     while let Some(current) = pending.pop() {
         match &current.kind {
             ExprKind::ConnectedPlaceholder(_) => return Ok(Some(current.span)),
-            ExprKind::Call { arguments, .. } | ExprKind::Tuple(arguments) => {
+            ExprKind::Call { arguments, .. }
+            | ExprKind::Format { arguments, .. }
+            | ExprKind::Tuple(arguments) => {
                 pending.try_reserve(arguments.len()).map_err(|_| {
                     LowerError::Build(BuildError::AllocationUnavailable {
                         arena: crate::Arena::Node,
@@ -1422,6 +1662,7 @@ fn lower_program_with_builder_and_resolution(
         needs_connected_bindings: false,
         needs_user_bindings: false,
         needs_strings: false,
+        needs_value_formatting: false,
         placeholder: None,
         releases: Vec::new(),
         binding_resolution,
@@ -1525,6 +1766,10 @@ fn lower_program_with_builder_and_resolution(
         lowerer.builder.push_root(Root {
             node: lowered.node,
             origin: lowered.origin,
+            presentation: match root.kind {
+                ExprKind::Format { raw: true, .. } => RootPresentation::RawString,
+                _ => RootPresentation::CanonicalValue,
+            },
         })?;
     }
     for binding in 0..lowerer.bindings.len() {
@@ -1609,6 +1854,12 @@ fn lower_program_with_builder_and_resolution(
     if lowerer.needs_strings {
         lowerer.builder.set_semantic_minor(4);
         lowerer.builder.push_feature(Feature::Strings.numeric())?;
+    }
+    if lowerer.needs_value_formatting {
+        lowerer.builder.set_semantic_minor(5);
+        lowerer
+            .builder
+            .push_feature(Feature::ValueFormatting.numeric())?;
     }
     Ok(lowerer.builder.finish()?.verify()?)
 }
@@ -1952,6 +2203,9 @@ impl Lowerer {
                 origin,
                 expression.span.begin,
             ),
+            ExprKind::Format { arguments, .. } => {
+                self.lower_format(arguments, origin, expression.span.begin)
+            }
             ExprKind::Connected { templates, operand } => {
                 self.lower_connected(expression, templates, operand, origin)
             }
@@ -2022,6 +2276,106 @@ impl Lowerer {
             location,
             borrowed: false,
             value_type: Type::Scalar(scalar_type),
+            tuple_elements: Vec::new(),
+            access: ValueAccess::WholeValue,
+            binding: None,
+        })
+    }
+
+    fn lower_format(
+        &mut self,
+        arguments: &[Expr],
+        origin: OriginIndex,
+        location: SourceLocation,
+    ) -> Result<Lowered, LowerError> {
+        let template_expression = arguments.first().ok_or_else(|| {
+            LowerError::Source(Error::new(
+                ErrorKind::ArityError,
+                location,
+                "format requires a String literal template",
+            ))
+        })?;
+        let ExprKind::Literal(Value::String(template)) = &template_expression.kind else {
+            return Err(LowerError::Source(Error::at_span(
+                ErrorKind::TypeError,
+                template_expression.span,
+                "format template must be a String literal",
+            )));
+        };
+        let template_origin = self.push_origin(template_expression.span)?;
+        let template = self
+            .builder
+            .push_string_value(try_clone_string(template, crate::Arena::StringValue)?)?;
+        let mut lowered = Vec::new();
+        lowered
+            .try_reserve_exact(arguments.len().saturating_sub(1))
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Node,
+                })
+            })?;
+        for argument in arguments.iter().skip(1) {
+            lowered.push(self.lower_expr(argument)?);
+        }
+        let edge_start = self.builder.finish_preview_edges()?;
+        for (position, argument) in lowered.iter().enumerate() {
+            self.builder.push_edge(Edge {
+                producer: argument.node,
+                argument_position: u32::try_from(position + 1).map_err(|_| {
+                    LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Edge,
+                    })
+                })?,
+                access: argument.access,
+                cardinality: argument.cardinality,
+                conversion: crate::Conversion::Identity,
+                ownership: if argument.borrowed {
+                    OwnershipMode::ImmutableBorrow
+                } else {
+                    OwnershipMode::OwnedInput
+                },
+                origin: argument.origin,
+            })?;
+        }
+        let count = u32::try_from(lowered.len()).map_err(|_| {
+            LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        let result_type = self
+            .builder
+            .push_type(TypeRecord::Scalar(ScalarType::String))?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::Format {
+                template,
+                template_origin,
+            },
+            result_type,
+            cardinality: Some(Cardinality::StaticScalar),
+            edges: IndexRange {
+                start: edge_start,
+                count,
+            },
+            origin,
+        })?;
+        self.register_node(node)?;
+        for argument in &lowered {
+            if let Some(binding) = argument.binding {
+                self.record_binding_consumer(binding, node)?;
+            } else if !argument.borrowed {
+                self.set_release(argument.node, ReleaseAfter::Node(node))?;
+            }
+        }
+        self.needs_strings = true;
+        self.needs_value_formatting = true;
+        Ok(Lowered {
+            node,
+            result_type,
+            cardinality: Some(Cardinality::StaticScalar),
+            origin,
+            location,
+            borrowed: false,
+            value_type: Type::Scalar(ScalarType::String),
             tuple_elements: Vec::new(),
             access: ValueAccess::WholeValue,
             binding: None,
@@ -4174,9 +4528,9 @@ fn placeholder_span(expression: &Expr) -> Option<SourceSpan> {
     match &expression.kind {
         ExprKind::Placeholder => Some(expression.span),
         ExprKind::ConnectedPlaceholder(_) => None,
-        ExprKind::Call { arguments, .. } | ExprKind::Tuple(arguments) => {
-            arguments.iter().find_map(placeholder_span)
-        }
+        ExprKind::Call { arguments, .. }
+        | ExprKind::Format { arguments, .. }
+        | ExprKind::Tuple(arguments) => arguments.iter().find_map(placeholder_span),
         ExprKind::Connected { templates, operand } => templates
             .iter()
             .flat_map(|template| &template.arguments)
@@ -4258,6 +4612,19 @@ mod tests {
             Ok(_) => panic!("source unexpectedly compiled"),
             Err(error) => panic!("expected source diagnostic, got {error:?}"),
         }
+    }
+
+    #[test]
+    fn value_formatting_lowering_records_typed_template_edges_and_root_presentation() {
+        let program = must_compile("printf[\"{}\" [1 \"x\"]]");
+        let raw = program.as_raw();
+        assert_eq!(raw.module.semantic_minor, 5);
+        assert!(raw.features.contains(&Feature::ValueFormatting.numeric()));
+        assert!(matches!(
+            raw.nodes.last().map(|node| node.kind),
+            Some(NodeKind::Format { .. })
+        ));
+        assert_eq!(raw.roots[0].presentation, RootPresentation::RawString);
     }
 
     #[test]
@@ -5821,9 +6188,11 @@ mod tests {
              filter[@odd (1 2)]\n\
              add [1 2]\n\
              add[1] 2\n\
-             fanout[[1 2] {add _}]\n",
+             fanout[[1 2] {add _}]\n\
+             format[\"{}\" x]\n\
+             printf[\"{}\" \"raw\"]\n",
         );
-        assert_eq!(debug_digest(&matrix), 2_422_886_676_315_912_113);
+        assert_eq!(debug_digest(&matrix), 11_623_015_216_813_318_305);
 
         let depth = 256;
         let mut deep = String::new();
@@ -5837,7 +6206,7 @@ mod tests {
         }
         assert_eq!(
             debug_digest(&must_compile(&deep)),
-            6_491_665_898_151_316_895
+            2_634_332_182_400_948_416
         );
 
         let mut unary = String::new();
@@ -5848,7 +6217,7 @@ mod tests {
         unary.push('1');
         assert_eq!(
             debug_digest(&must_compile(&unary)),
-            11_657_226_798_462_061_452
+            17_775_784_161_034_039_731
         );
     }
 

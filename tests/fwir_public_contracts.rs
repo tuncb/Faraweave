@@ -1,6 +1,7 @@
 use faraweave::{
-    DomainErrorReason, EvaluationConfiguration, Feature, FwirDecodeLimits, FwirEncodeOptions,
-    LiftMode, NodeKind, ResourceErrorReason, Value, compile_source_to_fwir,
+    AllocationFailureInjection, DomainErrorReason, EvaluationConfiguration, ExecutionProfile,
+    Feature, FwirDecodeLimits, FwirEncodeOptions, LiftMode, NodeKind, ResourceErrorReason,
+    ResourceLimits, RootPresentation, Value, compile_source_to_fwir,
     compile_source_to_fwir_with_name, compile_source_to_verified_program, decode_fwir, encode_fwir,
     evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
     inspect_fwir,
@@ -19,6 +20,13 @@ struct ObservedEvent {
 }
 
 static EVENTS: Mutex<Vec<ObservedEvent>> = Mutex::new(Vec::new());
+static EVENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_event_test() -> std::sync::MutexGuard<'static, ()> {
+    EVENT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn observe(event: &faraweave::ResourceEvent<'_>) {
     if let Ok(mut events) = EVENTS.lock() {
@@ -39,6 +47,209 @@ fn take_events() -> Vec<ObservedEvent> {
         Ok(mut events) => std::mem::take(&mut *events),
         Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
     }
+}
+
+fn section(encoded: &[u8], wanted: u16) -> (usize, usize, usize) {
+    let count = u32::from_le_bytes(encoded[20..24].try_into().expect("section count")) as usize;
+    for index in 0..count {
+        let entry = 32 + index * 24;
+        let id = u16::from_le_bytes(encoded[entry..entry + 2].try_into().expect("section id"));
+        if id == wanted {
+            let record_size = u32::from_le_bytes(
+                encoded[entry + 4..entry + 8]
+                    .try_into()
+                    .expect("record size"),
+            ) as usize;
+            let offset =
+                u64::from_le_bytes(encoded[entry + 8..entry + 16].try_into().expect("offset"))
+                    as usize;
+            return (entry, offset, record_size);
+        }
+    }
+    panic!("section {wanted} missing");
+}
+
+#[test]
+fn value_formatting_is_semantic_and_physical_1_5_and_roundtrips_root_presentation() {
+    let source =
+        "format[\"{}|{}|{{}}\" \"é\\0\" [1 \"x\"]]\nprintf[\"raw={}\\0\" (nan -0.0 inf)]\n";
+    let direct =
+        compile_source_to_verified_program(source, "formatting.faraweave").expect("compile");
+    let encoded = encode_fwir(&direct, &FwirEncodeOptions::default()).expect("encode");
+    assert_eq!(u16::from_le_bytes([encoded[10], encoded[11]]), 5);
+    assert_eq!(direct.module().semantic_minor, 5);
+    assert!(
+        direct
+            .as_raw()
+            .features
+            .contains(&Feature::ValueFormatting.numeric())
+    );
+    assert_eq!(
+        direct
+            .as_raw()
+            .roots
+            .iter()
+            .map(|root| root.presentation)
+            .collect::<Vec<_>>(),
+        [
+            RootPresentation::CanonicalValue,
+            RootPresentation::RawString
+        ]
+    );
+    let (_, nodes, node_record_size) = section(&encoded, 14);
+    assert_eq!(node_record_size, 56);
+    let format_node = (0..direct.as_raw().nodes.len())
+        .find(|index| encoded[nodes + index * node_record_size] == 11)
+        .expect("format node");
+    let (_, roots, root_record_size) = section(&encoded, 16);
+    assert_eq!(root_record_size, 12);
+    assert_eq!(encoded[roots + 8], 1);
+    assert_eq!(encoded[roots + root_record_size + 8], 2);
+
+    let decoded = decode_fwir(&encoded, &FwirDecodeLimits::default()).expect("decode");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("reencode"),
+        encoded
+    );
+    let direct_result =
+        evaluate_verified_program_with_arguments(&direct, &[], EvaluationConfiguration::default())
+            .expect("direct execute");
+    let decoded_result =
+        evaluate_verified_program_with_arguments(&decoded, &[], EvaluationConfiguration::default())
+            .expect("decoded execute");
+    assert_eq!(direct_result, decoded_result);
+    assert_eq!(
+        decoded_result.formatted,
+        ["\"é\\0|[1 \\\"x\\\"]|{}\"", "raw=(nan -0.0 inf)\0"]
+    );
+    assert_eq!(
+        decoded_result.presentations,
+        [
+            RootPresentation::CanonicalValue,
+            RootPresentation::RawString
+        ]
+    );
+
+    for relative in [8usize, 9] {
+        let mut hostile = encoded.clone();
+        hostile[roots + relative] = if relative == 8 { 0 } else { 1 };
+        assert!(decode_fwir(&hostile, &FwirDecodeLimits::default()).is_err());
+    }
+    let format_record = nodes + format_node * node_record_size;
+    for relative in [24usize, 28, 32] {
+        let mut hostile = encoded.clone();
+        hostile[format_record + relative..format_record + relative + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_fwir(&hostile, &FwirDecodeLimits::default()).is_err());
+    }
+    let edge_start = u32::from_le_bytes(
+        encoded[format_record + 12..format_record + 16]
+            .try_into()
+            .expect("edge start"),
+    ) as usize;
+    let (_, edges, edge_record_size) = section(&encoded, 11);
+    let mut wrong_conversion = encoded.clone();
+    wrong_conversion[edges + edge_start * edge_record_size + 10] = 2;
+    assert!(decode_fwir(&wrong_conversion, &FwirDecodeLimits::default()).is_err());
+
+    let mut old_physical = encoded.clone();
+    old_physical[10..12].copy_from_slice(&4_u16.to_le_bytes());
+    assert!(decode_fwir(&old_physical, &FwirDecodeLimits::default()).is_err());
+    let (_, module, _) = section(&encoded, 1);
+    let mut old_semantic = encoded.clone();
+    old_semantic[module + 2..module + 4].copy_from_slice(&4_u16.to_le_bytes());
+    assert!(decode_fwir(&old_semantic, &FwirDecodeLimits::default()).is_err());
+
+    let feature = encoded
+        .windows(4)
+        .position(|record| record == [11, 0, 0, 0])
+        .expect("feature 11");
+    let mut missing = encoded;
+    missing[feature..feature + 2].copy_from_slice(&100_u16.to_le_bytes());
+    missing[feature + 2] = 1;
+    assert!(decode_fwir(&missing, &FwirDecodeLimits::default()).is_err());
+}
+
+#[test]
+fn formatting_admits_one_complete_result_and_fault_cleanup_is_deterministic() {
+    let _event_test = lock_event_test();
+    let program = compile_source_to_verified_program(
+        "format[\"{}|{}\" \"é\" [1 \"x\"]]",
+        "format-resources.faraweave",
+    )
+    .expect("compile");
+    let configuration = EvaluationConfiguration {
+        profile: ExecutionProfile::BoundedV2,
+        limits: ResourceLimits {
+            max_vector_bytes: None,
+            max_tuple_table_bytes: Some(1024),
+            max_live_evaluation_bytes: Some(1024),
+            max_work_units: Some(1024),
+        },
+        allocation_failure: AllocationFailureInjection::default(),
+    };
+    let _ = take_events();
+    let result = evaluate_verified_program_with_observer(&program, &[], configuration, observe)
+        .expect("run");
+    assert_eq!(result.values, [Value::String("é|[1 \"x\"]".to_owned())]);
+    let events = take_events();
+    let format = events
+        .iter()
+        .find(|event| {
+            event.kind == faraweave::ResourceEventKind::Admission && event.producer == "format"
+        })
+        .expect("format admission");
+    assert_eq!(format.bytes, Some("é|[1 \"x\"]".len()));
+    assert_eq!(format.work, "é|[1 \"x\"]".len());
+    let format_ordinal = format.ordinal.expect("allocation ordinal");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.producer == "format"
+                && event.kind == faraweave::ResourceEventKind::Admission)
+            .count(),
+        1
+    );
+
+    let _ = take_events();
+    let failure = evaluate_verified_program_with_observer(
+        &program,
+        &[],
+        EvaluationConfiguration {
+            allocation_failure: AllocationFailureInjection {
+                fail_at_ordinal: Some(format_ordinal),
+            },
+            ..configuration
+        },
+        observe,
+    )
+    .expect_err("format allocation refusal");
+    assert_eq!(
+        failure.resource.as_ref().map(|context| context.reason),
+        Some(ResourceErrorReason::AllocationUnavailable)
+    );
+    assert_eq!(
+        failure
+            .resource
+            .as_ref()
+            .and_then(|context| context.allocation_ordinal),
+        Some(format_ordinal)
+    );
+    assert_eq!(
+        failure.usage.map(|usage| usage.live_evaluation_bytes),
+        Some(0)
+    );
+    let failure_events = take_events();
+    assert!(failure_events.iter().any(|event| {
+        event.kind == faraweave::ResourceEventKind::Refusal
+            && event.producer == "format"
+            && event.ordinal == Some(format_ordinal)
+    }));
+    assert!(
+        failure_events
+            .iter()
+            .any(|event| { event.kind == faraweave::ResourceEventKind::Release })
+    );
 }
 
 #[test]
@@ -96,6 +307,7 @@ fn utf8_strings_are_semantic_and_physical_1_4_and_roundtrip_exactly() {
 
 #[test]
 fn public_source_and_decoded_artifact_execution_and_resource_traces_match() {
+    let _event_test = lock_event_test();
     let source = "parameters[n Int]\nfanout[iota[n] {inc[_]} {add[_ 10]}]\n";
     let program =
         compile_source_to_verified_program(source, "logical/input.faraweave").expect("compile");
@@ -228,6 +440,7 @@ fn connected_completion_roundtrips_as_ordinary_existing_fwir() {
 
 #[test]
 fn connected_bindings_are_semantic_and_physical_1_2_and_roundtrip_exactly() {
+    let _event_test = lock_event_test();
     let source = "parameters[x Int]\n\
                   add[10 _] x\n\
                   sub[_2 _1] [1 x]\n\

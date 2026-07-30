@@ -1,0 +1,3 @@
+# Issue 89: value formatting
+
+Templates recognize `{}`, `{{`, and `}}`, with direct scalar Strings interpolated raw while every other scalar and all vector/tuple structure uses canonical value spelling. Formatting is a typed FWIR node because inputs execute once left-to-right and work equals the complete result's UTF-8 bytes through exactly one result admission. Root presentation is recorded separately so root-only `printf` publishes raw String bytes without an implicit newline. Mandatory feature 11 introduces the node and presentation in semantic and physical FWIR 1.5 while preserving earlier layouts.

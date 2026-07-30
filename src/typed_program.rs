@@ -2,7 +2,7 @@ use crate::ScalarType;
 use std::collections::TryReserveError;
 
 pub const SUPPORTED_SEMANTIC_MAJOR: u16 = 1;
-pub const SUPPORTED_SEMANTIC_MINOR: u16 = 4;
+pub const SUPPORTED_SEMANTIC_MINOR: u16 = 5;
 
 macro_rules! index_type {
     ($name:ident) => {
@@ -74,6 +74,7 @@ pub enum Feature {
     ConnectedApplicationBindings = 8,
     ImmutableBindings = 9,
     Strings = 10,
+    ValueFormatting = 11,
 }
 
 impl Feature {
@@ -237,6 +238,10 @@ pub enum NodeKind {
     },
     BindingMove,
     BindingBorrow,
+    Format {
+        template: StringValueIndex,
+        template_origin: OriginIndex,
+    },
     FanOut {
         branches: IndexRange,
         keyword_origin: OriginIndex,
@@ -276,6 +281,13 @@ pub struct Ownership {
 pub struct Root {
     pub node: NodeIndex,
     pub origin: OriginIndex,
+    pub presentation: RootPresentation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootPresentation {
+    CanonicalValue,
+    RawString,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -727,6 +739,7 @@ fn verify_program(
             Feature::ConnectedApplicationBindings.numeric(),
             Feature::ImmutableBindings.numeric(),
             Feature::Strings.numeric(),
+            Feature::ValueFormatting.numeric(),
         ]
         .contains(&feature)
         {
@@ -827,7 +840,7 @@ fn verify_program(
                 NodeKind::SelectedApply {
                     result_element_type: ScalarType::String,
                     ..
-                }
+                } | NodeKind::Format { .. }
             )
         });
     if program.module.semantic_minor < 4 && (has_strings || uses_strings) {
@@ -836,6 +849,23 @@ fn verify_program(
             RecordKind::Module,
             None,
             "strings_version",
+        ));
+    }
+    let has_value_formatting = has_feature(program, Feature::ValueFormatting);
+    let uses_value_formatting = program
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::Format { .. }))
+        || program
+            .roots
+            .iter()
+            .any(|root| root.presentation == RootPresentation::RawString);
+    if program.module.semantic_minor < 5 && (has_value_formatting || uses_value_formatting) {
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "value_formatting_version",
         ));
     }
     if program.module.semantic_minor == 0
@@ -1306,7 +1336,13 @@ fn verify_string_values(program: &RawProgram) -> Result<(), VerifyError> {
                 ScalarConstant::String(value_index) if value_index.0 as usize == index
             )
         });
-        if !used_by_name && !used_by_constant {
+        let used_by_format = program.nodes.iter().any(|node| {
+            matches!(
+                node.kind,
+                NodeKind::Format { template, .. } if template.0 as usize == index
+            )
+        });
+        if !used_by_name && !used_by_constant && !used_by_format {
             return Err(malformed(
                 Invariant::InvalidRecord,
                 RecordKind::StringValue,
@@ -1724,6 +1760,27 @@ fn verify_node_and_edge_references(program: &RawProgram) -> Result<(), VerifyErr
                             field,
                         ));
                     }
+                }
+            }
+            NodeKind::Format {
+                template,
+                template_origin,
+            } => {
+                if !in_bounds(template.0, program.string_values.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "template",
+                    ));
+                }
+                if !in_bounds(template_origin.0, program.origins.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "template_origin",
+                    ));
                 }
             }
             NodeKind::FanOut {
@@ -2179,6 +2236,28 @@ fn verify_node(
                 || edges[0].cardinality != node.cardinality
             {
                 return Err(inconsistent("binding_borrow"));
+            }
+        }
+        NodeKind::Format { template, .. } => {
+            let Some(template) = program.string_values.get(template.0 as usize) else {
+                return Err(inconsistent("template"));
+            };
+            if crate::value::format_template_placeholder_count(template).ok() != Some(edges.len())
+                || type_record(program, node.result_type)
+                    != Some(TypeRecord::Scalar(ScalarType::String))
+                || node.cardinality != Some(Cardinality::StaticScalar)
+            {
+                return Err(inconsistent("format"));
+            }
+            for edge in edges {
+                if edge.conversion != Conversion::Identity
+                    || !matches!(
+                        edge.ownership,
+                        OwnershipMode::OwnedInput | OwnershipMode::ImmutableBorrow
+                    )
+                {
+                    return Err(inconsistent("format_edge"));
+                }
             }
         }
         NodeKind::SelectedApply {
@@ -3170,7 +3249,7 @@ fn verify_semantic_ownership(
                 matches!(
                     (node.kind, edge.access, edge.ownership),
                     (
-                        NodeKind::SelectedApply { .. },
+                        NodeKind::SelectedApply { .. } | NodeKind::Format { .. },
                         ValueAccess::BindingBorrowWhole | ValueAccess::BindingBorrowElement(_),
                         OwnershipMode::ImmutableBorrow
                     ) | (
@@ -3190,7 +3269,7 @@ fn verify_semantic_ownership(
                 matches!(
                     (node.kind, edge.access, edge.ownership),
                     (
-                        NodeKind::SelectedApply { .. },
+                        NodeKind::SelectedApply { .. } | NodeKind::Format { .. },
                         ValueAccess::ConnectedBindingWhole
                             | ValueAccess::ConnectedBindingElement(_),
                         OwnershipMode::ImmutableBorrow
@@ -3200,7 +3279,7 @@ fn verify_semantic_ownership(
                 matches!(
                     (node.kind, edge.access, edge.ownership),
                     (
-                        NodeKind::SelectedApply { .. },
+                        NodeKind::SelectedApply { .. } | NodeKind::Format { .. },
                         ValueAccess::TupleElement(_),
                         OwnershipMode::ImmutableBorrow
                     )
@@ -3251,6 +3330,20 @@ fn verify_semantic_ownership(
                         } else {
                             edge.ownership == OwnershipMode::OwnedInput
                         }
+                    }
+                    (NodeKind::Format { .. }, ValueAccess::WholeValue) => {
+                        if parameter {
+                            edge.ownership == OwnershipMode::ImmutableBorrow
+                        } else {
+                            edge.ownership == OwnershipMode::OwnedInput
+                        }
+                    }
+                    (NodeKind::Format { .. }, ValueAccess::FanOutOperandBorrow) => {
+                        edge.ownership == OwnershipMode::ImmutableBorrow
+                            && fan_out_borrow_context
+                                .get(edge_index)
+                                .copied()
+                                .unwrap_or(false)
                     }
                     (NodeKind::SelectedApply { .. }, ValueAccess::TupleElement(_)) => false,
                     (
@@ -3417,8 +3510,10 @@ fn verify_connected_binding_owners(
             if !matches!(
                 program.nodes.get(producer).map(|node| node.kind),
                 Some(NodeKind::ConnectedBinding)
-            ) || !matches!(node.kind, NodeKind::SelectedApply { .. })
-            {
+            ) || !matches!(
+                node.kind,
+                NodeKind::SelectedApply { .. } | NodeKind::Format { .. }
+            ) {
                 return Err(malformed(
                     Invariant::AmbiguousOwnership,
                     RecordKind::Edge,
@@ -3648,6 +3743,20 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
                 "origin",
             ));
         }
+        if root.presentation == RootPresentation::RawString
+            && program
+                .nodes
+                .get(root.node.0 as usize)
+                .and_then(|node| type_record(program, node.result_type))
+                != Some(TypeRecord::Scalar(ScalarType::String))
+        {
+            return Err(malformed(
+                Invariant::InconsistentResultMetadata,
+                RecordKind::Root,
+                checked_index(index),
+                "presentation",
+            ));
+        }
     }
     let needs_ids = program
         .nodes
@@ -3752,7 +3861,19 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
         || program
             .constant_elements
             .iter()
-            .any(|constant| matches!(constant, ScalarConstant::String(_)));
+            .any(|constant| matches!(constant, ScalarConstant::String(_)))
+        || program
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, NodeKind::Format { .. }));
+    let needs_value_formatting = program
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::Format { .. }))
+        || program
+            .roots
+            .iter()
+            .any(|root| root.presentation == RootPresentation::RawString);
     for (required, needed, field) in [
         (Feature::StableSemanticIds, needs_ids, "stable_semantic_ids"),
         (Feature::Tuples, needs_tuples, "tuples"),
@@ -3784,6 +3905,11 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             "immutable_bindings",
         ),
         (Feature::Strings, needs_strings, "strings"),
+        (
+            Feature::ValueFormatting,
+            needs_value_formatting,
+            "value_formatting",
+        ),
     ] {
         if needed && !has_feature(program, required) {
             return Err(malformed(
@@ -3816,6 +3942,14 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             RecordKind::Module,
             None,
             "superfluous_strings",
+        ));
+    }
+    if has_feature(program, Feature::ValueFormatting) && !needs_value_formatting {
+        return Err(malformed(
+            Invariant::InvalidRecord,
+            RecordKind::Module,
+            None,
+            "superfluous_value_formatting",
         ));
     }
     Ok(())
@@ -3870,7 +4004,11 @@ mod tests {
             owner: node,
             release_after: ReleaseAfter::Root(RootIndex(0)),
         }));
-        must(builder.push_root(Root { node, origin }));
+        must(builder.push_root(Root {
+            node,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(builder.finish())
     }
 
@@ -3910,7 +4048,11 @@ mod tests {
             edges: IndexRange::default(),
             origin,
         }));
-        must(builder.push_root(Root { node, origin }));
+        must(builder.push_root(Root {
+            node,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(builder.finish())
     }
 
@@ -3978,6 +4120,7 @@ mod tests {
         must(builder.push_root(Root {
             node: tuple,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4056,6 +4199,7 @@ mod tests {
         must(builder.push_root(Root {
             node: apply,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4111,7 +4255,11 @@ mod tests {
             owner: iota,
             release_after: ReleaseAfter::Root(RootIndex(0)),
         }));
-        must(builder.push_root(Root { node: iota, origin }));
+        must(builder.push_root(Root {
+            node: iota,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(builder.finish())
     }
 
@@ -4333,6 +4481,7 @@ mod tests {
         must(builder.push_root(Root {
             node: apply,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4466,6 +4615,7 @@ mod tests {
         program.roots.push(Root {
             node: NodeIndex(5),
             origin: OriginIndex(0),
+            presentation: RootPresentation::CanonicalValue,
         });
         program.module.ranges.nodes.count = 6;
         program.module.ranges.edges.count = 7;
@@ -4560,6 +4710,7 @@ mod tests {
         must(builder.push_root(Root {
             node: fan_out,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4793,6 +4944,7 @@ mod tests {
         must(builder.push_root(Root {
             node: outer_fan_out,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4885,6 +5037,7 @@ mod tests {
             must(builder.push_root(Root {
                 node: fan_out,
                 origin,
+                presentation: RootPresentation::CanonicalValue,
             }));
         }
         must(builder.finish())
@@ -5049,6 +5202,7 @@ mod tests {
         must(builder.push_root(Root {
             node: fan_out,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -6440,6 +6594,7 @@ mod tests {
         must(builder.push_root(Root {
             node: apply,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -6699,6 +6854,7 @@ mod tests {
         must(builder.push_root(Root {
             node: current_node,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -6762,6 +6918,7 @@ mod tests {
         must(builder.push_root(Root {
             node: current,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -6878,6 +7035,7 @@ mod tests {
         must(builder.push_root(Root {
             node: fan_out,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -7043,6 +7201,7 @@ mod tests {
         cross_call.roots.push(Root {
             node: bindings[1],
             origin: cross_call.roots[0].origin,
+            presentation: RootPresentation::CanonicalValue,
         });
         cross_call.module.ranges.roots.count += 1;
         verify_error(cross_call, Invariant::AmbiguousOwnership);
@@ -7068,6 +7227,7 @@ mod tests {
         escaped.roots.push(Root {
             node: displaced,
             origin: escaped.roots[0].origin,
+            presentation: RootPresentation::CanonicalValue,
         });
         escaped.module.ranges.roots.count += 1;
         verify_error(escaped, Invariant::InconsistentResultMetadata);
@@ -7281,6 +7441,7 @@ mod tests {
         cross_binding.roots.push(Root {
             node: bindings[1],
             origin: cross_binding.roots[0].origin,
+            presentation: RootPresentation::CanonicalValue,
         });
         cross_binding.module.ranges.roots.count += 1;
         verify_error(cross_binding, Invariant::AmbiguousOwnership);

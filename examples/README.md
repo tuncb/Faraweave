@@ -13,6 +13,7 @@ in order and prints one result per line.
 | [`math-functions.faraweave`](math-functions.faraweave) | Host-math scalar and vector functions |
 | [`parameters.faraweave`](parameters.faraweave) | Declaring and using typed command-line inputs |
 | [`bindings.faraweave`](bindings.faraweave) | Naming an evaluate-once value and borrowing it from later expressions |
+| [`formatting.faraweave`](formatting.faraweave) | Typed value interpolation, escaped braces, and newline-free raw root output |
 | [`rewrite.faraweave`](rewrite.faraweave) | A compact tour of scalar and vector expressions |
 
 Run an example from the repository root:

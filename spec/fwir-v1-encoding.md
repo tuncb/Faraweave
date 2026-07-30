@@ -95,7 +95,7 @@ its specified record size. A known section appears at most once.
 | 13 | `BRAN` | `3` | 20 | fan-out branches |
 | 14 | `NODE` | `3` | 56 | executable nodes |
 | 15 | `OWNR` | `3` | 12 | logical ownership and release |
-| 16 | `ROOT` | `3` | 8 | ordered program roots |
+| 16 | `ROOT` | `3` | 8 through minor 4; 12 from minor 5 | ordered program roots and presentation |
 | 17 | `APPL` | `3` | 8 | explicit application plans |
 | 18 | `OPRF` | `3` | 16 | stable built-in operation references |
 | 32769 | `PROD` | `0` | 0 | optional producer metadata |
@@ -120,7 +120,8 @@ ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`,
 `4=FanOut`, `5=ApplicationPlans`, `6=OperationReferences`,
 `7=BackendNativeMathV1`, `8=ConnectedApplicationBindings`,
-`9=ImmutableBindings`, and `10=Strings`; zero is invalid. IDs 1 through 10 are semantic capabilities and
+`9=ImmutableBindings`, `10=Strings`, and `11=ValueFormatting`; zero is
+invalid. IDs 1 through 11 are semantic capabilities and
 MUST have class `0`: pairing a known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
 Feature 5 requires semantic minor 1 and physical format minor 1.
@@ -133,14 +134,16 @@ Feature 9 requires semantic minor 3 and physical format minor 3 and is present
 exactly when immutable source-binding nodes/accesses occur.
 Feature 10 requires semantic minor 4 and physical format minor 4 and is present
 exactly when a String type or value is used.
+Feature 11 requires semantic minor 5 and physical format minor 5 and is present
+exactly when a Format node or raw root presentation is used.
 
 `STRS` begins with `count:u32`, followed by `count` descriptors
 `offset:u32, length:u32`, followed by one concatenated byte area. Offsets are
 relative to the start of the byte area. Strings are unique and strictly
 increasing by unsigned UTF-8 byte sequence, descriptors cover the byte area
 contiguously from offset zero, and unused strings are forbidden. Source-unit
-diagnostic names, parameter names, and String constant payloads reference this
-pool by `u32` index.
+diagnostic names, parameter names, String constant payloads, and Format
+templates reference this pool by `u32` index.
 
 ### 4.3 Sources, parameters, types, and constants
 
@@ -207,7 +210,7 @@ placeholder_origin:u32, origin:u32`.
 Kinds are `1=Constant`, `2=ParameterBorrow`, `3=TupleConstruct`,
 `4=SelectedApply`, `5=PrefixSpreadPrepare`, `6=FanOut`, and
 `7=ConnectedBinding`, `8=Binding`, `9=BindingMove`, and
-`10=BindingBorrow`. Cardinality uses
+`10=BindingBorrow`, and `11=Format`. Cardinality uses
 the `EDGE` tags. Lift is `0` outside SelectedApply and otherwise `1=Scalar`,
 `2=Vector`, or `3=DynamicVector`; result-element scalar type is likewise zero
 outside SelectedApply.
@@ -228,10 +231,17 @@ outside SelectedApply.
   `4=ContainerScalar` and `5=ContainerVector` only under feature 5.
 - FanOut: `a0=branch_start`, `a1=branch_count`,
   `a2=keyword_origin`; `a3` through `a7` are zero.
+- Format: `a0=template_string`, `a1=template_origin`; `a2` through `a7`
+  are zero. The template is a canonical physical `STRS` index, not an
+  in-memory String-value-arena index.
 
 `OWNR` is `owner:u32, release_kind:u8, reserved[3], release_index:u32`.
-Release kind is `1=Node` or `2=Root`. `ROOT` is
-`node:u32, origin:u32`.
+Release kind is `1=Node` or `2=Root`. Before physical minor 5, `ROOT` is
+`node:u32, origin:u32` and reconstructs canonical-value presentation. From
+physical minor 5, `ROOT` is `node:u32, origin:u32, presentation:u8,
+reserved[3]`, where presentation is `1=CanonicalValue` or `2=RawString` and
+all reserved bytes are zero. RawString requires a scalar String result and
+feature 11.
 
 `APPL` is present exactly when feature 5 is present and at least one
 SelectedApply exists. Each record is `node:u32, application_plan_id:u16,
@@ -290,7 +300,7 @@ asserts provenance but conveys no trust.
 | `operation_references` | `OPRF` |
 | `branches` | `BRAN` |
 | `ownership` | `OWNR` |
-| `roots` | `ROOT` |
+| `roots` | `ROOT`; presentation reconstructs as canonical before physical 1.5 |
 
 No Rust discriminant, `usize`, native address, host path, struct bytes, or
 backend handle is serialized.
@@ -343,6 +353,9 @@ The physical format version and semantic contract version are separate.
 - Format minor 4 is emitted when feature 10 is present. Scalar-type tag 4 and
   String `CONS`/`COEL` pool references are invalid without feature 10,
   semantic 1.4, and physical 1.4.
+- Physical minor 5 uses twelve-byte `ROOT` records even when every presentation
+  tag is canonical. Format node tag 11 and raw root presentation require
+  feature 11 and semantic/physical 1.5.
 - `OPRF` records or feature `6=OperationReferences` require semantic version
   1.1 and physical format minor 1. Semantic 1.0/physical 1.0 artifacts cannot
   opt into that mandatory sidecar capability.
@@ -381,7 +394,8 @@ canonical v1.0 artifacts, while an accepted forward-minor artifact re-encodes
 as canonical v1.0 with advisory extensions omitted. A semantic 1.1 artifact
 using mandatory feature 5 re-encodes as canonical physical v1.1, and feature 8
 re-encodes as canonical physical v1.2; feature 9 re-encodes as canonical
-physical v1.3; feature 10 re-encodes as canonical physical v1.4.
+physical v1.3; feature 10 re-encodes as canonical physical v1.4; feature 11
+re-encodes as canonical physical v1.5.
 
 ## 8. Checked decoding and hostile lengths
 
@@ -407,7 +421,7 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known IDs 1 through 10), tag, boolean, optional sentinel, unused
+   class `1` on known IDs 1 through 11), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after
@@ -518,7 +532,7 @@ issue rather than treating this comparison as authorization.
 
 ## 12. Accepted product, producer, and security policy
 
-Physical formats 1.0 through 1.4 and semantic contracts 1.0 through 1.4, canonical
+Physical formats 1.0 through 1.5 and semantic contracts 1.0 through 1.5, canonical
 program-identity bytes, the `.fwir` extension, and the library and CLI
 spellings above are the stable FWIR v1 product contract. A compatible addition
 uses the same-major

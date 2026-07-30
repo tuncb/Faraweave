@@ -48,6 +48,12 @@ Lowering selects appended stable String operation identities, the canonical
 encoder interns literal payloads into `STRS`, and the shared interpreter keeps
 payload copying, resource admission, and cleanup explicit and fallible.
 
+Semantic/physical FWIR 1.5 adds feature 11 for structural value formatting.
+Lowering records a literal template and ordered interpolation edges in a
+`Format` node, while each root records canonical or raw String presentation;
+the interpreter measures before one result admission and the runner publishes
+the fully prepared root sequence atomically.
+
 `VerifiedProgram` is an in-process trust boundary, not a serialized ABI.
 Callers may build `RawProgram`, but only complete verification can construct a
 `VerifiedProgram`; decoding likewise returns nothing until physical checks and
