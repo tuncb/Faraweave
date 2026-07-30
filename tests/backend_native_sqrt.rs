@@ -5,22 +5,10 @@ use faraweave::{
     evaluate_expression_with_configuration,
 };
 
-const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+#[path = "support/backend_native.rs"]
+mod backend_native_support;
 
-fn double(source: &str) -> f64 {
-    match evaluate_expression(source).expect(source).value {
-        Value::Double(value) => value,
-        value => panic!("{source} returned {value:?}"),
-    }
-}
-
-fn order_key(bits: u64) -> u64 {
-    if bits >> 63 == 0 {
-        bits | (1_u64 << 63)
-    } else {
-        !bits
-    }
-}
+use backend_native_support::{CANONICAL_NAN_BITS, assert_finite_envelope, double};
 
 #[test]
 fn sqrt_uses_reserved_ids_double_selection_lifting_and_feature_seven() {
@@ -98,14 +86,7 @@ fn sqrt_special_values_finite_envelope_and_vectors_are_public_semantics() {
         ("sqrt[1e-300]", 1.0e-150_f64.to_bits()),
         ("sqrt[1e300]", 1.0e150_f64.to_bits()),
     ] {
-        let actual = double(source);
-        let actual_bits = actual.to_bits();
-        assert_eq!(actual_bits >> 63, reference_bits >> 63, "{source}");
-        assert!(actual.is_finite(), "{source}");
-        assert!(
-            order_key(actual_bits).abs_diff(order_key(reference_bits)) <= 1,
-            "{source}: actual={actual_bits:016x} reference={reference_bits:016x}"
-        );
+        assert_finite_envelope(source, reference_bits, 1, 0.0);
     }
 
     assert_eq!(
