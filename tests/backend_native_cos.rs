@@ -1,92 +1,28 @@
 use faraweave::{
     AllocationFailureInjection, Cardinality, Conversion, ErrorKind, EvaluationConfiguration,
-    ExecutionProfile, Feature, FwirDecodeErrorKind, FwirDecodeLimits, FwirEncodeOptions, Invariant,
-    LiftMode, NodeKind, ResourceErrorReason, ResourceLimits, ScalarType, Value, VerifyError,
-    compile_source_to_fwir, compile_source_to_verified_program, decode_fwir, emit_c_source,
-    encode_fwir, evaluate_expression, evaluate_expression_with_configuration,
-    evaluate_source_with_arguments,
+    ExecutionProfile, Feature, FwirEncodeOptions, LiftMode, NodeKind, ResourceErrorReason,
+    ResourceLimits, ScalarType, Value, compile_source_to_fwir, compile_source_to_verified_program,
+    evaluate_expression, evaluate_expression_with_configuration, evaluate_source_with_arguments,
 };
 
-const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+#[path = "support/backend_native.rs"]
+mod backend_native_support;
+
+use backend_native_support::{
+    CANONICAL_NAN_BITS, assert_backend_native_feature_required, assert_canonical_roundtrip, double,
+    order_key, selected_node,
+};
+
+const MAX_ULPS: u64 = 8;
 const MAX_ABSOLUTE_ERROR: f64 = 3.552_713_678_800_501e-15;
 
-fn double(source: &str) -> f64 {
-    match evaluate_expression(source).expect(source).value {
-        Value::Double(value) => value,
-        value => panic!("{source} returned {value:?}"),
-    }
-}
-
-fn order_key(bits: u64) -> u64 {
-    if bits >> 63 == 0 {
-        bits | (1_u64 << 63)
-    } else {
-        !bits
-    }
-}
-
 fn assert_finite_envelope(source: &str, reference_bits: u64) {
-    let actual = double(source);
-    let actual_bits = actual.to_bits();
-    let reference = f64::from_bits(reference_bits);
-    assert!(actual.is_finite(), "{source}");
-    assert_eq!(actual_bits >> 63, reference_bits >> 63, "{source}");
-    let ulps = order_key(actual_bits).abs_diff(order_key(reference_bits));
-    assert!(
-        ulps <= 8 || (actual - reference).abs() <= MAX_ABSOLUTE_ERROR,
-        "{source}: actual={actual_bits:016x} reference={reference_bits:016x}"
+    backend_native_support::assert_finite_envelope(
+        source,
+        reference_bits,
+        MAX_ULPS,
+        MAX_ABSOLUTE_ERROR,
     );
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-        bytes[offset + 4],
-        bytes[offset + 5],
-        bytes[offset + 6],
-        bytes[offset + 7],
-    ])
-}
-
-fn section(bytes: &[u8], wanted: u16) -> (usize, usize) {
-    for index in 0..read_u32(bytes, 20) as usize {
-        let entry = 32 + index * 24;
-        if read_u16(bytes, entry) == wanted {
-            return (
-                read_u64(bytes, entry + 8) as usize,
-                read_u64(bytes, entry + 16) as usize,
-            );
-        }
-    }
-    panic!("canonical artifact lacks section {wanted}");
-}
-
-fn cos_node(bytes: &[u8]) -> usize {
-    let (offset, length) = section(bytes, 14);
-    bytes[offset..offset + length]
-        .chunks_exact(56)
-        .position(|record| {
-            record[0] == 4
-                && u32::from_le_bytes([record[24], record[25], record[26], record[27]]) == 34
-        })
-        .map(|index| offset + index * 56)
-        .unwrap_or_else(|| panic!("canonical artifact lacks cos node"))
 }
 
 #[test]
@@ -384,74 +320,15 @@ fn cos_resources_failures_cleanup_and_diagnostics_are_exact() {
 fn cos_fwir_roundtrip_malformed_identities_and_version_are_checked() {
     let bytes = compile_source_to_fwir("cos[(0.0 1.0)]\n", &FwirEncodeOptions::default())
         .expect("cos artifact");
-    let decoded = decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode cos artifact");
-    assert_eq!(
-        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("re-encode cos artifact"),
-        bytes
+    assert_canonical_roundtrip(&bytes, "cos");
+
+    let node = selected_node(&bytes, 34, "cos");
+    backend_native_support::assert_identity_mismatches(
+        &bytes,
+        node,
+        &[(24, 33), (28, 58), (32, 58)],
+        "cos",
     );
-    assert_eq!(
-        decoded.as_raw().features,
-        vec![
-            Feature::StableSemanticIds.numeric(),
-            Feature::BackendNativeMathV1.numeric(),
-        ]
-    );
-
-    let node = cos_node(&bytes);
-    for (relative, replacement) in [(24, 33_u32), (28, 58), (32, 58)] {
-        let mut malformed = bytes.clone();
-        malformed[node + relative..node + relative + 4].copy_from_slice(&replacement.to_le_bytes());
-        let error = decode_fwir(&malformed, &FwirDecodeLimits::default())
-            .expect_err("mismatched cos identity");
-        assert_eq!(
-            error.kind,
-            FwirDecodeErrorKind::NonCanonicalRecord {
-                field: "semantic_id"
-            }
-        );
-        assert_eq!(usize::try_from(error.offset).ok(), Some(node + 24));
-        assert_eq!(error.section_id, Some(14));
-    }
-
-    let (feature_offset, feature_length) = section(&bytes, 2);
-    let feature = bytes[feature_offset..feature_offset + feature_length]
-        .chunks_exact(4)
-        .position(|record| read_u16(record, 0) == Feature::BackendNativeMathV1.numeric())
-        .map(|index| feature_offset + index * 4)
-        .expect("backend-native feature record");
-    let mut missing_feature = bytes.clone();
-    missing_feature[feature..feature + 2].copy_from_slice(&8_u16.to_le_bytes());
-    missing_feature[feature + 2] = 1;
-    let error = decode_fwir(&missing_feature, &FwirDecodeLimits::default())
-        .expect_err("missing backend-native feature");
-    assert!(matches!(
-        error.kind,
-        FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(ref malformed))
-            if malformed.invariant == Invariant::MissingFeature
-                && malformed.field == "backend_native_math_v1"
-    ));
-
-    let (module, _) = section(&bytes, 1);
-    let mut old_version = bytes.clone();
-    old_version[module + 2..module + 4].copy_from_slice(&0_u16.to_le_bytes());
-    let error = decode_fwir(&old_version, &FwirDecodeLimits::default())
-        .expect_err("semantic 1.0 cos artifact");
-    assert!(matches!(
-        error.kind,
-        FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(ref malformed))
-            if malformed.invariant == Invariant::UnsupportedVersion
-                && malformed.field == "semantic_version"
-    ));
-}
-
-#[test]
-fn cos_emitted_c_calls_math_h_cos_directly() {
-    let source = emit_c_source("cos[(0.0 1.0)]\n")
-        .expect("cos C emission")
-        .source;
-    assert!(source.contains("#include <math.h>"));
-    assert!(source.contains("result=cos(input);"));
-    assert!(source.contains("fw_set_double(out,fw_backend_native_cos(args[0].d))"));
-    assert!(source.contains("static int fw_kernel_59("));
-    assert!(source.contains("static int fw_impl_59("));
+    assert_backend_native_feature_required(&bytes);
+    backend_native_support::assert_semantic_minor_zero_rejected(&bytes, "cos");
 }

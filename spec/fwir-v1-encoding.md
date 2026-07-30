@@ -95,7 +95,7 @@ its specified record size. A known section appears at most once.
 | 13 | `BRAN` | `3` | 20 | fan-out branches |
 | 14 | `NODE` | `3` | 56 | executable nodes |
 | 15 | `OWNR` | `3` | 12 | logical ownership and release |
-| 16 | `ROOT` | `3` | 8 | ordered program roots |
+| 16 | `ROOT` | `3` | 8 through minor 4; 12 from minor 5 | ordered program roots and presentation |
 | 17 | `APPL` | `3` | 8 | explicit application plans |
 | 18 | `OPRF` | `3` | 16 | stable built-in operation references |
 | 32769 | `PROD` | `0` | 0 | optional producer metadata |
@@ -118,21 +118,32 @@ mandatory semantic feature and class `1` is optional advisory metadata.
 Current `VerifiedProgram.features` entries are emitted in strictly increasing
 ID order with class `0`; optional entries are not added to that vector.
 Current IDs are `1=StableSemanticIds`, `2=Tuples`, `3=PrefixSpread`,
-`4=FanOut`, `5=ApplicationPlans`, `6=OperationReferences`, and
-`7=BackendNativeMathV1`; zero is invalid. IDs 1 through 7 are semantic capabilities and
+`4=FanOut`, `5=ApplicationPlans`, `6=OperationReferences`,
+`7=BackendNativeMathV1`, `8=ConnectedApplicationBindings`,
+`9=ImmutableBindings`, `10=Strings`, and `11=ValueFormatting`; zero is
+invalid. IDs 1 through 11 are semantic capabilities and
 MUST have class `0`: pairing a known current ID with class `1` is a
 `NonCanonicalRecord` error rather than an advisory feature.
 Feature 5 requires semantic minor 1 and physical format minor 1.
 Feature 6 requires semantic minor 1 and physical format minor 1.
 Feature 7 requires semantic minor 1 but does not by itself raise the physical
 format minor.
+Feature 8 requires semantic minor 2 and physical format minor 2 and is present
+exactly when connected binding nodes/accesses occur.
+Feature 9 requires semantic minor 3 and physical format minor 3 and is present
+exactly when immutable source-binding nodes/accesses occur.
+Feature 10 requires semantic minor 4 and physical format minor 4 and is present
+exactly when a String type or value is used.
+Feature 11 requires semantic minor 5 and physical format minor 5 and is present
+exactly when a Format node or raw root presentation is used.
 
 `STRS` begins with `count:u32`, followed by `count` descriptors
 `offset:u32, length:u32`, followed by one concatenated byte area. Offsets are
 relative to the start of the byte area. Strings are unique and strictly
 increasing by unsigned UTF-8 byte sequence, descriptors cover the byte area
 contiguously from offset zero, and unused strings are forbidden. Source-unit
-diagnostic names and parameter names reference this pool by `u32` index.
+diagnostic names, parameter names, String constant payloads, and Format
+templates reference this pool by `u32` index.
 
 ### 4.3 Sources, parameters, types, and constants
 
@@ -143,15 +154,16 @@ declaration_origin:u32, name_origin:u32`.
 
 `TYPE` is `kind:u8, scalar_type:u8, reserved:u16, element_start:u32,
 element_count:u32`. Kinds are `1=Scalar`, `2=Vector`, and `3=Tuple`.
-`scalar_type` is `1=Bool`, `2=Int`, `3=Double`; tuple uses zero.
+`scalar_type` is `1=Bool`, `2=Int`, `3=Double`, `4=String`; tuple uses zero.
 `element_start` and `element_count` are zero except for Tuple. `TYEL` records
 are `type_index:u32`.
 
 `CONS` is `kind:u8, scalar_type:u8, reserved:u16, element_start:u32,
 element_count:u32, payload:u64`. Kinds are `1=Scalar` and `2=Vector`.
-Scalar uses zero element range and stores Bool, Int, or Double bits in
+Scalar uses zero element range and stores Bool, Int, Double, or String data in
 `payload`; Bool permits only `0` or `1`, Int uses the exact two's-complement
-`i64` bit pattern, and Double uses exact IEEE-754 bits. Vector uses zero
+`i64` bit pattern, Double uses exact IEEE-754 bits, and String uses a `STRS`
+index in the low 32 bits with the upper 32 bits zero. Vector uses zero
 payload and identifies its typed `COEL` range. `COEL` is
 `scalar_type:u8, reserved[3], payload:u64` with the same scalar payload rules.
 
@@ -163,8 +175,11 @@ payload and identifies its typed `COEL` range. `COEL` is
 `EDGE` is `producer:u32, argument_position:u32, access:u8,
 cardinality_kind:u8, conversion:u8, ownership:u8, access_index:u32,
 cardinality_length:u32, origin:u32`. Access is `1=WholeValue`,
-`2=TupleElement`, or `3=FanOutOperandBorrow`; only TupleElement uses
-`access_index`. Cardinality is `0=None`, `1=StaticScalar`,
+`2=TupleElement`, `3=FanOutOperandBorrow`, `4=ConnectedBindingWhole`, or
+`5=ConnectedBindingElement`, `6=BindingBorrowWhole`,
+`7=BindingBorrowElement`, or `8=BindingMove`. TupleElement,
+ConnectedBindingElement, and BindingBorrowElement use a zero-based
+`access_index`; the other accesses require zero. Cardinality is `0=None`, `1=StaticScalar`,
 `2=StaticVector`, or `3=DynamicVector`; only StaticVector uses
 `cardinality_length`. Conversion is `1=Identity` or
 `2=PromoteIntToDouble`. Ownership is `1=OwnedInput`,
@@ -193,28 +208,40 @@ placeholder_origin:u32, origin:u32`.
 | 24 | 32 | eight variant `u32` words `a0` through `a7` |
 
 Kinds are `1=Constant`, `2=ParameterBorrow`, `3=TupleConstruct`,
-`4=SelectedApply`, `5=PrefixSpreadPrepare`, and `6=FanOut`. Cardinality uses
+`4=SelectedApply`, `5=PrefixSpreadPrepare`, `6=FanOut`, and
+`7=ConnectedBinding`, `8=Binding`, `9=BindingMove`, and
+`10=BindingBorrow`, and `11=Format`. Cardinality uses
 the `EDGE` tags. Lift is `0` outside SelectedApply and otherwise `1=Scalar`,
 `2=Vector`, or `3=DynamicVector`; result-element scalar type is likewise zero
 outside SelectedApply.
 
 - Constant: `a0=constant`.
 - ParameterBorrow: `a0=parameter`.
-- TupleConstruct and PrefixSpreadPrepare: all variant words are zero.
+- TupleConstruct, PrefixSpreadPrepare, ConnectedBinding, BindingMove, and
+  BindingBorrow: all variant words are zero.
+- Binding: `a0=declaration_origin`, `a1=name_origin`, and
+  `a2=initializer_origin`; `a3` through `a7` are zero.
 - SelectedApply: `a0=primitive_id`, `a1=signature_id`,
   `a2=implementation_id`, `a3=primitive_origin`,
   `a4=static_anchor` (`NONE` when absent), `a5=dynamic_check_start`,
   `a6=dynamic_check_count`, and `a7=operation_reference_plus_one`. The last
-  field is zero for ordinary applications; `foldl` and `scanl` require feature
-  6 and store their zero-based `OPRF` index plus one. Stable semantic IDs fit `u16`,
+  field is zero for ordinary applications; `foldl`, `scanl`, and `filter`
+  require feature 6 and store their zero-based `OPRF` index plus one. Stable semantic IDs fit `u16`,
   so the upper 16 bits of `a0` through `a2` MUST be zero. Lift adds
   `4=ContainerScalar` and `5=ContainerVector` only under feature 5.
 - FanOut: `a0=branch_start`, `a1=branch_count`,
   `a2=keyword_origin`; `a3` through `a7` are zero.
+- Format: `a0=template_string`, `a1=template_origin`, and
+  `a2=keyword_origin`; `a3` through `a7` are zero. The template is a canonical
+  physical `STRS` index, not an in-memory String-value-arena index.
 
 `OWNR` is `owner:u32, release_kind:u8, reserved[3], release_index:u32`.
-Release kind is `1=Node` or `2=Root`. `ROOT` is
-`node:u32, origin:u32`.
+Release kind is `1=Node` or `2=Root`. Before physical minor 5, `ROOT` is
+`node:u32, origin:u32` and reconstructs canonical-value presentation. From
+physical minor 5, `ROOT` is `node:u32, origin:u32, presentation:u8,
+reserved[3]`, where presentation is `1=CanonicalValue` or `2=RawString` and
+all reserved bytes are zero. RawString requires a scalar String result from a
+Format node and feature 11.
 
 `APPL` is present exactly when feature 5 is present and at least one
 SelectedApply exists. Each record is `node:u32, application_plan_id:u16,
@@ -222,16 +249,23 @@ reserved:u16`; records cover every SelectedApply exactly once in ascending
 node order. Application-plan IDs are nonzero, fit `u16`, and must match the
 selected implementation's registry descriptor. A v1.0 artifact omits `APPL`
 and reconstructs the plan from its validated implementation identity.
+Application-plan ID 11 is the filter-only dynamic subset plan with
+operand-cardinality work admitted before exact result admission; its meaning
+is reconstructed from the stable selected identity and adds no new physical
+record field. Existing section layouts and canonical 1.0/1.1 bytes are
+unchanged.
 
 `OPRF` is `primitive_id:u16, signature_id:u16, implementation_id:u16,
 reserved:u16, origin:u32, reserved:u32`. Both reserved fields are zero.
 Verification requires the three IDs to identify one closed registered
 elementwise descriptor and requires `origin` to be in range; inconsistent or
 structural identities are malformed rather than runtime-dispatched by name.
-Every `foldl` or `scanl` SelectedApply links exactly one `OPRF` record through
-nonzero `NODE.a7`; the referenced descriptor must have the container element
-type as both parameter types and result type. Other applications require zero, and missing,
-out-of-range, structurally invalid, or type-incompatible links are malformed.
+Every `foldl`, `scanl`, or `filter` SelectedApply links exactly one `OPRF`
+record through nonzero `NODE.a7`. Fold and scan require the container element
+type as both parameter types and result type; filter requires one exact
+container-element parameter, Bool result, and a declared total pure predicate
+implementation. Other applications require zero, and missing, out-of-range,
+structurally invalid, or type-incompatible links are malformed.
 
 ### 4.6 Producer metadata
 
@@ -255,6 +289,7 @@ asserts provenance but conveys no trust.
 | `features` | mandatory-class `FEAT` records |
 | `source_units` | `SRCU` plus `STRS` |
 | `parameters` | `PARM` plus `STRS` |
+| `string_values` | canonical `STRS` entries referenced by String `CONS`/`COEL` payloads |
 | `types`, `type_elements` | `TYPE`, `TYEL` |
 | `constants`, `constant_elements` | `CONS`, `COEL` |
 | `nodes`, except the application-plan sidecar | `NODE` |
@@ -265,7 +300,7 @@ asserts provenance but conveys no trust.
 | `operation_references` | `OPRF` |
 | `branches` | `BRAN` |
 | `ownership` | `OWNR` |
-| `roots` | `ROOT` |
+| `roots` | `ROOT`; presentation reconstructs as canonical before physical 1.5 |
 
 No Rust discriminant, `usize`, native address, host path, struct bytes, or
 backend handle is serialized.
@@ -273,7 +308,9 @@ backend handle is serialized.
 ## 6. Canonical ordering and program identity
 
 Arena record order is the already-semantic `VerifiedProgram` order; an encoder
-MUST NOT sort, deduplicate, or renumber those records. Features are strictly
+MUST NOT sort, deduplicate, or renumber those records, except that names and
+String values share the canonical sorted, deduplicated `STRS` pool and their
+references are remapped accordingly. Features are strictly
 increasing by numeric ID, the string pool is sorted as specified above, and
 directory order is numeric section-ID order. These rules make repeated
 encoding byte-identical without relying on map iteration or native layout.
@@ -289,8 +326,8 @@ A UI MAY display a named cryptographic digest of those bytes, but the
 algorithm and spelling are not part of FWIR v1.
 
 Producer version, source digest, source filesystem path, compilation time,
-execution profile, resource limits, compiler choice, and target platform do
-not participate in identity. Diagnostic source-unit names and all origins do
+execution profile, resource limits, and target platform do not participate in
+identity. Diagnostic source-unit names and all origins do
 participate because they affect structured errors.
 
 ## 7. Version, feature, and extension compatibility
@@ -307,12 +344,24 @@ The physical format version and semantic contract version are separate.
   no greater than its supported minor.
 - Format minor 1 is emitted when feature 5 or feature 6 is present; either
   sidecar feature at format or semantic minor 0 is noncanonical/unsupported.
+- Format minor 2 is emitted when feature 8 is present. Connected-binding node
+  tag 7 and access tags 4/5 are invalid without feature 8, semantic 1.2, and
+  physical 1.2.
+- Format minor 3 is emitted when feature 9 is present. Binding node tags
+  8/9/10 and access tags 6/7/8 are invalid without feature 9, semantic 1.3,
+  and physical 1.3.
+- Format minor 4 is emitted when feature 10 is present. Scalar-type tag 4 and
+  String `CONS`/`COEL` pool references are invalid without feature 10,
+  semantic 1.4, and physical 1.4.
+- Physical minor 5 uses twelve-byte `ROOT` records even when every presentation
+  tag is canonical. Format node tag 11 and raw root presentation require
+  feature 11 and semantic/physical 1.5.
 - `OPRF` records or feature `6=OperationReferences` require semantic version
   1.1 and physical format minor 1. Semantic 1.0/physical 1.0 artifacts cannot
   opt into that mandatory sidecar capability.
-- A `foldl` or `scanl` SelectedApply requires feature 6, a nonzero in-range
-  `NODE.a7`, and one compatible stable reducer identity; other applications
-  require `NODE.a7=0`.
+- A `foldl`, `scanl`, or `filter` SelectedApply requires feature 6, a nonzero
+  in-range `NODE.a7`, and one compatible stable operation identity; other
+  applications require `NODE.a7=0`.
 - A lower format minor is accepted when the major matches and every required
   v1 section/record rule used by the artifact is supported.
 
@@ -343,7 +392,10 @@ feature; those forward-compatible bytes are not retained in
 `VerifiedProgram`. Decode-encode is therefore byte-identical for supported
 canonical v1.0 artifacts, while an accepted forward-minor artifact re-encodes
 as canonical v1.0 with advisory extensions omitted. A semantic 1.1 artifact
-using mandatory feature 5 re-encodes as canonical physical v1.1.
+using mandatory feature 5 re-encodes as canonical physical v1.1, and feature 8
+re-encodes as canonical physical v1.2; feature 9 re-encodes as canonical
+physical v1.3; feature 10 re-encodes as canonical physical v1.4; feature 11
+re-encodes as canonical physical v1.5.
 
 ## 8. Checked decoding and hostile lengths
 
@@ -369,7 +421,7 @@ deterministic physical-validation sequence:
 6. validate string descriptors, checked byte-area bounds, contiguity, UTF-8,
    uniqueness/order, total string bytes, and reference-use completeness;
 7. validate every reserved byte, feature ID/class pair (including rejecting
-   class `1` on known IDs 1 through 7), tag, boolean, optional sentinel, unused
+   class `1` on known IDs 1 through 11), tag, boolean, optional sentinel, unused
    variant word, and stable-ID width while decoding records in section and
    record order;
 8. reserve each destination vector with `try_reserve_exact`, copy only after
@@ -412,7 +464,7 @@ not part of the artifact.
   4,413-byte golden produced from one verified source program covering all 16
   semantic-1.0 sections, all six node opcodes, every graph sidecar, sorted
   strings, and exact binary64 payload bits. Operation-reference section 18 is
-  covered by constructed semantic-1.1 codec tests because no source consumer
+  covered by constructed semantic-1.1/1.2/1.3/1.4 codec tests because no source consumer
   exists in issue #38.
 
 Run:
@@ -453,15 +505,13 @@ The explicit CLI spellings are:
 faraweave compile-ir <source> -o <artifact.fwir>
 faraweave inspect-ir <artifact.fwir>
 faraweave run-ir <artifact.fwir> [-- <arguments...>]
-faraweave emit-c-ir <artifact.fwir> -o <output.c>
-faraweave build-ir <artifact.fwir> -o <executable> [--cc <compiler>]
 ```
 
 Commands never infer source versus FWIR from the extension. Every file
 publication is atomic, rejects input/output aliases, and preserves an existing
-destination on compile, decode, verify, format, C-compiler, or publication
-failure. Argument count and decoding begin only after a complete artifact has
-become a `VerifiedProgram`.
+destination on compile, decode, verify, format, or publication failure.
+Argument count and decoding begin only after a complete artifact has become a
+`VerifiedProgram`.
 
 ## 11. Alternatives and measurement decision
 
@@ -469,8 +519,8 @@ become a `VerifiedProgram`.
 selected format with canonical JSON and an explicit-schema Protocol Buffers
 wire model. The sectioned format is selected for bounded nonrecursive framing,
 exact fixed-width values, zero production/schema-runtime dependencies, and
-symmetric safe-Rust/strict-C11 implementation, not because it wins every size
-case. Protocol Buffers is smaller in all measured fixtures but its official
+straightforward checked safe-Rust implementation, not because it wins every
+size case. Protocol Buffers is smaller in all measured fixtures but its official
 [encoding rules](https://protobuf.dev/programming-guides/encoding/) do not
 guarantee field serialization order, requiring another canonicalization layer;
 canonical JSON is retained only as an inspection model because exact integer
@@ -482,7 +532,7 @@ issue rather than treating this comparison as authorization.
 
 ## 12. Accepted product, producer, and security policy
 
-Physical formats 1.0 and 1.1, semantic contracts 1.0 and 1.1, canonical
+Physical formats 1.0 through 1.5 and semantic contracts 1.0 through 1.5, canonical
 program-identity bytes, the `.fwir` extension, and the library and CLI
 spellings above are the stable FWIR v1 product contract. A compatible addition
 uses the same-major
@@ -504,9 +554,9 @@ features. Consumers reject unsupported mandatory semantics rather than
 guessing, defaulting, or redispatching by a source name.
 
 The decoder treats bytes as hostile, applies checked bounds and caller limits,
-and yields no backend input before complete verification. That is an
-input-safety boundary, not a sandbox: generated C, the selected C compiler,
-and native executables run with the invoking process's authority.
+and yields no interpreter input before complete verification. That is an
+input-safety boundary, not a sandbox: interpreter execution runs with the
+invoking process's authority.
 
 FWIR is not confidential or encrypted. Canonical bytes and inspection output
 can reveal diagnostic source names, literal constants, type and node graphs,

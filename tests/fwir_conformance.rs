@@ -3,9 +3,9 @@ use faraweave::{
     FwirDecodeLimits, FwirEncodeOptions, FwirProducerMetadata, Invariant, OperationReference,
     Origin, OriginPosition, OriginSpan, RawProgramBuilder, RecordKind, ResourceErrorReason,
     ResourceEventKind, SourceUnit, Value, VerifyError, compile_source_to_verified_program,
-    decode_fwir, emit_c_from_verified_program, encode_fwir,
-    evaluate_source_with_arguments_and_observer, evaluate_verified_program_with_arguments,
-    evaluate_verified_program_with_observer, inspect_fwir,
+    decode_fwir, encode_fwir, evaluate_source_with_arguments_and_observer,
+    evaluate_verified_program_with_arguments, evaluate_verified_program_with_observer,
+    inspect_fwir,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -463,6 +463,134 @@ fn canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral() {
 }
 
 #[test]
+fn immutable_binding_artifact_versions_tags_and_provenance_are_conformant() {
+    let program = compile_source_to_verified_program(
+        "let value = iota[3]\nsum[value]\n",
+        "binding-conformance.faraweave",
+    )
+    .expect("compile immutable binding");
+    let bytes =
+        encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode immutable binding");
+    assert_eq!(read_u16(&bytes, 8), 1);
+    assert_eq!(read_u16(&bytes, 10), 3);
+    let decoded =
+        decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode immutable binding");
+    assert_eq!(decoded.as_raw().module.semantic_minor, 3);
+    assert!(
+        decoded
+            .as_raw()
+            .features
+            .contains(&Feature::ImmutableBindings.numeric())
+    );
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("canonical reencode"),
+        bytes
+    );
+    let inspection = inspect_fwir(&decoded).expect("inspect immutable binding");
+    assert!(inspection.contains("id=9"));
+    assert!(inspection.contains("Binding {"));
+    assert!(inspection.contains("BindingBorrowWhole"));
+
+    let (_, features, feature_length) = section(&bytes, 2);
+    let feature_record = (0..feature_length / 4)
+        .find(|index| {
+            read_u16(&bytes, features + index * 4) == Feature::ImmutableBindings.numeric()
+        })
+        .map(|index| features + index * 4)
+        .expect("feature 9 record");
+    let binding_node = record_with_tag(&bytes, 14, 56, 8);
+    let (_, edges, edge_length) = section(&bytes, 11);
+    let binding_edge = (0..edge_length / 24)
+        .find(|index| matches!(bytes[edges + index * 24 + 8], 6..=8))
+        .map(|index| edges + index * 24)
+        .expect("binding access");
+
+    let mut missing_feature = bytes.clone();
+    put_u16(
+        &mut missing_feature,
+        feature_record,
+        Feature::ConnectedApplicationBindings.numeric(),
+    );
+    let missing_feature_error =
+        decode_fwir(&missing_feature, &FwirDecodeLimits::default()).expect_err("missing feature");
+    assert!(
+        matches!(
+            &missing_feature_error,
+            faraweave::FwirDecodeError {
+                kind: FwirDecodeErrorKind::NonCanonicalRecord { field: "access" },
+                ..
+            }
+        ),
+        "{missing_feature_error:?}"
+    );
+
+    let mut old_physical = bytes.clone();
+    put_u16(&mut old_physical, 10, 2);
+    assert!(matches!(
+        decode_fwir(&old_physical, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "feature_format_minor"
+            },
+            ..
+        })
+    ));
+
+    let mut old_semantics = bytes.clone();
+    let (_, module, _) = section(&old_semantics, 1);
+    put_u16(&mut old_semantics, module + 2, 2);
+    assert!(matches!(
+        decode_fwir(&old_semantics, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                faraweave::MalformedProgram {
+                    invariant: Invariant::UnsupportedVersion,
+                    ..
+                }
+            )),
+            ..
+        })
+    ));
+
+    let mut invalid_node = bytes.clone();
+    invalid_node[binding_node] = 11;
+    assert!(matches!(
+        decode_fwir(&invalid_node, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord { field: "kind" },
+            ..
+        })
+    ));
+
+    let mut invalid_access = bytes.clone();
+    invalid_access[binding_edge + 8] = 9;
+    assert!(matches!(
+        decode_fwir(&invalid_access, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord { field: "access" },
+            ..
+        })
+    ));
+
+    let mut invalid_provenance = bytes;
+    put_u32(&mut invalid_provenance, binding_node + 28, u32::MAX);
+    assert!(matches!(
+        decode_fwir(&invalid_provenance, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                faraweave::MalformedProgram {
+                    invariant: Invariant::IndexOutOfBounds,
+                    record: RecordKind::Node,
+                    field: "name_origin",
+                    ..
+                }
+            )),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn operation_reference_artifact_is_versioned_canonical_and_roundtrippable() {
     let bytes = operation_reference_artifact();
     assert_eq!(read_u16(&bytes, 8), 1);
@@ -503,6 +631,156 @@ fn operation_reference_artifact_is_versioned_canonical_and_roundtrippable() {
         encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("canonical OPRF reencode"),
         bytes
     );
+}
+
+#[test]
+fn canonical_string_1_4_artifact_and_mutations_are_conformant() {
+    let program = compile_source_to_verified_program(
+        "[\"é\" (\"a\" \"é\") equals[\"a\" \"a\"]]\n",
+        "string-conformance.faraweave",
+    )
+    .expect("compile String conformance program");
+    let bytes = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode String FWIR");
+    assert_eq!(read_u16(&bytes, 10), 4);
+    let decoded = decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode String FWIR");
+    assert_eq!(decoded.as_raw().module.semantic_minor, 4);
+    assert!(
+        decoded
+            .as_raw()
+            .features
+            .iter()
+            .any(|feature| *feature == Feature::Strings.numeric())
+    );
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("canonical String reencode"),
+        bytes
+    );
+
+    let (_, types, type_length) = section(&bytes, 6);
+    assert!(
+        bytes[types..types + type_length]
+            .chunks_exact(12)
+            .any(|record| record[1] == 4)
+    );
+    let (_, constants, constant_length) = section(&bytes, 8);
+    let scalar_index = bytes[constants..constants + constant_length]
+        .chunks_exact(20)
+        .position(|record| record[0] == 1 && record[1] == 4)
+        .expect("String scalar constant");
+    let scalar = constants + scalar_index * 20;
+    let (_, elements, element_length) = section(&bytes, 9);
+    assert!(
+        bytes[elements..elements + element_length]
+            .chunks_exact(12)
+            .any(|record| record[0] == 4)
+    );
+
+    let mut high_payload = bytes.clone();
+    put_u64(
+        &mut high_payload,
+        scalar + 12,
+        read_u64(&bytes, scalar + 12) | (1_u64 << 32),
+    );
+    assert!(matches!(
+        decode_fwir(&high_payload, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "scalar_payload"
+            },
+            ..
+        })
+    ));
+
+    let mut out_of_range = bytes.clone();
+    let string_count = read_u32(&bytes, section(&bytes, 3).1);
+    put_u64(&mut out_of_range, elements + 4, u64::from(string_count));
+    assert!(matches!(
+        decode_fwir(&out_of_range, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "string_index"
+            },
+            ..
+        })
+    ));
+
+    let (_, strings, _) = section(&bytes, 3);
+    let data = strings + 4 + read_u32(&bytes, strings) as usize * 8;
+    let mut invalid_utf8 = bytes.clone();
+    invalid_utf8[data] = 0xff;
+    assert!(matches!(
+        decode_fwir(&invalid_utf8, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::InvalidUtf8,
+            section_id: Some(3),
+            ..
+        })
+    ));
+
+    let (_, module, _) = section(&bytes, 1);
+    let mut old_semantic = bytes.clone();
+    put_u16(&mut old_semantic, module + 2, 3);
+    assert!(matches!(
+        decode_fwir(&old_semantic, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                faraweave::MalformedProgram {
+                    invariant: Invariant::UnsupportedVersion,
+                    ..
+                }
+            )),
+            ..
+        })
+    ));
+    let mut old_physical = bytes.clone();
+    put_u16(&mut old_physical, 10, 3);
+    assert!(matches!(
+        decode_fwir(&old_physical, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "feature_format_minor"
+            },
+            ..
+        })
+    ));
+
+    let (_, features, feature_length) = section(&bytes, 2);
+    let feature = bytes[features..features + feature_length]
+        .chunks_exact(4)
+        .position(|record| read_u16(record, 0) == Feature::Strings.numeric())
+        .expect("feature 10");
+    let mut missing_feature = bytes.clone();
+    put_u16(&mut missing_feature, features + feature * 4, 12);
+    missing_feature[features + feature * 4 + 2] = 1;
+    assert!(matches!(
+        decode_fwir(&missing_feature, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                faraweave::MalformedProgram {
+                    invariant: Invariant::MissingFeature,
+                    ..
+                }
+            )),
+            ..
+        })
+    ));
+
+    let (_, nodes, node_length) = section(&bytes, 14);
+    let selected = bytes[nodes..nodes + node_length]
+        .chunks_exact(56)
+        .position(|record| record[0] == 4)
+        .expect("String SelectedApply");
+    let mut wrong_identity = bytes;
+    put_u32(&mut wrong_identity, nodes + selected * 56 + 28, 15);
+    assert!(matches!(
+        decode_fwir(&wrong_identity, &FwirDecodeLimits::default()),
+        Err(faraweave::FwirDecodeError {
+            kind: FwirDecodeErrorKind::NonCanonicalRecord {
+                field: "semantic_id"
+            },
+            ..
+        })
+    ));
 }
 
 fn named_mutations() -> Vec<(&'static str, Vec<u8>)> {
@@ -1151,6 +1429,28 @@ fn operation_reference_mutations() -> Vec<MutationCase> {
         )
     })
     .collect()
+}
+
+#[test]
+fn filter_fwir_rejects_non_predicate_reference_identity_after_physical_decode() {
+    let program =
+        compile_source_to_verified_program("filter[@odd (1 2 3)]\n", "hostile-filter.faraweave")
+            .expect("compile filter artifact");
+    let mut bytes =
+        encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode filter artifact");
+    let (_, references, _) = section(&bytes, 18);
+    put_u16(&mut bytes, references, 1);
+    put_u16(&mut bytes, references + 2, 1);
+    put_u16(&mut bytes, references + 4, 1);
+    let error = decode_fwir(&bytes, &FwirDecodeLimits::default())
+        .expect_err("inc is not a declared total Int predicate");
+    assert!(matches!(
+        error.kind,
+        FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(ref malformed))
+            if malformed.invariant == Invariant::InvalidSemanticIdentity
+                && malformed.record == RecordKind::Node
+                && malformed.field == "operation_reference"
+    ));
 }
 
 fn targeted_mutations() -> Vec<MutationCase> {
@@ -1975,22 +2275,14 @@ fn unique_directory(name: &str) -> PathBuf {
 }
 
 #[test]
-fn every_public_artifact_consumer_verifies_before_arguments_or_backends() {
-    let directory = unique_directory("fwir-backend-gate");
+fn every_public_artifact_consumer_verifies_before_arguments_or_execution() {
+    let directory = unique_directory("fwir-interpreter-gate");
     fs::create_dir_all(&directory).expect("temporary directory");
     let malformed = directory.join("malformed.fwir");
-    let c_destination = directory.join("preserved.c");
-    let native_destination = directory.join(if cfg!(windows) {
-        "preserved.exe"
-    } else {
-        "preserved"
-    });
     let mut bytes = example_bytes("complete");
     let (_, roots, _) = section(&bytes, 16);
     put_u32(&mut bytes, roots, u32::MAX);
     fs::write(&malformed, bytes).expect("malformed artifact");
-    fs::write(&c_destination, b"preserve-c").expect("C sentinel");
-    fs::write(&native_destination, b"preserve-native").expect("native sentinel");
 
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_faraweave"));
     let commands = [
@@ -2000,20 +2292,6 @@ fn every_public_artifact_consumer_verifies_before_arguments_or_backends() {
             malformed.as_os_str().to_owned(),
             "--".into(),
             "not-an-argument".into(),
-        ],
-        vec![
-            "emit-c-ir".into(),
-            malformed.as_os_str().to_owned(),
-            "-o".into(),
-            c_destination.as_os_str().to_owned(),
-        ],
-        vec![
-            "build-ir".into(),
-            malformed.as_os_str().to_owned(),
-            "-o".into(),
-            native_destination.as_os_str().to_owned(),
-            "--cc".into(),
-            "compiler-must-not-run".into(),
         ],
     ];
     for arguments in commands {
@@ -2028,17 +2306,7 @@ fn every_public_artifact_consumer_verifies_before_arguments_or_backends() {
             "{:?}",
             output.stderr
         );
-        assert!(
-            !String::from_utf8_lossy(&output.stderr).contains("compiler-must-not-run"),
-            "{:?}",
-            output.stderr
-        );
     }
-    assert_eq!(fs::read(&c_destination).expect("C sentinel"), b"preserve-c");
-    assert_eq!(
-        fs::read(&native_destination).expect("native sentinel"),
-        b"preserve-native"
-    );
     fs::remove_dir_all(directory).expect("temporary cleanup");
 }
 
@@ -2078,7 +2346,7 @@ fn take_events() -> Vec<Event> {
 }
 
 #[test]
-fn source_memory_decoded_interpreter_c_resources_faults_and_cleanup_are_identical() {
+fn source_memory_and_decoded_interpreter_resources_faults_and_cleanup_are_identical() {
     let source = "parameters[n Int]\nfanout[iota[n] {inc[_]} {add[_ 10]}]\n";
     let memory = compile_source_to_verified_program(source, "corpus.fw").expect("source lowering");
     let canonical = encode_fwir(&memory, &FwirEncodeOptions::default()).expect("encode");
@@ -2098,13 +2366,6 @@ fn source_memory_decoded_interpreter_c_resources_faults_and_cleanup_are_identica
     .expect("decoded result");
     assert_eq!(memory_result, decoded_result);
     assert_eq!(memory_result.formatted, ["[(2 3 4) (11 12 13)]"]);
-    assert_eq!(
-        emit_c_from_verified_program(&memory, EvaluationConfiguration::default())
-            .expect("memory C"),
-        emit_c_from_verified_program(&decoded, EvaluationConfiguration::default())
-            .expect("decoded C")
-    );
-
     let arguments = [Value::Int(3)];
     let _ = take_events();
     let source_observed = evaluate_source_with_arguments_and_observer(
@@ -2201,6 +2462,10 @@ fn traceability_references_complete_executable_evidence_sets() {
         "compat-advisory-feature",
         "canonical-application-plans",
         "canonical-operation-references",
+        "canonical-connected-bindings",
+        "canonical-immutable-bindings",
+        "canonical-strings",
+        "value-formatting",
     ]);
     let behavioral_evidence = BTreeSet::from([
         ("header.section_count", "section-count-limit"),
@@ -2231,6 +2496,16 @@ fn traceability_references_complete_executable_evidence_sets() {
         ("canonical.byte_identity", "corpus-hash"),
         ("canonical.host_neutral", "corpus-host-neutral"),
         (
+            "formatting.feature_version",
+            "value-formatting-feature-version",
+        ),
+        ("formatting.node_template", "value-formatting-node-template"),
+        (
+            "formatting.root_presentation",
+            "value-formatting-root-presentation",
+        ),
+        ("formatting.roundtrip", "value-formatting-roundtrip"),
+        (
             "appl.feature_required",
             "application-plan-section-without-feature",
         ),
@@ -2255,8 +2530,22 @@ fn traceability_references_complete_executable_evidence_sets() {
             "oprf.canonical_roundtrip",
             "operation-reference-canonical-roundtrip",
         ),
+        ("binding.feature_required", "connected-binding-feature"),
+        ("binding.format_minor", "connected-binding-format-minor"),
+        ("binding.semantic_minor", "connected-binding-semantic-minor"),
+        ("binding.node_kind", "connected-binding-node-kind"),
+        ("binding.access_kind", "connected-binding-access-kind"),
+        ("user_binding.feature_required", "user-binding-feature"),
+        ("user_binding.format_minor", "user-binding-format-minor"),
+        ("user_binding.semantic_minor", "user-binding-semantic-minor"),
+        ("user_binding.node_kind", "user-binding-node-kind"),
+        ("user_binding.access_kind", "user-binding-access-kind"),
+        ("user_binding.provenance", "user-binding-provenance"),
+        ("strings.feature_version", "string-feature-version"),
+        ("strings.scalar_pool_reference", "string-scalar-reference"),
+        ("strings.vector_pool_reference", "string-vector-reference"),
+        ("strings.semantic_identity", "string-semantic-identity"),
         ("surfaces.source_memory_decoded", "differential-runtime"),
-        ("surfaces.c_native", "strict-native-journey"),
         (
             "surfaces.resources_faults_cleanup",
             "differential-resource-faults",
@@ -2304,6 +2593,8 @@ fn traceability_references_complete_executable_evidence_sets() {
         "node.",
         "appl.",
         "oprf.",
+        "binding.",
+        "user_binding.",
         "ownr.",
         "root.",
         "prod.",

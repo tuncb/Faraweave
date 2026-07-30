@@ -1,13 +1,26 @@
 use crate::{
-    Error, ErrorKind, ParameterErrorContext, ParameterErrorReason, ScalarType, SourceLocation,
-    SourceSpan, Value,
+    BindingErrorContext, BindingErrorReason, ConnectedApplicationErrorContext,
+    ConnectedApplicationErrorReason, Error, ErrorKind, ParameterErrorContext, ParameterErrorReason,
+    ScalarType, SourceLocation, SourceSpan, Value,
 };
+use std::cell::Cell;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Program {
     pub parameter_header: Option<SourceSpan>,
     pub parameters: Vec<Parameter>,
+    pub declarations: Vec<Declaration>,
     pub roots: Vec<Expr>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Declaration {
+    pub name: String,
+    pub initializer: Expr,
+    pub before_root: usize,
+    pub span: SourceSpan,
+    pub name_span: SourceSpan,
+    pub initializer_span: SourceSpan,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +45,20 @@ pub(crate) struct UnaryStep {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ConnectedTemplate {
+    pub name: String,
+    pub arguments: Vec<Expr>,
+    pub name_span: SourceSpan,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectedPlaceholder {
+    Whole,
+    Element(u32),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum ExprKind {
     Literal(Value),
     Vector(ScalarType, Vec<Value>),
@@ -45,7 +72,6 @@ pub(crate) enum ExprKind {
         leaf_span: SourceSpan,
         steps: Vec<UnaryStep>,
     },
-    Parameter(usize),
     OperationReference {
         name: String,
         name_span: SourceSpan,
@@ -56,10 +82,20 @@ pub(crate) enum ExprKind {
         arguments: Vec<Expr>,
         name_span: SourceSpan,
     },
+    Format {
+        raw: bool,
+        arguments: Vec<Expr>,
+        keyword_span: SourceSpan,
+    },
+    Connected {
+        templates: Vec<ConnectedTemplate>,
+        operand: Box<Expr>,
+    },
     UnresolvedName {
         name: String,
         name_span: SourceSpan,
     },
+    ConnectedPlaceholder(ConnectedPlaceholder),
     Placeholder,
     Fanout {
         operand: Box<Expr>,
@@ -76,12 +112,15 @@ pub(crate) enum CallSyntax {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TokenKind {
     Name,
+    Let,
     Bool,
     Int,
     Double,
+    String,
     BoolType,
     IntType,
     DoubleType,
+    StringType,
     LeftBracket,
     RightBracket,
     LeftParenthesis,
@@ -89,7 +128,10 @@ enum TokenKind {
     LeftBrace,
     RightBrace,
     Placeholder,
+    IndexedPlaceholder,
+    InvalidPlaceholder,
     At,
+    Equal,
     Space,
     Comment,
     Newline,
@@ -98,7 +140,7 @@ enum TokenKind {
     Invalid,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Token {
     kind: TokenKind,
     span: SourceSpan,
@@ -106,8 +148,65 @@ struct Token {
     value: Option<Value>,
 }
 
+thread_local! {
+    static PARSER_FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    static PARSER_ALLOCATION_ORDINAL: Cell<usize> = const { Cell::new(0) };
+}
+
+fn parser_allocation_attempt(location: SourceLocation) -> Result<(), Error> {
+    if cfg!(test) {
+        let ordinal = PARSER_ALLOCATION_ORDINAL.get();
+        PARSER_ALLOCATION_ORDINAL.set(ordinal.saturating_add(1));
+        if PARSER_FAIL_AT.get() == Some(ordinal) {
+            return Err(parser_allocation_error(location));
+        }
+    }
+    let _ = location;
+    Ok(())
+}
+
+fn parser_copy_string(value: &str, location: SourceLocation) -> Result<String, Error> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    parser_allocation_attempt(location)?;
+    let mut result = String::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| parser_allocation_error(location))?;
+    result.push_str(value);
+    Ok(result)
+}
+
+fn parser_clone_value(value: &Value, location: SourceLocation) -> Result<Value, Error> {
+    match value {
+        Value::Bool(value) => Ok(Value::Bool(*value)),
+        Value::Int(value) => Ok(Value::Int(*value)),
+        Value::Double(value) => Ok(Value::Double(*value)),
+        Value::String(value) => parser_copy_string(value, location).map(Value::String),
+        _ => value
+            .try_clone()
+            .map_err(|()| parser_allocation_error(location)),
+    }
+}
+
+impl Token {
+    fn try_clone(&self) -> Result<Self, Error> {
+        Ok(Self {
+            kind: self.kind,
+            span: self.span,
+            spelling: parser_copy_string(&self.spelling, self.span.begin)?,
+            value: self
+                .value
+                .as_ref()
+                .map(|value| parser_clone_value(value, self.span.begin))
+                .transpose()?,
+        })
+    }
+}
+
 pub(crate) fn parse(source: &str) -> Result<Program, Error> {
-    let tokens = tokenize(source);
+    let tokens = tokenize(source)?;
     if let Some(result) = parse_deep_singleton_tuple(&tokens) {
         return result;
     }
@@ -141,14 +240,27 @@ fn parse_prefix_chain(
     while tokens.get(index).map(|token| token.kind) == Some(TokenKind::Name)
         && tokens.get(index + 1).map(|token| token.kind) == Some(TokenKind::Space)
     {
-        names.push(tokens[index].clone());
+        if let Err(error) = parser_allocation_attempt(tokens[index].span.begin).and_then(|()| {
+            names
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(tokens[index].span.begin))
+        }) {
+            return Some(Err(error));
+        }
+        match tokens[index].try_clone() {
+            Ok(token) => names.push(token),
+            Err(error) => return Some(Err(error)),
+        }
         index += 2;
     }
     if names.len() < minimum_depth {
         return None;
     }
     let leaf_token = tokens.get(index)?;
-    let leaf = leaf_token.value.clone()?;
+    let leaf = match parser_clone_value(leaf_token.value.as_ref()?, leaf_token.span.begin) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(error)),
+    };
     index += 1;
     while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
         index += 1;
@@ -192,7 +304,17 @@ fn parse_bracket_chain(
     while tokens.get(index).map(|token| token.kind) == Some(TokenKind::Name)
         && tokens.get(index + 1).map(|token| token.kind) == Some(TokenKind::LeftBracket)
     {
-        names.push(tokens[index].clone());
+        if let Err(error) = parser_allocation_attempt(tokens[index].span.begin).and_then(|()| {
+            names
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(tokens[index].span.begin))
+        }) {
+            return Some(Err(error));
+        }
+        match tokens[index].try_clone() {
+            Ok(token) => names.push(token),
+            Err(error) => return Some(Err(error)),
+        }
         index += 2;
         while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
             index += 1;
@@ -208,7 +330,10 @@ fn parse_bracket_chain(
             "expected an expression",
         )));
     };
-    let leaf = leaf_token.value.clone()?;
+    let leaf = match parser_clone_value(leaf_token.value.as_ref()?, leaf_token.span.begin) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(error)),
+    };
     index += 1;
     let mut steps = Vec::new();
     if steps.try_reserve_exact(names.len()).is_err() {
@@ -295,6 +420,7 @@ fn single_root_unary_program(
     Program {
         parameter_header: None,
         parameters: Vec::new(),
+        declarations: Vec::new(),
         roots: vec![Expr {
             kind: ExprKind::UnaryChain {
                 leaf,
@@ -337,7 +463,10 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
             "expected an expression",
         )));
     };
-    let leaf = leaf_token.value.clone()?;
+    let leaf = match parser_clone_value(leaf_token.value.as_ref()?, leaf_token.span.begin) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(error)),
+    };
     index += 1;
     let mut closed = 0usize;
     let mut closing_end = leaf_token.span.end;
@@ -392,6 +521,7 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
     Some(Ok(Program {
         parameter_header: None,
         parameters: Vec::new(),
+        declarations: Vec::new(),
         roots: vec![Expr {
             kind: ExprKind::DeepTuple { depth, leaf },
             span,
@@ -400,11 +530,37 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
 }
 
 pub(crate) fn program_contains_tuple(program: &Program) -> bool {
-    program.roots.iter().any(expression_contains_tuple)
+    program
+        .declarations
+        .iter()
+        .any(|declaration| expression_contains_tuple(&declaration.initializer))
+        || program.roots.iter().any(expression_contains_tuple)
 }
 
 pub(crate) fn first_tuple_location(program: &Program) -> Option<SourceLocation> {
-    program.roots.iter().find_map(first_tuple_in_expression)
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            if let Some(location) =
+                first_tuple_in_expression(&program.declarations[declaration].initializer)
+            {
+                return Some(location);
+            }
+            declaration += 1;
+        }
+        if let Some(location) = program
+            .roots
+            .get(boundary)
+            .and_then(first_tuple_in_expression)
+        {
+            return Some(location);
+        }
+    }
+    None
 }
 
 fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
@@ -418,12 +574,22 @@ fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
         ExprKind::Fanout { operand, branches } => first_tuple_in_expression(operand)
             .or_else(|| branches.iter().find_map(first_tuple_in_expression))
             .or(Some(expression.span.begin)),
-        ExprKind::Call { arguments, .. } => arguments.iter().find_map(first_tuple_in_expression),
+        ExprKind::Call { arguments, .. } | ExprKind::Format { arguments, .. } => {
+            arguments.iter().find_map(first_tuple_in_expression)
+        }
+        ExprKind::Connected { templates, operand } => templates
+            .iter()
+            .flat_map(|template| &template.arguments)
+            .find_map(first_tuple_in_expression)
+            .or_else(|| match &operand.kind {
+                ExprKind::Tuple(elements) => elements.iter().find_map(first_tuple_in_expression),
+                _ => first_tuple_in_expression(operand),
+            }),
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. }
+        | ExprKind::ConnectedPlaceholder(_)
         | ExprKind::Placeholder => None,
     }
 }
@@ -432,17 +598,29 @@ fn expression_contains_tuple(expression: &Expr) -> bool {
     match &expression.kind {
         ExprKind::Tuple(_) | ExprKind::DeepTuple { .. } | ExprKind::Fanout { .. } => true,
         ExprKind::UnaryChain { .. } => false,
-        ExprKind::Call { arguments, .. } => arguments.iter().any(expression_contains_tuple),
+        ExprKind::Call { arguments, .. } | ExprKind::Format { arguments, .. } => {
+            arguments.iter().any(expression_contains_tuple)
+        }
+        ExprKind::Connected { templates, operand } => {
+            templates
+                .iter()
+                .flat_map(|template| &template.arguments)
+                .any(expression_contains_tuple)
+                || match &operand.kind {
+                    ExprKind::Tuple(elements) => elements.iter().any(expression_contains_tuple),
+                    _ => expression_contains_tuple(operand),
+                }
+        }
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. }
+        | ExprKind::ConnectedPlaceholder(_)
         | ExprKind::Placeholder => false,
     }
 }
 
-fn tokenize(source: &str) -> Vec<Token> {
+fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -450,18 +628,38 @@ fn tokenize(source: &str) -> Vec<Token> {
     while index < bytes.len() {
         let begin = location;
         let byte = bytes[index];
+        if byte == b'"' {
+            let (next_index, next_location, value, valid) =
+                tokenize_string_literal(source, index, location)?;
+            push_token(
+                &mut tokens,
+                if valid {
+                    TokenKind::String
+                } else {
+                    TokenKind::MalformedLiteral
+                },
+                begin,
+                next_location,
+                "",
+                value.map(Value::String),
+            )?;
+            index = next_index;
+            location = next_location;
+            continue;
+        }
         if matches!(byte, b' ' | b'\t') {
             while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
                 advance_ascii(&mut location);
                 index += 1;
             }
-            tokens.push(token(
+            push_token(
+                &mut tokens,
                 TokenKind::Space,
                 begin,
                 location,
                 &source[begin.offset - 1..location.offset - 1],
                 None,
-            ));
+            )?;
             continue;
         }
         if byte == b'#' {
@@ -474,7 +672,7 @@ fn tokenize(source: &str) -> Vec<Token> {
                 advance_ascii(&mut location);
                 index += 1;
             }
-            tokens.push(token(TokenKind::Comment, begin, location, "", None));
+            push_token(&mut tokens, TokenKind::Comment, begin, location, "", None)?;
             continue;
         }
         if byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) == Some(&b'\n')) {
@@ -487,7 +685,7 @@ fn tokenize(source: &str) -> Vec<Token> {
             }
             location.line += 1;
             location.column = 1;
-            tokens.push(token(TokenKind::Newline, begin, location, "", None));
+            push_token(&mut tokens, TokenKind::Newline, begin, location, "", None)?;
             continue;
         }
         if byte.is_ascii_lowercase() {
@@ -505,15 +703,37 @@ fn tokenize(source: &str) -> Vec<Token> {
                 "false" => (TokenKind::Bool, Some(Value::Bool(false))),
                 "inf" => (TokenKind::Double, Some(Value::Double(f64::INFINITY))),
                 "nan" => (TokenKind::Double, Some(Value::Double(f64::NAN))),
+                "let" => (TokenKind::Let, None),
                 _ => (TokenKind::Name, None),
             };
-            tokens.push(token(kind, begin, location, spelling, value));
+            push_token(&mut tokens, kind, begin, location, spelling, value)?;
             continue;
         }
         if byte == b'_' {
             advance_ascii(&mut location);
             index += 1;
-            tokens.push(token(TokenKind::Placeholder, begin, location, "_", None));
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                advance_ascii(&mut location);
+                index += 1;
+            }
+            let spelling = &source[begin.offset - 1..location.offset - 1];
+            let kind = if spelling == "_" {
+                TokenKind::Placeholder
+            } else {
+                let digits = &spelling[1..];
+                if !digits.is_empty()
+                    && digits.bytes().all(|digit| digit.is_ascii_digit())
+                    && !digits.starts_with('0')
+                    && digits.parse::<u32>().is_ok()
+                {
+                    TokenKind::IndexedPlaceholder
+                } else {
+                    TokenKind::InvalidPlaceholder
+                }
+            };
+            push_token(&mut tokens, kind, begin, location, spelling, None)?;
             continue;
         }
         if byte.is_ascii_uppercase() {
@@ -528,9 +748,10 @@ fn tokenize(source: &str) -> Vec<Token> {
                 "Bool" => TokenKind::BoolType,
                 "Int" => TokenKind::IntType,
                 "Double" => TokenKind::DoubleType,
+                "String" => TokenKind::StringType,
                 _ => TokenKind::Invalid,
             };
-            tokens.push(token(kind, begin, location, spelling, None));
+            push_token(&mut tokens, kind, begin, location, spelling, None)?;
             continue;
         }
         if byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.') {
@@ -543,13 +764,13 @@ fn tokenize(source: &str) -> Vec<Token> {
             }
             let spelling = &source[begin.offset - 1..location.offset - 1];
             let (kind, value) = parse_numeric(spelling);
-            tokens.push(token(kind, begin, location, spelling, value));
+            push_token(&mut tokens, kind, begin, location, spelling, value)?;
             continue;
         }
         if !byte.is_ascii() {
             advance_ascii(&mut location);
             index += 1;
-            tokens.push(token(TokenKind::Invalid, begin, location, "", None));
+            push_token(&mut tokens, TokenKind::Invalid, begin, location, "", None)?;
             continue;
         }
         let kind = match byte {
@@ -560,14 +781,107 @@ fn tokenize(source: &str) -> Vec<Token> {
             b'{' => TokenKind::LeftBrace,
             b'}' => TokenKind::RightBrace,
             b'@' => TokenKind::At,
+            b'=' => TokenKind::Equal,
             _ => TokenKind::Invalid,
         };
         advance_ascii(&mut location);
         index += 1;
         let spelling = &source[begin.offset - 1..location.offset - 1];
-        tokens.push(token(kind, begin, location, spelling, None));
+        push_token(&mut tokens, kind, begin, location, spelling, None)?;
     }
-    tokens
+    Ok(tokens)
+}
+
+fn tokenize_string_literal(
+    source: &str,
+    start: usize,
+    mut location: SourceLocation,
+) -> Result<(usize, SourceLocation, Option<String>, bool), Error> {
+    let mut index = start + 1;
+    advance_ascii(&mut location);
+    let mut output = String::new();
+    let bytes = source.as_bytes();
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            advance_ascii(&mut location);
+            return Ok((index + 1, location, Some(output), true));
+        }
+        if matches!(bytes[index], b'\n' | b'\r') {
+            return Ok((index, location, None, false));
+        }
+        if bytes[index] != b'\\' {
+            let Some(character) = source[index..].chars().next() else {
+                return Ok((index, location, None, false));
+            };
+            parser_allocation_attempt(location)?;
+            output
+                .try_reserve(character.len_utf8())
+                .map_err(|_| parser_allocation_error(location))?;
+            output.push(character);
+            let width = character.len_utf8();
+            index += width;
+            location.offset += width;
+            location.column += 1;
+            continue;
+        }
+        advance_ascii(&mut location);
+        index += 1;
+        let Some(escape) = bytes.get(index).copied() else {
+            return Ok((index, location, None, false));
+        };
+        let character = match escape {
+            b'"' => '"',
+            b'\\' => '\\',
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
+            b'0' => '\0',
+            b'u' => {
+                advance_ascii(&mut location);
+                index += 1;
+                if bytes.get(index) != Some(&b'{') {
+                    return Ok((index, location, None, false));
+                }
+                advance_ascii(&mut location);
+                index += 1;
+                let digits_start = index;
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| byte.is_ascii_hexdigit())
+                {
+                    advance_ascii(&mut location);
+                    index += 1;
+                }
+                if index == digits_start || bytes.get(index) != Some(&b'}') {
+                    return Ok((index, location, None, false));
+                }
+                let digits = &source[digits_start..index];
+                let Ok(value) = u32::from_str_radix(digits, 16) else {
+                    return Ok((index, location, None, false));
+                };
+                let Some(character) = char::from_u32(value) else {
+                    return Ok((index, location, None, false));
+                };
+                advance_ascii(&mut location);
+                index += 1;
+                parser_allocation_attempt(location)?;
+                output
+                    .try_reserve(character.len_utf8())
+                    .map_err(|_| parser_allocation_error(location))?;
+                output.push(character);
+                continue;
+            }
+            _ => return Ok((index, location, None, false)),
+        };
+        parser_allocation_attempt(location)?;
+        output
+            .try_reserve(character.len_utf8())
+            .map_err(|_| parser_allocation_error(location))?;
+        output.push(character);
+        advance_ascii(&mut location);
+        index += 1;
+    }
+    Ok((index, location, None, false))
 }
 
 fn advance_ascii(location: &mut SourceLocation) {
@@ -575,19 +889,26 @@ fn advance_ascii(location: &mut SourceLocation) {
     location.column += 1;
 }
 
-fn token(
+fn push_token(
+    tokens: &mut Vec<Token>,
     kind: TokenKind,
     begin: SourceLocation,
     end: SourceLocation,
     spelling: &str,
     value: Option<Value>,
-) -> Token {
-    Token {
+) -> Result<(), Error> {
+    parser_allocation_attempt(begin)?;
+    tokens
+        .try_reserve(1)
+        .map_err(|_| parser_allocation_error(begin))?;
+    let token = Token {
         kind,
         span: SourceSpan { begin, end },
-        spelling: spelling.to_owned(),
+        spelling: parser_copy_string(spelling, begin)?,
         value,
-    }
+    };
+    tokens.push(token);
+    Ok(())
 }
 
 fn parse_numeric(spelling: &str) -> (TokenKind, Option<Value>) {
@@ -695,6 +1016,7 @@ impl Parser {
         if self.is_name("parameters") {
             parameter_header = Some(self.parse_parameter_header()?);
         }
+        let mut declarations = Vec::new();
         let mut roots: Vec<Expr> = Vec::new();
         loop {
             self.skip_newlines_and_spaces();
@@ -704,14 +1026,24 @@ impl Parser {
             if self.is_name("parameters") {
                 let keyword = self
                     .peek()
-                    .cloned()
+                    .map(Token::try_clone)
+                    .transpose()?
                     .ok_or_else(|| self.eof_error("expected an expression"))?;
                 let (reason, related) = if let Some(header) = parameter_header {
                     (ParameterErrorReason::SecondParameterHeader, header)
                 } else {
                     (
                         ParameterErrorReason::ParameterHeaderAfterRoot,
-                        roots.first().map_or(keyword.span, |root| root.span),
+                        roots.first().map_or_else(
+                            || {
+                                declarations
+                                    .first()
+                                    .map_or(keyword.span, |declaration: &Declaration| {
+                                        declaration.span
+                                    })
+                            },
+                            |root| root.span,
+                        ),
                     )
                 };
                 return Err(parameter_syntax_error(
@@ -720,6 +1052,11 @@ impl Parser {
                     keyword.span,
                     Some(related),
                 ));
+            }
+            if self.peek_kind() == Some(TokenKind::Let) {
+                let declaration = self.parse_declaration(roots.len())?;
+                declarations.push(declaration);
+                continue;
             }
             let root = self.parse_expr(false)?;
             roots.push(root);
@@ -755,7 +1092,116 @@ impl Parser {
         Ok(Program {
             parameter_header,
             parameters: self.parameters,
+            declarations,
             roots,
+        })
+    }
+
+    fn parse_declaration(&mut self, before_root: usize) -> Result<Declaration, Error> {
+        let keyword = self
+            .take_kind(TokenKind::Let)
+            .ok_or_else(|| self.eof_error("expected 'let'"))?;
+        if self.take_kind(TokenKind::Space).is_none() {
+            return Err(binding_syntax_error(
+                self.peek()
+                    .map_or_else(|| self.insertion_span(), |token| token.span),
+                keyword.span,
+                None,
+                None,
+            ));
+        }
+        let Some(name) = self.take() else {
+            return Err(binding_syntax_error(
+                self.insertion_span(),
+                keyword.span,
+                None,
+                None,
+            ));
+        };
+        if name.kind != TokenKind::Name {
+            if matches!(
+                name.kind,
+                TokenKind::BoolType
+                    | TokenKind::IntType
+                    | TokenKind::DoubleType
+                    | TokenKind::StringType
+            ) || matches!(
+                name.spelling.as_str(),
+                "true" | "false" | "inf" | "nan" | "let"
+            ) {
+                return Err(binding_reserved_name_error(keyword.span, name.span));
+            }
+            return Err(binding_syntax_error(
+                name.span,
+                SourceSpan {
+                    begin: keyword.span.begin,
+                    end: name.span.end,
+                },
+                Some(name.span),
+                None,
+            ));
+        }
+        if self.take_kind(TokenKind::Space).is_none()
+            || self.take_kind(TokenKind::Equal).is_none()
+            || self.take_kind(TokenKind::Space).is_none()
+        {
+            return Err(binding_syntax_error(
+                self.peek()
+                    .map_or_else(|| self.insertion_span(), |token| token.span),
+                SourceSpan {
+                    begin: keyword.span.begin,
+                    end: name.span.end,
+                },
+                Some(name.span),
+                None,
+            ));
+        }
+        let initializer = self.parse_expr(false).map_err(|mut error| {
+            if error.binding.is_none()
+                && matches!(error.kind, ErrorKind::SyntaxError | ErrorKind::InvalidByte)
+            {
+                error.kind = ErrorKind::BindingError;
+                error.message =
+                    "malformed let declaration; expected 'let name = expression' on one logical line"
+                        .to_owned();
+                error.binding = BindingErrorContext::try_new(
+                    BindingErrorReason::MalformedDeclaration,
+                    Some(SourceSpan {
+                        begin: keyword.span.begin,
+                        end: error.span.map_or(name.span.end, |span| span.end),
+                    }),
+                    Some(name.span),
+                    error.span,
+                    None,
+                    None,
+                );
+            }
+            error
+        })?;
+        self.skip_spaces();
+        if !self.at_end() && !self.take_if(TokenKind::Newline) {
+            return Err(binding_syntax_error(
+                self.peek()
+                    .map_or_else(|| self.insertion_span(), |token| token.span),
+                SourceSpan {
+                    begin: keyword.span.begin,
+                    end: initializer.span.end,
+                },
+                Some(name.span),
+                Some(initializer.span),
+            ));
+        }
+        let span = SourceSpan {
+            begin: keyword.span.begin,
+            end: initializer.span.end,
+        };
+        Ok(Declaration {
+            name: name.spelling,
+            initializer_span: initializer.span,
+            initializer,
+            before_root,
+            span,
+            name_span: name.span,
         })
     }
 
@@ -918,12 +1364,22 @@ impl Parser {
         if allow_newline {
             self.skip_inside();
         }
+        let expression = self.parse_primary_expr()?;
+        if allow_newline && !has_immediate_connected_placeholder(&expression) {
+            Ok(expression)
+        } else {
+            self.parse_connected_tail(expression)
+        }
+    }
+
+    fn parse_primary_expr(&mut self) -> Result<Expr, Error> {
         let token = self
             .peek()
-            .cloned()
+            .map(Token::try_clone)
+            .transpose()?
             .ok_or_else(|| self.eof_error("expected an expression"))?;
         match token.kind {
-            TokenKind::Bool | TokenKind::Int | TokenKind::Double => {
+            TokenKind::Bool | TokenKind::Int | TokenKind::Double | TokenKind::String => {
                 self.index += 1;
                 Ok(Expr {
                     kind: ExprKind::Literal(
@@ -950,9 +1406,10 @@ impl Parser {
                     "scalar literal is outside its accepted range",
                 ))
             }
-            TokenKind::BoolType | TokenKind::IntType | TokenKind::DoubleType => {
-                self.parse_typed_empty()
-            }
+            TokenKind::BoolType
+            | TokenKind::IntType
+            | TokenKind::DoubleType
+            | TokenKind::StringType => self.parse_typed_empty(),
             TokenKind::LeftParenthesis => self.parse_vector(),
             TokenKind::LeftBracket => self.parse_tuple(),
             TokenKind::Name => self.parse_name_expr(),
@@ -964,10 +1421,33 @@ impl Parser {
                     span: token.span,
                 })
             }
-            TokenKind::Placeholder => Err(Error::at_span(
-                ErrorKind::SyntaxError,
+            TokenKind::Placeholder => {
+                self.index += 1;
+                Ok(Expr {
+                    kind: ExprKind::ConnectedPlaceholder(ConnectedPlaceholder::Whole),
+                    span: token.span,
+                })
+            }
+            TokenKind::IndexedPlaceholder if self.branch_depth == 0 => {
+                self.index += 1;
+                let index = token.spelling[1..].parse::<u32>().map_err(|_| {
+                    connected_placeholder_syntax_error(
+                        token.span,
+                        "connected placeholder index is outside the supported range",
+                    )
+                })?;
+                Ok(Expr {
+                    kind: ExprKind::ConnectedPlaceholder(ConnectedPlaceholder::Element(index)),
+                    span: token.span,
+                })
+            }
+            TokenKind::IndexedPlaceholder => Err(connected_placeholder_syntax_error(
                 token.span,
-                "fanout token is not valid in this position",
+                "indexed placeholders are not valid in fanout branches",
+            )),
+            TokenKind::InvalidPlaceholder => Err(connected_placeholder_syntax_error(
+                token.span,
+                "connected placeholder must be '_' or a one-based canonical '_n' form",
             )),
             TokenKind::Invalid => Err(Error::at_span(
                 ErrorKind::InvalidByte,
@@ -989,6 +1469,98 @@ impl Parser {
         }
     }
 
+    fn parse_connected_tail(&mut self, first: Expr) -> Result<Expr, Error> {
+        if !matches!(
+            &first.kind,
+            ExprKind::Call {
+                syntax: CallSyntax::Direct,
+                ..
+            }
+        ) || !self.has_horizontal_operand()
+        {
+            return Ok(first);
+        }
+
+        let begin = first.span.begin;
+        let mut templates = Vec::new();
+        let mut current = first;
+        loop {
+            let Expr {
+                kind:
+                    ExprKind::Call {
+                        name,
+                        syntax: CallSyntax::Direct,
+                        arguments,
+                        name_span,
+                    },
+                span,
+            } = current
+            else {
+                return Err(Error::at_span(
+                    ErrorKind::SyntaxError,
+                    current.span,
+                    "connected application template must be an adjacent bracket call",
+                ));
+            };
+            templates
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(span.begin))?;
+            templates.push(ConnectedTemplate {
+                name,
+                arguments,
+                name_span,
+                span,
+            });
+            self.skip_spaces();
+            let next = self.parse_primary_expr()?;
+            if matches!(
+                &next.kind,
+                ExprKind::Call {
+                    syntax: CallSyntax::Direct,
+                    ..
+                }
+            ) && self.has_horizontal_operand()
+            {
+                current = next;
+                continue;
+            }
+            let span = SourceSpan {
+                begin,
+                end: next.span.end,
+            };
+            return Ok(Expr {
+                kind: ExprKind::Connected {
+                    templates,
+                    operand: Box::new(next),
+                },
+                span,
+            });
+        }
+    }
+
+    fn has_horizontal_operand(&self) -> bool {
+        if !self.peek_kind().is_some_and(is_horizontal_trivia) {
+            return false;
+        }
+        let mut index = self.index;
+        while self
+            .tokens
+            .get(index)
+            .is_some_and(|token| is_horizontal_trivia(token.kind))
+        {
+            index += 1;
+        }
+        self.tokens.get(index).is_some_and(|token| {
+            !matches!(
+                token.kind,
+                TokenKind::Newline
+                    | TokenKind::RightParenthesis
+                    | TokenKind::RightBracket
+                    | TokenKind::RightBrace
+            )
+        })
+    }
+
     fn parse_typed_empty(&mut self) -> Result<Expr, Error> {
         let type_token = self.take().ok_or_else(|| self.eof_error("expected type"))?;
         let scalar_type = token_scalar_type(type_token.kind)
@@ -997,11 +1569,11 @@ impl Parser {
             return Err(Error::at_span(
                 ErrorKind::SyntaxError,
                 type_token.span,
-                "empty vector requires Bool(), Int(), or Double()",
+                "empty vector requires Bool(), Int(), Double(), or String()",
             ));
         }
         self.index += 1;
-        self.skip_comment_trivia();
+        self.skip_inside();
         let close = self
             .take()
             .ok_or_else(|| self.eof_error("missing closing delimiter"))?;
@@ -1034,7 +1606,7 @@ impl Parser {
                     begin: open.span.begin,
                     end: close.span.end,
                 },
-                "empty vector requires Bool(), Int(), or Double()",
+                "empty vector requires Bool(), Int(), Double(), or String()",
             ));
         }
         let mut values = Vec::new();
@@ -1080,6 +1652,10 @@ impl Parser {
                 ));
             }
             scalar_type = Some(element_type);
+            parser_allocation_attempt(token.span.begin)?;
+            values
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(token.span.begin))?;
             values.push(value);
             self.require_sibling_separator_or_close(TokenKind::RightParenthesis)?;
         }
@@ -1111,30 +1687,28 @@ impl Parser {
         if name.spelling == "fanout" {
             return self.parse_fanout(name);
         }
-        if let Some(position) = self
-            .parameters
-            .iter()
-            .position(|parameter| parameter.name == name.spelling)
-            && self.peek_kind() != Some(TokenKind::LeftBracket)
-        {
-            return Ok(Expr {
-                kind: ExprKind::Parameter(position),
-                span: name.span,
-            });
-        }
         if self.peek_kind() == Some(TokenKind::LeftBracket) {
             let _open = self.take().ok_or_else(|| self.eof_error("expected '['"))?;
             let mut arguments = Vec::new();
             loop {
                 self.skip_inside();
                 if let Some(close) = self.take_kind(TokenKind::RightBracket) {
-                    return Ok(Expr {
-                        kind: ExprKind::Call {
+                    let kind = if matches!(name.spelling.as_str(), "format" | "printf") {
+                        ExprKind::Format {
+                            raw: name.spelling == "printf",
+                            arguments,
+                            keyword_span: name.span,
+                        }
+                    } else {
+                        ExprKind::Call {
                             name: name.spelling,
                             syntax: CallSyntax::Direct,
                             arguments,
                             name_span: name.span,
-                        },
+                        }
+                    };
+                    return Ok(Expr {
+                        kind,
                         span: SourceSpan {
                             begin: name.span.begin,
                             end: close.span.end,
@@ -1145,7 +1719,9 @@ impl Parser {
                 self.require_sibling_separator_or_close(TokenKind::RightBracket)?;
             }
         }
-        if self.peek_kind() == Some(TokenKind::Space) {
+        if self.peek_kind() == Some(TokenKind::Space)
+            && crate::semantic_registry::primitive_from_name(&name.spelling).is_ok()
+        {
             self.skip_spaces();
             let argument = self.parse_expr(false)?;
             return Ok(Expr {
@@ -1165,6 +1741,7 @@ impl Parser {
             self.peek_kind(),
             None | Some(
                 TokenKind::Comment
+                    | TokenKind::Space
                     | TokenKind::Newline
                     | TokenKind::RightParenthesis
                     | TokenKind::RightBracket
@@ -1326,7 +1903,14 @@ impl Parser {
     }
 
     fn take(&mut self) -> Option<Token> {
-        let token = self.tokens.get(self.index).cloned()?;
+        let token = self.tokens.get_mut(self.index)?;
+        let empty = Token {
+            kind: TokenKind::Invalid,
+            span: token.span,
+            spelling: String::new(),
+            value: None,
+        };
+        let token = std::mem::replace(token, empty);
         self.index += 1;
         Some(token)
     }
@@ -1374,18 +1958,6 @@ impl Parser {
 
     fn skip_inside(&mut self) {
         self.skip_newlines_and_spaces();
-    }
-
-    fn skip_comment_trivia(&mut self) {
-        let mut index = self.index;
-        let mut saw_comment = false;
-        while let Some(token) = self.tokens.get(index).filter(|token| is_trivia(token.kind)) {
-            saw_comment |= token.kind == TokenKind::Comment;
-            index += 1;
-        }
-        if saw_comment {
-            self.index = index;
-        }
     }
 
     fn has_separator(&self) -> bool {
@@ -1455,8 +2027,34 @@ fn token_scalar_type(kind: TokenKind) -> Option<ScalarType> {
         TokenKind::BoolType => Some(ScalarType::Bool),
         TokenKind::IntType => Some(ScalarType::Int),
         TokenKind::DoubleType => Some(ScalarType::Double),
+        TokenKind::StringType => Some(ScalarType::String),
         _ => None,
     }
+}
+
+fn has_immediate_connected_placeholder(expression: &Expr) -> bool {
+    matches!(
+        &expression.kind,
+        ExprKind::Call {
+            syntax: CallSyntax::Direct,
+            arguments,
+            ..
+        } if arguments
+            .iter()
+            .any(|argument| matches!(argument.kind, ExprKind::ConnectedPlaceholder(_)))
+    )
+}
+
+fn connected_placeholder_syntax_error(span: SourceSpan, message: &'static str) -> Error {
+    let mut error = Error::at_span(ErrorKind::SyntaxError, span, message);
+    error.connected_application = Some(ConnectedApplicationErrorContext {
+        reason: ConnectedApplicationErrorReason::InvalidPlaceholder,
+        template_arity: 0,
+        supplied_width: 0,
+        template_span: span,
+        operand_span: span,
+    });
+    error
 }
 
 fn is_horizontal_trivia(kind: TokenKind) -> bool {
@@ -1465,6 +2063,49 @@ fn is_horizontal_trivia(kind: TokenKind) -> bool {
 
 fn is_trivia(kind: TokenKind) -> bool {
     is_horizontal_trivia(kind) || kind == TokenKind::Newline
+}
+
+fn binding_syntax_error(
+    primary_span: SourceSpan,
+    declaration_span: SourceSpan,
+    name_span: Option<SourceSpan>,
+    initializer_span: Option<SourceSpan>,
+) -> Error {
+    let mut error = Error::at_span(
+        ErrorKind::BindingError,
+        primary_span,
+        "malformed let declaration; expected 'let name = expression' on one logical line",
+    );
+    error.binding = BindingErrorContext::try_new(
+        BindingErrorReason::MalformedDeclaration,
+        Some(declaration_span),
+        name_span,
+        initializer_span,
+        None,
+        None,
+    );
+    error
+}
+
+fn binding_reserved_name_error(keyword_span: SourceSpan, name_span: SourceSpan) -> Error {
+    let declaration_span = SourceSpan {
+        begin: keyword_span.begin,
+        end: name_span.end,
+    };
+    let mut error = Error::at_span(
+        ErrorKind::BindingError,
+        name_span,
+        "binding name is reserved",
+    );
+    error.binding = BindingErrorContext::try_new(
+        BindingErrorReason::ReservedName,
+        Some(declaration_span),
+        Some(name_span),
+        None,
+        Some(name_span),
+        Some(name_span),
+    );
+    error
 }
 
 fn parameter_syntax_error(
@@ -1542,33 +2183,13 @@ fn syntactic_parameter_name(name: &str) -> bool {
 }
 
 fn reserved_parameter_name(name: &str) -> bool {
+    reserved_syntax_name(name) || crate::semantic_registry::primitive_from_name(name).is_ok()
+}
+
+pub(crate) fn reserved_syntax_name(name: &str) -> bool {
     matches!(
         name,
-        "true"
-            | "false"
-            | "inf"
-            | "nan"
-            | "parameters"
-            | "fanout"
-            | "inc"
-            | "dec"
-            | "neg"
-            | "abs"
-            | "add"
-            | "sub"
-            | "mul"
-            | "equals"
-            | "not_equals"
-            | "not"
-            | "and"
-            | "or"
-            | "odd"
-            | "even"
-            | "is_positive"
-            | "is_negative"
-            | "less_than"
-            | "greater_than"
-            | "iota"
+        "true" | "false" | "inf" | "nan" | "parameters" | "let" | "fanout" | "format" | "printf"
     )
 }
 
@@ -1584,11 +2205,27 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
                 first.get_or_insert(current.span);
                 owned_position |= owned;
             }
+            ExprKind::ConnectedPlaceholder(_) => {}
             ExprKind::Tuple(elements) => {
                 pending.extend(elements.iter().rev().map(|element| (element, true)));
             }
             ExprKind::Call { arguments, .. } => {
                 pending.extend(arguments.iter().rev().map(|argument| (argument, owned)));
+            }
+            ExprKind::Format { arguments, .. } => {
+                pending.extend(arguments.iter().rev().map(|argument| (argument, owned)));
+            }
+            ExprKind::Connected { templates, operand } => {
+                pending.push((operand, owned));
+                for template in templates.iter().rev() {
+                    pending.extend(
+                        template
+                            .arguments
+                            .iter()
+                            .rev()
+                            .map(|argument| (argument, owned)),
+                    );
+                }
             }
             ExprKind::Fanout { operand, branches } => {
                 pending.push((operand, owned));
@@ -1598,7 +2235,6 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
             | ExprKind::Vector(_, _)
             | ExprKind::DeepTuple { .. }
             | ExprKind::UnaryChain { .. }
-            | ExprKind::Parameter(_)
             | ExprKind::OperationReference { .. }
             | ExprKind::UnresolvedName { .. } => {}
         }
@@ -1609,6 +2245,58 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_with_failure(source: &str, fail_at: Option<usize>) -> (Result<Program, Error>, usize) {
+        PARSER_ALLOCATION_ORDINAL.set(0);
+        PARSER_FAIL_AT.set(fail_at);
+        let result = parse(source);
+        let attempts = PARSER_ALLOCATION_ORDINAL.get();
+        PARSER_FAIL_AT.set(None);
+        PARSER_ALLOCATION_ORDINAL.set(0);
+        (result, attempts)
+    }
+
+    #[test]
+    fn parser_reports_initial_and_later_allocation_refusals() {
+        let source = "[\"héllo\" (\"世界\" \"🦀\")]\n";
+        let (success, attempts) = parse_with_failure(source, None);
+        assert!(success.is_ok());
+        assert!(
+            attempts > 4,
+            "fixture must exercise several allocation sites"
+        );
+        for ordinal in [0, 1, attempts - 1] {
+            let (result, _) = parse_with_failure(source, Some(ordinal));
+            let error = result.expect_err("parser allocation refusal");
+            assert_eq!(error.kind, ErrorKind::ResourceError);
+            assert!(error.message.contains("allocation_unavailable"));
+        }
+    }
+
+    #[test]
+    fn token_clone_copies_string_payload_fallibly() {
+        let token = Token {
+            kind: TokenKind::String,
+            span: SourceSpan {
+                begin: SourceLocation::start(),
+                end: SourceLocation::start(),
+            },
+            spelling: "\"héllo\"".to_owned(),
+            value: Some(Value::String("héllo".to_owned())),
+        };
+        for ordinal in [0, 1] {
+            PARSER_ALLOCATION_ORDINAL.set(0);
+            PARSER_FAIL_AT.set(Some(ordinal));
+            let error = token.try_clone().expect_err("clone allocation refusal");
+            assert_eq!(error.kind, ErrorKind::ResourceError);
+        }
+        PARSER_ALLOCATION_ORDINAL.set(0);
+        PARSER_FAIL_AT.set(None);
+        let clone = token.try_clone().expect("fallible token clone");
+        assert_eq!(clone.spelling, token.spelling);
+        assert_eq!(clone.value, token.value);
+        PARSER_ALLOCATION_ORDINAL.set(0);
+    }
 
     fn quoted_fields(line: &str) -> Vec<String> {
         let mut fields = Vec::new();
@@ -1663,6 +2351,102 @@ mod tests {
         let program = parse(source).expect("valid program");
         assert_eq!(program.parameters.len(), 2);
         assert_eq!(program.roots.len(), 3);
+    }
+
+    #[test]
+    fn connected_applications_are_flat_right_associated_and_stop_at_list_boundaries() {
+        let program =
+            parse("add[10] mul[2] 20\ninc[add[1] 2]\n[add[1] 2]\n").expect("connected syntax");
+        let ExprKind::Connected { templates, operand } = &program.roots[0].kind else {
+            panic!("expected connected chain");
+        };
+        assert_eq!(
+            templates
+                .iter()
+                .map(|template| template.name.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "mul"]
+        );
+        assert!(matches!(operand.kind, ExprKind::Literal(Value::Int(20))));
+
+        let ExprKind::Call { arguments, .. } = &program.roots[1].kind else {
+            panic!("bracket sibling list must retain its direct call");
+        };
+        assert_eq!(arguments.len(), 2);
+        assert!(matches!(
+            arguments[0].kind,
+            ExprKind::Call {
+                syntax: CallSyntax::Direct,
+                ..
+            }
+        ));
+        let ExprKind::Tuple(elements) = &program.roots[2].kind else {
+            panic!("tuple sibling list must remain a tuple");
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(
+            elements[0].kind,
+            ExprKind::Call {
+                syntax: CallSyntax::Direct,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn connected_application_requires_horizontal_operand_input() {
+        let program = parse("add[10]# line end\n20\nadd[10]# eof").expect("three roots");
+        assert_eq!(program.roots.len(), 3);
+        assert!(
+            program
+                .roots
+                .iter()
+                .all(|root| { !matches!(root.kind, ExprKind::Connected { .. }) })
+        );
+        let explicit = parse("add[_] 20\ninc[add[1 _] 2]\n[add[1 _] 2]\n")
+            .expect("explicit placeholders disambiguate connected siblings");
+        assert!(matches!(explicit.roots[0].kind, ExprKind::Connected { .. }));
+        let ExprKind::Call { arguments, .. } = &explicit.roots[1].kind else {
+            panic!("outer call");
+        };
+        assert!(matches!(arguments[0].kind, ExprKind::Connected { .. }));
+        let ExprKind::Tuple(elements) = &explicit.roots[2].kind else {
+            panic!("outer tuple");
+        };
+        assert!(matches!(elements[0].kind, ExprKind::Connected { .. }));
+    }
+
+    #[test]
+    fn connected_placeholder_tokens_are_canonical_and_contextual() {
+        let parsed = parse("sub[_2 _1] [1 2]\n").expect("indexed placeholders");
+        let ExprKind::Connected { templates, .. } = &parsed.roots[0].kind else {
+            panic!("connected");
+        };
+        assert!(matches!(
+            templates[0].arguments[0].kind,
+            ExprKind::ConnectedPlaceholder(ConnectedPlaceholder::Element(2))
+        ));
+        for source in ["add[_0] 1", "add[_01] 1", "add[_4294967296] 1", "add[_x] 1"] {
+            let error = parse(source).expect_err(source);
+            assert_eq!(error.kind, ErrorKind::SyntaxError, "{source}");
+            assert_eq!(
+                error
+                    .connected_application
+                    .as_ref()
+                    .map(|context| context.reason),
+                Some(ConnectedApplicationErrorReason::InvalidPlaceholder),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_tuple_location_follows_interleaved_source_order() {
+        let program = parse("[1]\nlet value = [2]\nvalue\n").expect("program");
+        assert_eq!(
+            first_tuple_location(&program).map(|location| location.offset),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1780,7 +2564,7 @@ mod tests {
     #[test]
     fn tokenizes_utf8_comments_without_retaining_their_text() {
         let source = "1# café\r\n2#終";
-        let tokens = tokenize(source);
+        let tokens = tokenize(source).expect("tokenize");
         assert_eq!(
             tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
             vec![
@@ -1831,13 +2615,16 @@ mod tests {
     }
 
     #[test]
-    fn typed_empty_vectors_accept_comment_trivia_and_preserve_close_diagnostics() {
+    fn typed_empty_vectors_accept_all_trivia_and_preserve_failure_diagnostics() {
         for (source, expected_type) in [
+            ("Bool( )", ScalarType::Bool),
+            ("Int(\n)", ScalarType::Int),
+            ("Double(\t\r\n)", ScalarType::Double),
             ("Bool(# LF\n)", ScalarType::Bool),
             ("Int( # CRLF\r\n )", ScalarType::Int),
-            ("Double(\n# UTF-8 🦀\n)", ScalarType::Double),
+            ("Double(\t\n# UTF-8 🦀\r\n \t)", ScalarType::Double),
         ] {
-            let program = parse(source).expect("commented typed empty");
+            let program = parse(source).expect("typed empty with trivia");
             let root = program.roots.first().expect("typed empty root");
             match &root.kind {
                 ExprKind::Vector(actual_type, values) => {
@@ -1850,15 +2637,17 @@ mod tests {
             assert_eq!(root.span.end.offset, source.len() + 1);
         }
 
-        let eof_source = "Int(# no close";
-        let eof_error = parse(eof_source).expect_err("commented typed empty missing close");
-        assert_eq!(eof_error.kind, ErrorKind::SyntaxError);
-        assert_eq!(eof_error.message, "missing closing delimiter");
-        let eof_span = eof_error.span.expect("missing close insertion span");
-        assert_eq!(eof_span.begin.offset, eof_source.len() + 1);
-        assert_eq!(eof_span.begin, eof_span.end);
+        for eof_source in ["Int(\t\n", "Int(# no close"] {
+            let eof_error = parse(eof_source).expect_err("typed empty missing close");
+            assert_eq!(eof_error.kind, ErrorKind::SyntaxError);
+            assert_eq!(eof_error.message, "missing closing delimiter");
+            let eof_span = eof_error.span.expect("missing close insertion span");
+            assert_eq!(eof_span.begin.offset, eof_source.len() + 1);
+            assert_eq!(eof_span.begin, eof_span.end);
+        }
 
-        let invalid_close = parse("Bool(# comment\r\n]").expect_err("invalid typed empty close");
+        let invalid_close =
+            parse("Bool(\t# comment\r\n]").expect_err("mismatched typed empty close");
         assert_eq!(invalid_close.kind, ErrorKind::SyntaxError);
         assert_eq!(
             invalid_close.message,
@@ -1868,15 +2657,15 @@ mod tests {
         assert_eq!(invalid_span.begin.offset, 1);
         assert_eq!(invalid_span.end.offset, 5);
 
-        let whitespace_only = parse("Int( )").expect_err("whitespace-only typed empty");
-        assert_eq!(whitespace_only.kind, ErrorKind::SyntaxError);
+        let invalid_content = parse("Double(\n 1.0 )").expect_err("typed empty scalar content");
+        assert_eq!(invalid_content.kind, ErrorKind::SyntaxError);
         assert_eq!(
-            whitespace_only.message,
+            invalid_content.message,
             "vector elements must be scalar literals"
         );
-        let whitespace_span = whitespace_only.span.expect("whitespace type span");
-        assert_eq!(whitespace_span.begin.offset, 1);
-        assert_eq!(whitespace_span.end.offset, 4);
+        let invalid_content_span = invalid_content.span.expect("invalid content type span");
+        assert_eq!(invalid_content_span.begin.offset, 1);
+        assert_eq!(invalid_content_span.end.offset, 7);
     }
 
     #[test]

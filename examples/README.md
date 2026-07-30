@@ -10,8 +10,10 @@ in order and prints one result per line.
 | [`tuples.faraweave`](tuples.faraweave) | Heterogeneous and nested tuples, plus one-level tuple spreading |
 | [`fanout.faraweave`](fanout.faraweave) | Reusing one operand across several left-to-right branches |
 | [`reductions.faraweave`](reductions.faraweave) | Numeric and Boolean reductions, folds, and seed-inclusive scans |
-| [`math-functions.faraweave`](math-functions.faraweave) | Backend-native scalar and vector math |
+| [`math-functions.faraweave`](math-functions.faraweave) | Host-math scalar and vector functions |
 | [`parameters.faraweave`](parameters.faraweave) | Declaring and using typed command-line inputs |
+| [`bindings.faraweave`](bindings.faraweave) | Naming an evaluate-once value and borrowing it from later expressions |
+| [`formatting.faraweave`](formatting.faraweave) | Typed value interpolation, escaped braces, and newline-free raw root output |
 | [`rewrite.faraweave`](rewrite.faraweave) | A compact tour of scalar and vector expressions |
 
 Run an example from the repository root:
@@ -27,5 +29,11 @@ order. The `--` separates program arguments from Faraweave's own options:
 cargo run -- run examples/parameters.faraweave -- 4 2.5 true
 ```
 
-Faraweave source does not have comment syntax, so explanations live here rather
-than inside the runnable files.
+In Faraweave source, `#` begins a line comment. The checked-in runnable files
+remain concise, with longer explanations here.
+
+UTF-8 strings can be tried directly without another example file:
+
+```faraweave
+["Málaga café" length["aé🦀"] sort[("é" "alpha" "")]]
+```

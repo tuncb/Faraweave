@@ -32,6 +32,7 @@ pub enum ErrorKind {
     SyntaxError,
     UnknownPrimitive,
     ParameterError,
+    BindingError,
     TypeError,
     EmptyExpression,
     ArityError,
@@ -45,7 +46,6 @@ pub enum ErrorKind {
     FormattingError,
     OutputError,
     FileError,
-    NativeBuildError,
 }
 
 impl ErrorKind {
@@ -57,6 +57,7 @@ impl ErrorKind {
             Self::SyntaxError => "SyntaxError",
             Self::UnknownPrimitive => "UnknownPrimitive",
             Self::ParameterError => "ParameterError",
+            Self::BindingError => "BindingError",
             Self::TypeError => "TypeError",
             Self::EmptyExpression => "EmptyExpression",
             Self::ArityError => "ArityError",
@@ -70,7 +71,6 @@ impl ErrorKind {
             Self::FormattingError => "FormattingError",
             Self::OutputError => "OutputError",
             Self::FileError => "file error",
-            Self::NativeBuildError => "native build",
         }
     }
 }
@@ -150,6 +150,48 @@ pub struct ArgumentErrorContext {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectedApplicationErrorReason {
+    MissingCompletion,
+    SurplusCompletion,
+    AmbiguousCompletion,
+    AlreadyComplete,
+    EmptyTupleOperand,
+    RuntimeTupleOperand,
+    InvalidPlaceholder,
+    PlaceholderOutsideTemplate,
+    NestedPlaceholder,
+    MissingOperand,
+    PlaceholderIndexOutOfRange,
+}
+
+impl ConnectedApplicationErrorReason {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MissingCompletion => "missing_completion",
+            Self::SurplusCompletion => "surplus_completion",
+            Self::AmbiguousCompletion => "ambiguous_completion",
+            Self::AlreadyComplete => "already_complete",
+            Self::EmptyTupleOperand => "empty_tuple_operand",
+            Self::RuntimeTupleOperand => "runtime_tuple_operand",
+            Self::InvalidPlaceholder => "invalid_placeholder",
+            Self::PlaceholderOutsideTemplate => "placeholder_outside_template",
+            Self::NestedPlaceholder => "nested_placeholder",
+            Self::MissingOperand => "missing_operand",
+            Self::PlaceholderIndexOutOfRange => "placeholder_index_out_of_range",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectedApplicationErrorContext {
+    pub reason: ConnectedApplicationErrorReason,
+    pub template_arity: usize,
+    pub supplied_width: usize,
+    pub template_span: SourceSpan,
+    pub operand_span: SourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParameterErrorReason {
     SecondParameterHeader,
     ParameterHeaderAfterRoot,
@@ -173,6 +215,84 @@ pub struct ParameterErrorContext {
     pub related_span: Option<SourceSpan>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingErrorReason {
+    MalformedDeclaration,
+    DuplicateName,
+    ReservedName,
+    Shadowing,
+    UnknownName,
+    ForwardReference,
+    SelfReference,
+    UnusedBinding,
+    MultipleOwnershipEscape,
+    UseAfterMove,
+}
+
+impl BindingErrorReason {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MalformedDeclaration => "malformed_declaration",
+            Self::DuplicateName => "duplicate_name",
+            Self::ReservedName => "reserved_name",
+            Self::Shadowing => "shadowing",
+            Self::UnknownName => "unknown_name",
+            Self::ForwardReference => "forward_reference",
+            Self::SelfReference => "self_reference",
+            Self::UnusedBinding => "unused_binding",
+            Self::MultipleOwnershipEscape => "multiple_ownership_escape",
+            Self::UseAfterMove => "use_after_move",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindingErrorContext {
+    fields: Vec<BindingErrorContextFields>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindingErrorContextFields {
+    pub reason: BindingErrorReason,
+    pub declaration_span: Option<SourceSpan>,
+    pub name_span: Option<SourceSpan>,
+    pub initializer_span: Option<SourceSpan>,
+    pub reference_span: Option<SourceSpan>,
+    pub related_span: Option<SourceSpan>,
+}
+
+impl BindingErrorContext {
+    pub(crate) fn try_new(
+        reason: BindingErrorReason,
+        declaration_span: Option<SourceSpan>,
+        name_span: Option<SourceSpan>,
+        initializer_span: Option<SourceSpan>,
+        reference_span: Option<SourceSpan>,
+        related_span: Option<SourceSpan>,
+    ) -> Option<Self> {
+        let mut fields = Vec::new();
+        fields.try_reserve_exact(1).ok()?;
+        fields.push(BindingErrorContextFields {
+            reason,
+            declaration_span,
+            name_span,
+            initializer_span,
+            reference_span,
+            related_span,
+        });
+        Some(Self { fields })
+    }
+}
+
+impl std::ops::Deref for BindingErrorContext {
+    type Target = BindingErrorContextFields;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields[0]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Error {
     pub kind: ErrorKind,
@@ -190,7 +310,9 @@ pub struct Error {
     pub resource: Option<ResourceErrorContext>,
     pub domain: Option<DomainErrorContext>,
     pub argument: Option<ArgumentErrorContext>,
+    pub connected_application: Option<ConnectedApplicationErrorContext>,
     pub parameter: Option<ParameterErrorContext>,
+    pub binding: Option<BindingErrorContext>,
     pub usage: Option<ResourceUsage>,
 }
 
@@ -212,7 +334,9 @@ impl Error {
             resource: None,
             domain: None,
             argument: None,
+            connected_application: None,
             parameter: None,
+            binding: None,
             usage: None,
         }
     }
@@ -252,4 +376,8 @@ impl fmt::Display for LocatedError {
     }
 }
 
-impl std::error::Error for LocatedError {}
+impl std::error::Error for LocatedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}

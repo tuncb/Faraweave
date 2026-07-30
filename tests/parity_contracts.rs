@@ -1,12 +1,132 @@
 use faraweave::{
-    AllocationFailureInjection, CompilerConfiguration, DomainErrorReason, ErrorKind,
-    EvaluationConfiguration, ExecutionProfile, NativePlatform, ResourceLimits, ScalarType,
-    SourceLocation, Type, Value, evaluate_expression, evaluate_expression_with_configuration,
-    evaluate_source, format_type, format_value, select_c_compiler,
+    AllocationFailureInjection, ConnectedApplicationErrorReason, DomainErrorReason, ErrorKind,
+    EvaluationConfiguration, ExecutionProfile, ResourceLimits, ScalarType, SourceLocation, Type,
+    Value, evaluate_expression, evaluate_expression_with_configuration, evaluate_source,
+    format_type, format_value,
 };
+use std::fmt::Write as _;
 
 fn formatted(source: &str) -> String {
     format_value(&evaluate_expression(source).expect(source).value).expect("format")
+}
+
+#[test]
+fn utf8_strings_literals_vectors_operations_and_diagnostics_are_exact() {
+    let cases = [
+        ("\"\"", "\"\""),
+        ("\"Málaga café\"", "\"Málaga café\""),
+        (
+            "\"quote:\\\" slash:\\\\ line:\\n nul:\\0 \\u{1f980}\"",
+            "\"quote:\\\" slash:\\\\ line:\\n nul:\\0 🦀\"",
+        ),
+        ("String()", "()"),
+        ("(\"é\" \"alpha\" \"z\")", "(\"é\" \"alpha\" \"z\")"),
+        ("equals[(\"é\" \"e\") \"é\"]", "(true false)"),
+        ("not_equals[\"é\" (\"é\" \"e\")]", "(false true)"),
+        ("less_than[(\"z\" \"alpha\") \"é\"]", "(true true)"),
+        ("greater_than[\"é\" (\"z\" \"é\")]", "(true false)"),
+        ("length[\"aé🦀\"]", "3"),
+        ("length[(\"a\" \"bb\")]", "2"),
+        (
+            "sort[(\"é\" \"alpha\" \"z\" \"\")]",
+            "(\"\" \"alpha\" \"z\" \"é\")",
+        ),
+        (
+            "[\"x\" (\"a\" \"b\") [\"nul\\0\" true]]",
+            "[\"x\" (\"a\" \"b\") [\"nul\\0\" true]]",
+        ),
+        ("fanout[\"é\" {length[_]} {equals[_ \"é\"]}]", "[1 true]"),
+        ("equals [\"é\" \"é\"]", "true"),
+        (
+            "let word = \"é\"\nlet words = (\"z\" \"é\")\n[equals[word \"é\"] sort[words] word]",
+            "[true (\"z\" \"é\") \"é\"]",
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    for source in [
+        "add[\"a\" \"b\"]",
+        "sum[(\"a\" \"b\")]",
+        "foldl[@equals \"a\" (\"a\")]",
+        "length[[\"a\"]]",
+    ] {
+        assert_eq!(
+            evaluate_source(source).expect_err(source).kind,
+            ErrorKind::TypeError
+        );
+    }
+    let shape = evaluate_source("equals[(\"a\" \"b\") (\"a\")]").expect_err("shape");
+    assert_eq!(shape.kind, ErrorKind::ShapeMismatch);
+    assert_eq!(shape.argument_position, Some(2));
+}
+
+#[test]
+fn utf8_string_parameters_are_raw_exact_and_typed_api_matches_source() {
+    let source = "parameters[name String]\n[name length[name] equals[name \"Málaga café\"]]\n";
+    let result = faraweave::evaluate_source_with_arguments(
+        source,
+        &[Value::String("Málaga café".to_owned())],
+        EvaluationConfiguration::default(),
+    )
+    .expect("String argument");
+    assert_eq!(
+        result.values,
+        vec![Value::Tuple(
+            vec![
+                Value::String("Málaga café".to_owned()),
+                Value::Int(11),
+                Value::Bool(true),
+            ]
+            .into()
+        )]
+    );
+
+    let typed = faraweave::evaluate_source_with_arguments(
+        "parameters[value String]\nvalue\n",
+        &[Value::String(String::new())],
+        EvaluationConfiguration::default(),
+    )
+    .expect("empty String argument");
+    assert_eq!(typed.values, vec![Value::String(String::new())]);
+}
+
+#[test]
+fn utf8_string_literal_failures_have_exact_byte_spans() {
+    for (source, expected_end) in [
+        ("\"unterminated", 14),
+        ("\"bad\\x\"", 6),
+        ("\"surrogate\\u{d800}\"", 18),
+        ("\"too-large\\u{110000}\"", 20),
+        ("\"raw\nnewline\"", 5),
+        ("\"empty-unicode\\u{}\"", 18),
+    ] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::MalformedLiteral, "{source}");
+        let span = error.span.expect("literal span");
+        assert_eq!(span.begin.offset, 1, "{source}");
+        assert_eq!(span.end.offset, expected_end, "{source}");
+    }
+}
+
+#[test]
+fn many_short_string_literals_parse_without_retaining_source_sized_capacities() {
+    let mut source = String::new();
+    source.push('(');
+    for index in 0..2_048 {
+        if index != 0 {
+            source.push(' ');
+        }
+        source.push_str("\"a\"");
+    }
+    source.push(')');
+    let result = evaluate_expression(&source).expect("many short String literals");
+    let Value::StringVector(values) = result.value else {
+        panic!("expected String vector");
+    };
+    assert_eq!(values.len(), 2_048);
+    assert!(values.iter().all(|value| value == "a"));
 }
 
 #[test]
@@ -51,6 +171,20 @@ fn s16_empty_singleton_promotion_and_shape_contracts() {
     assert_eq!(formatted("div[(7) 2]"), "(3)");
     let div_shape = evaluate_expression("div[(1) (0 1)]").expect_err("shape before domain");
     assert_eq!(div_shape.kind, ErrorKind::ShapeMismatch);
+}
+
+#[test]
+fn typed_empty_trivia_evaluates_with_its_declared_vector_type() {
+    for (source, expected) in [
+        ("Bool( \t)", Value::BoolVector(Vec::new())),
+        ("Int(\n)", Value::IntVector(Vec::new())),
+        (
+            "Double(\t# mixed trivia\r\n )",
+            Value::DoubleVector(Vec::new()),
+        ),
+    ] {
+        assert_eq!(evaluate_expression(source).expect(source).value, expected);
+    }
 }
 
 #[test]
@@ -502,6 +636,139 @@ fn sum_double_is_left_to_right_strict_and_preserves_special_value_bits() {
         };
         assert_eq!(value.to_bits(), expected_bits, "{source}");
     }
+}
+
+#[test]
+fn filter_is_stable_typed_and_exact_for_every_allowed_predicate() {
+    for (source, expected) in [
+        ("filter[@not Bool()]", "()"),
+        ("filter[@not (true)]", "()"),
+        ("filter[@not (false)]", "(false)"),
+        ("filter[@not (true false false true)]", "(false false)"),
+        ("filter[@odd Int()]", "()"),
+        ("filter[@odd (2)]", "()"),
+        ("filter[@odd (1)]", "(1)"),
+        ("filter[@odd (1 2 3 4 5)]", "(1 3 5)"),
+        ("filter[@even (-3 -2 -1 0 1 2 3)]", "(-2 0 2)"),
+        (
+            "filter[@is_positive (-9223372036854775808 -1 0 1 9223372036854775807)]",
+            "(1 9223372036854775807)",
+        ),
+        (
+            "filter[@is_negative (-9223372036854775808 -1 0 1 9223372036854775807)]",
+            "(-9223372036854775808 -1)",
+        ),
+        (
+            "filter[@is_positive (-inf -2.0 -0.0 0.0 3.0 inf nan)]",
+            "(3.0 inf)",
+        ),
+        (
+            "filter[@is_negative (-inf -2.0 -0.0 0.0 3.0 inf nan)]",
+            "(-inf -2.0)",
+        ),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+
+    let result = evaluate_expression("filter[@is_negative (-inf -1.5 -0.0 0.0 1.5 inf nan)]")
+        .expect("exact double filter");
+    let Value::DoubleVector(values) = result.value else {
+        panic!("filter did not return Double vector");
+    };
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [f64::NEG_INFINITY.to_bits(), (-1.5_f64).to_bits(),]
+    );
+
+    for (count, expected) in [(0, Vec::new()), (1, vec![1]), (5, vec![1, 3, 5])] {
+        let dynamic = faraweave::evaluate_source_with_arguments(
+            "parameters[n Int]\nfilter[@odd iota[n]]\n",
+            &[Value::Int(count)],
+            EvaluationConfiguration::default(),
+        )
+        .expect("dynamic filter");
+        assert_eq!(
+            dynamic.values,
+            [Value::IntVector(expected)],
+            "count {count}"
+        );
+    }
+}
+
+#[test]
+fn filter_rejects_invalid_references_and_non_vectors_at_static_spans() {
+    for (source, kind, primitive, message) in [
+        (
+            "filter[@missing (1 2)]",
+            ErrorKind::UnknownPrimitive,
+            "missing",
+            "@missing is not a registered built-in operation",
+        ),
+        (
+            "filter[@equals (1 2)]",
+            ErrorKind::ArityError,
+            "equals",
+            "@equals referenced operation has incompatible arity",
+        ),
+        (
+            "filter[@inc (1 2)]",
+            ErrorKind::TypeError,
+            "inc",
+            "@inc referenced operation has no compatible signature",
+        ),
+        (
+            "filter[@filter (1 2)]",
+            ErrorKind::TypeError,
+            "filter",
+            "@filter referenced operation has unsupported structural behavior",
+        ),
+        (
+            "filter[@odd (1.0 2.0)]",
+            ErrorKind::TypeError,
+            "odd",
+            "@odd referenced operation has no compatible signature",
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some(primitive), "{source}");
+        assert_eq!(error.message, message, "{source}");
+        assert_eq!(error.location.line, 1, "{source}");
+        assert_eq!(error.location.column, 9, "{source}");
+        let span = error.span.expect("operation reference name span");
+        assert_eq!(span.begin.column, 9, "{source}");
+    }
+
+    for (source, expected_column, actual) in [
+        ("filter[@odd 1]", 13, Type::Scalar(ScalarType::Int)),
+        (
+            "filter[@not [true false]]",
+            13,
+            Type::Tuple(vec![
+                Type::Scalar(ScalarType::Bool),
+                Type::Scalar(ScalarType::Bool),
+            ]),
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::TypeError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("filter"), "{source}");
+        assert_eq!(error.argument_position, Some(2), "{source}");
+        assert_eq!(error.location.column, expected_column, "{source}");
+        assert_eq!(error.actual_types, [actual], "{source}");
+    }
+
+    let value_reference =
+        evaluate_expression("filter[1 (1 2)]").expect_err("predicate must use reference syntax");
+    assert_eq!(value_reference.kind, ErrorKind::TypeError);
+    assert_eq!(value_reference.location.column, 8);
+    assert_eq!(
+        value_reference.message,
+        "filter argument 1 must be a built-in operation reference"
+    );
 }
 
 #[test]
@@ -1054,6 +1321,135 @@ fn tup_structural_format_spread_and_direct_preservation() {
 }
 
 #[test]
+fn connected_completion_scalar_vector_tuple_chain_and_boundaries_are_exact() {
+    for (source, expected) in [
+        ("add[10] 20", "30"),
+        ("add[] [10 20]", "30"),
+        ("add[10] (20 30)", "(30 40)"),
+        ("add[10] mul[2] 20", "50"),
+        ("foldl[@add 0] (1 2 3)", "6"),
+        ("foldl[] [@add 0 (1 2 3)]", "6"),
+        ("filter[@odd] (1 2 3 4)", "(1 3)"),
+        ("filter[] [@odd (1 2 3 4)]", "(1 3)"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+    let parameterized = faraweave::evaluate_source_with_arguments(
+        "parameters[x Int]\nadd[] [x 2]\n",
+        &[Value::Int(3)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("authored parameter element remains statically available");
+    assert_eq!(parameterized.values, [Value::Int(5)]);
+
+    for source in ["inc[add[1] 2]", "[add[1] 2]"] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::ArityError, "{source}");
+        assert_eq!(error.primitive.as_deref(), Some("add"), "{source}");
+        assert!(error.connected_application.is_none(), "{source}");
+    }
+    assert_eq!(formatted("inc[_] 20"), "21");
+}
+
+#[test]
+fn connected_placeholders_bind_once_select_reorder_and_span_every_operand_kind() {
+    for (source, expected) in [
+        ("add[10 _] 20", "30"),
+        ("add[_] [10 20]", "30"),
+        ("sub[_2 _1] [1 2]", "1"),
+        ("mul[_1 _1] (2 3)", "(4 9)"),
+        ("inc[add[1 _] 2]", "4"),
+        ("[add[1 _] 2]", "[3]"),
+        ("add[10 _1] 20", "30"),
+        ("add[_2 _1] [1 2.5]", "3.5"),
+        ("sum[_] (1 2 3)", "6"),
+        ("add[_] fanout[1 {add[_ 9]} {add[_ 19]}]", "30"),
+    ] {
+        assert_eq!(formatted(source), expected, "{source}");
+    }
+    let parameterized = faraweave::evaluate_source_with_arguments(
+        "parameters[left Int right Int]\nsub[_2 _1] [left right]\n",
+        &[Value::Int(1), Value::Int(2)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("parameter tuple operand");
+    assert_eq!(parameterized.values, [Value::Int(1)]);
+}
+
+#[test]
+fn connected_placeholder_failures_are_structured_and_fanout_stays_distinct() {
+    for (source, reason) in [
+        (
+            "add[_2 1] 2",
+            ConnectedApplicationErrorReason::PlaceholderIndexOutOfRange,
+        ),
+        (
+            "add[_] []",
+            ConnectedApplicationErrorReason::EmptyTupleOperand,
+        ),
+        (
+            "add[[_]] 1",
+            ConnectedApplicationErrorReason::NestedPlaceholder,
+        ),
+        ("add[_]", ConnectedApplicationErrorReason::MissingOperand),
+        (
+            "_1",
+            ConnectedApplicationErrorReason::PlaceholderOutsideTemplate,
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(
+            error
+                .connected_application
+                .as_ref()
+                .map(|context| context.reason),
+            Some(reason),
+            "{source}: {error:?}"
+        );
+    }
+    assert_eq!(formatted("fanout[2 {inc[_]} {mul[_ 3]}]"), "[3 6]");
+}
+
+#[test]
+fn connected_completion_negative_contract_is_structured() {
+    for (source, reason) in [
+        (
+            "add[] 1",
+            ConnectedApplicationErrorReason::MissingCompletion,
+        ),
+        (
+            "inc[] [1 2]",
+            ConnectedApplicationErrorReason::SurplusCompletion,
+        ),
+        (
+            "add[1 2] 3",
+            ConnectedApplicationErrorReason::AlreadyComplete,
+        ),
+        (
+            "add[] []",
+            ConnectedApplicationErrorReason::EmptyTupleOperand,
+        ),
+        (
+            "add[] fanout[1 {inc[_]} {inc[_]}]",
+            ConnectedApplicationErrorReason::RuntimeTupleOperand,
+        ),
+    ] {
+        let error = evaluate_expression(source).expect_err(source);
+        assert_eq!(
+            error
+                .connected_application
+                .as_ref()
+                .map(|context| context.reason),
+            Some(reason),
+            "{source}"
+        );
+    }
+    let incomplete = evaluate_expression("add[10]").expect_err("no callable partial value");
+    assert_eq!(incomplete.kind, ErrorKind::ArityError);
+    assert!(incomplete.connected_application.is_none());
+}
+
+#[test]
 fn fan_stable_id_matrix() {
     assert_eq!(formatted("fanout[1 {inc[_]}]"), "[2]");
     assert_eq!(
@@ -1148,6 +1544,24 @@ fn deep_unary_programs_use_iterative_parse_analysis_and_evaluation() {
     let span = error.span.expect("deep syntax error span");
     assert_eq!(span.begin.offset, bracketed.len() + 1);
     assert_eq!(span.begin, span.end);
+
+    let mut connected = String::with_capacity(DEPTH * 6 + 1);
+    for _ in 0..DEPTH {
+        connected.push_str("inc[] ");
+    }
+    connected.push('1');
+    let evaluated = evaluate_expression(&connected).expect("4,000-deep connected program");
+    assert_eq!(evaluated.value, Value::Int(4_001));
+    assert_eq!(evaluated.usage.work_units, DEPTH);
+
+    let mut explicit = String::with_capacity(DEPTH * 7 + 1);
+    for _ in 0..DEPTH {
+        explicit.push_str("inc[_] ");
+    }
+    explicit.push('1');
+    let evaluated = evaluate_expression(&explicit).expect("4,000-deep explicit connected program");
+    assert_eq!(evaluated.value, Value::Int(4_001));
+    assert_eq!(evaluated.usage.work_units, DEPTH);
 }
 
 #[test]
@@ -1241,34 +1655,282 @@ fn typed_public_api_parameter_contract() {
 }
 
 #[test]
-fn native_compiler_selection_is_explicit_then_environment_then_platform() {
-    let explicit = select_c_compiler(
-        Some("explicit compiler"),
-        Some("environment compiler"),
-        NativePlatform::GccLike,
+fn immutable_bindings_borrow_many_and_evaluate_through_verified_fwir() {
+    let source =
+        "let values = iota[4]\nlet doubled = mul[values 2]\nsum[doubled]\nlength[values]\n";
+    let source_result = evaluate_source(source).expect("source bindings");
+    assert_eq!(source_result.values, vec![Value::Int(20), Value::Int(4)]);
+
+    let bytes = faraweave::compile_source_to_fwir(source, &faraweave::FwirEncodeOptions::default())
+        .expect("binding FWIR");
+    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 1);
+    assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 3);
+    let decoded =
+        faraweave::decode_fwir(&bytes, &faraweave::FwirDecodeLimits::default()).expect("decode");
+    assert_eq!(decoded.as_raw().module.semantic_minor, 3);
+    assert!(
+        decoded
+            .as_raw()
+            .features
+            .contains(&faraweave::Feature::ImmutableBindings.numeric())
+    );
+    let decoded_result = faraweave::evaluate_verified_program(
+        &decoded,
+        &[],
+        faraweave::EvaluationConfiguration::default(),
     )
-    .expect("explicit compiler");
+    .expect("decoded bindings");
+    assert_eq!(decoded_result, source_result);
+}
+
+#[test]
+fn immutable_bindings_move_once_into_roots_and_tuples() {
+    let direct = evaluate_source("let value = iota[3]\nvalue\n").expect("direct move");
+    assert_eq!(direct.values, vec![Value::IntVector(vec![1, 2, 3])]);
+
+    let tuple = evaluate_source("let value = iota[3]\n[value 9]\n").expect("tuple move");
     assert_eq!(
-        explicit.configuration,
-        CompilerConfiguration::ExplicitOption
+        tuple.values,
+        vec![Value::Tuple(
+            vec![Value::IntVector(vec![1, 2, 3]), Value::Int(9)].into()
+        )]
     );
-    assert_eq!(explicit.executable, "explicit compiler");
 
-    let environment =
-        select_c_compiler(None, Some("environment compiler"), NativePlatform::GccLike)
-            .expect("environment compiler");
+    let parameter = faraweave::evaluate_source_with_arguments(
+        "parameters[n Int]\nlet value = n\n[value]\n",
+        &[Value::Int(7)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("parameter-derived binding");
     assert_eq!(
-        environment.configuration,
-        CompilerConfiguration::Environment
+        parameter.values,
+        vec![Value::Tuple(vec![Value::Int(7)].into())]
     );
-    assert_eq!(environment.executable, "environment compiler");
+}
 
-    let unix = select_c_compiler(None, None, NativePlatform::GccLike).expect("Unix fallback");
-    assert_eq!(unix.configuration, CompilerConfiguration::Fallback);
-    assert_eq!(unix.executable, "cc");
-    let windows =
-        select_c_compiler(None, None, NativePlatform::WindowsMsvc).expect("Windows fallback");
-    assert_eq!(windows.executable, "cl.exe");
+#[test]
+fn immutable_binding_uses_cover_prefix_reducers_scan_and_fanout() {
+    let prefix = evaluate_source("let pair = [2 3]\nadd pair\n").expect("prefix spread binding");
+    assert_eq!(prefix.values, vec![Value::Int(5)]);
 
-    assert!(select_c_compiler(Some(""), Some("cc"), NativePlatform::GccLike).is_err());
+    let reducers = evaluate_source(
+        "let values = iota[4]\nfoldl[@add 0 values]\nscanl[@add 0 values]\nfanout[values {sum[_]} {length[_]}]\n",
+    )
+    .expect("reducer and fanout bindings");
+    assert_eq!(
+        reducers.values,
+        vec![
+            Value::Int(10),
+            Value::IntVector(vec![0, 1, 3, 6, 10]),
+            Value::Tuple(vec![Value::Int(10), Value::Int(4)].into()),
+        ]
+    );
+
+    let dynamic_source =
+        "parameters[n Int]\nlet values = iota[n]\nfilter[@odd values]\nlength[values]\n";
+    let dynamic_bytes =
+        faraweave::compile_source_to_fwir(dynamic_source, &faraweave::FwirEncodeOptions::default())
+            .expect("dynamic binding FWIR");
+    let dynamic = faraweave::decode_fwir(&dynamic_bytes, &faraweave::FwirDecodeLimits::default())
+        .expect("decode dynamic binding");
+    let dynamic_result = faraweave::evaluate_verified_program(
+        &dynamic,
+        &[Value::Int(5)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("dynamic filter binding");
+    assert_eq!(
+        dynamic_result.values,
+        vec![Value::IntVector(vec![1, 3, 5]), Value::Int(5)]
+    );
+}
+
+#[test]
+fn immutable_binding_rejections_are_structured_and_span_exact() {
+    let cases = [
+        (
+            "let x = 1\nlet x = 2\nx\n",
+            faraweave::BindingErrorReason::DuplicateName,
+            15,
+            Some(5),
+        ),
+        (
+            "let add = 1\nadd\n",
+            faraweave::BindingErrorReason::ReservedName,
+            5,
+            Some(5),
+        ),
+        (
+            "missing\n",
+            faraweave::BindingErrorReason::UnknownName,
+            1,
+            None,
+        ),
+        (
+            "let x = y\nlet y = 1\nx\n",
+            faraweave::BindingErrorReason::ForwardReference,
+            9,
+            Some(15),
+        ),
+        (
+            "let x = x\nx\n",
+            faraweave::BindingErrorReason::SelfReference,
+            9,
+            Some(5),
+        ),
+        (
+            "parameters[x Int]\nlet x = 1\nx\n",
+            faraweave::BindingErrorReason::Shadowing,
+            23,
+            Some(12),
+        ),
+        (
+            "let x = 1\n2\n",
+            faraweave::BindingErrorReason::UnusedBinding,
+            5,
+            Some(5),
+        ),
+        (
+            "let x = 1\n[x x]\n",
+            faraweave::BindingErrorReason::MultipleOwnershipEscape,
+            14,
+            Some(12),
+        ),
+        (
+            "let x = 1\nx\ninc[x]\n",
+            faraweave::BindingErrorReason::UseAfterMove,
+            17,
+            Some(11),
+        ),
+    ];
+    for (source, reason, primary_offset, related_offset) in cases {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::BindingError, "{source}");
+        assert_eq!(
+            error.binding.as_ref().map(|context| context.reason),
+            Some(reason),
+            "{source}"
+        );
+        assert_eq!(
+            error.span.map(|span| span.begin.offset),
+            Some(primary_offset),
+            "{source}"
+        );
+        assert_eq!(
+            error
+                .binding
+                .as_ref()
+                .and_then(|context| context.related_span)
+                .map(|span| span.begin.offset),
+            related_offset,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn malformed_let_syntax_is_full_line_and_structured() {
+    for source in ["let x= 1\n", "let x =\n", "let = 1\n", "let x = 1 2\n"] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::BindingError, "{source}");
+        let context = error.binding.expect("binding context");
+        assert_eq!(
+            context.reason,
+            faraweave::BindingErrorReason::MalformedDeclaration,
+            "{source}"
+        );
+        assert!(context.declaration_span.is_some(), "{source}");
+    }
+
+    for source in [
+        "let let = 1\n",
+        "let true = 1\n",
+        "let false = 1\n",
+        "let inf = 1\n",
+        "let nan = 1\n",
+        "let parameters = 1\n",
+        "let fanout = 1\n",
+        "let Bool = 1\n",
+        "let Int = 1\n",
+        "let Double = 1\n",
+    ] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::BindingError, "{source}");
+        assert_eq!(
+            error.binding.expect("binding context").reason,
+            faraweave::BindingErrorReason::ReservedName,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn immutable_binding_duplicate_precedence_follows_source_order() {
+    let source = "let z = 1\nlet a = 1\nlet z = 2\nlet a = 2\nadd[z a]\n";
+    let error = evaluate_source(source).expect_err("duplicate bindings");
+    assert_eq!(error.kind, ErrorKind::BindingError);
+    let context = error.binding.expect("binding context");
+    assert_eq!(context.reason, faraweave::BindingErrorReason::DuplicateName);
+    assert_eq!(error.span.map(|span| span.begin.offset), Some(25));
+    assert_eq!(context.related_span.map(|span| span.begin.offset), Some(5));
+}
+
+#[test]
+fn binding_static_passes_preserve_interleaved_source_error_order() {
+    for (source, kind, offset) in [
+        (
+            "earlier[1]\nlet value = later[1]\nvalue\n",
+            ErrorKind::UnknownPrimitive,
+            1,
+        ),
+        (
+            "add[1]\nlet value = sub[1]\nvalue\n",
+            ErrorKind::ArityError,
+            1,
+        ),
+        ("@add\nlet value = @sub\nvalue\n", ErrorKind::SyntaxError, 2),
+    ] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+        assert_eq!(error.location.offset, offset, "{source}");
+    }
+}
+
+#[test]
+fn immutable_binding_static_failures_precede_argument_decoding() {
+    let error = faraweave::evaluate_source_with_arguments(
+        "parameters[n Int]\nlet value = missing\nadd[value n]\n",
+        &[],
+        EvaluationConfiguration::default(),
+    )
+    .expect_err("static binding failure");
+    assert_eq!(error.kind, ErrorKind::BindingError);
+    assert_eq!(
+        error.binding.map(|context| context.reason),
+        Some(faraweave::BindingErrorReason::UnknownName)
+    );
+}
+
+#[test]
+fn immutable_binding_deep_resolution_and_verification_are_iterative() {
+    const DEPTH: usize = 4_000;
+    let mut source = String::new();
+    source
+        .try_reserve(DEPTH * 32)
+        .expect("deep binding source reservation");
+    source.push_str("let value0 = 0\n");
+    for index in 1..DEPTH {
+        writeln!(&mut source, "let value{index} = inc[value{}]", index - 1)
+            .expect("write deep declaration");
+    }
+    writeln!(&mut source, "value{}", DEPTH - 1).expect("write deep root");
+
+    let result = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || evaluate_source(&source).map_err(|_| ()))
+        .expect("spawn reduced-stack binding evaluation")
+        .join()
+        .expect("join reduced-stack binding evaluation")
+        .expect("deep bindings");
+    assert_eq!(result.values, vec![Value::Int((DEPTH - 1) as i64)]);
 }

@@ -3,6 +3,12 @@
 **Status:** Completed and accepted as FWIR v1 by
 [GitHub issue #15](https://github.com/tuncb/Faraweave/issues/15)
 
+**Historical note:** This file records the completed issue #1–#15 migration
+plan as accepted at that time. Issue #99 later removed the C emitter and native
+builder, so references to those paths below are not current product contracts,
+roadmap items, or support promises; the README, architecture, and
+specifications define the current interpreter-only product.
+
 **Relevant decision record:**
 [Issue #1 — accept the portable typed FWIR plan](../decisions/issue-1-accept-fwir-plan.md)
 

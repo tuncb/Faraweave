@@ -17,6 +17,8 @@ import re
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+CHECKOUT_ACTION_REVISION = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+DEPRECATED_NODE20_CHECKOUT_REVISION = "11bd71901bbe5b1630ceea73d27597364c9af683"
 
 def require(condition: bool, message: str) -> None:
     if not condition:
@@ -24,15 +26,29 @@ def require(condition: bool, message: str) -> None:
 
 def static_contracts() -> None:
     cargo = (ROOT / "Cargo.toml").read_text()
-    require('name = "faraweave"' in cargo and 'version = "0.1.0"' in cargo, "Cargo identity")
-    require((ROOT / "Cargo.lock").is_file(), "Cargo.lock missing")
+    require('name = "faraweave"' in cargo and 'version = "0.2.0"' in cargo, "Cargo identity")
+    locked_packages = tomllib.loads((ROOT / "Cargo.lock").read_text()).get("package", [])
+    require(
+        any(
+            package.get("name") == "faraweave"
+            and package.get("version") == VERSION
+            for package in locked_packages
+        ),
+        "Cargo.lock identity",
+    )
     toolchain = (ROOT / "rust-toolchain.toml").read_text()
     require('channel = "1.97.1"' in toolchain and "clippy" in toolchain, "toolchain pin")
     main = (ROOT / ".github/workflows/main.yml").read_text()
     validate_main_workflow(main)
+    workflows = {
+        str(path.relative_to(ROOT)): path.read_text()
+        for path in sorted((ROOT / ".github/workflows").glob("*.y*ml"))
+    }
+    validate_action_pins(workflows)
     validate_release_workflows()
     validate_fwir_conformance()
     validate_product_cutover()
+    validate_interpreter_only_documentation()
 
 
 def validate_main_workflow(main: str) -> None:
@@ -87,10 +103,57 @@ def validate_main_workflow_without_mutations(text: str, required: list[str]) -> 
             raise AssertionError(needle)
 
 
+def validate_action_pins(workflows: dict[str, str]) -> None:
+    try:
+        validate_action_pins_without_mutations(workflows)
+    except AssertionError as error:
+        raise SystemExit(str(error)) from error
+
+    for relative, text in workflows.items():
+        checkout = f"actions/checkout@{CHECKOUT_ACTION_REVISION}"
+        if checkout not in text:
+            continue
+        parts = text.split(checkout)
+        for occurrence in range(len(parts) - 1):
+            mutated = dict(workflows)
+            mutated[relative] = (
+                checkout.join(parts[: occurrence + 1])
+                + f"actions/checkout@{DEPRECATED_NODE20_CHECKOUT_REVISION}"
+                + checkout.join(parts[occurrence + 1 :])
+            )
+            try:
+                validate_action_pins_without_mutations(mutated)
+            except AssertionError:
+                continue
+            raise SystemExit(
+                "workflow checkout revision negative mutation survived: "
+                f"{relative} occurrence {occurrence + 1}"
+            )
+
+
+def validate_action_pins_without_mutations(workflows: dict[str, str]) -> None:
+    checkout_revisions = []
+    for relative, text in workflows.items():
+        for action, revision in re.findall(r"uses:\s*([^@\s]+)@([^\s]+)", text):
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise AssertionError(
+                    f"{relative} action {action} is not pinned by a full commit"
+                )
+            if action == "actions/checkout":
+                checkout_revisions.append(revision)
+    if not checkout_revisions:
+        raise AssertionError("workflows have no actions/checkout usage")
+    if any(revision != CHECKOUT_ACTION_REVISION for revision in checkout_revisions):
+        raise AssertionError(
+            "workflows do not pin actions/checkout to the approved Node 24 revision"
+        )
+
+
 def validate_release_workflows() -> None:
-    initial = (ROOT / ".github/workflows/release.yml").read_text()
+    release = (ROOT / ".github/workflows/release.yml").read_text()
     future = (ROOT / ".github/workflows/future-release.yml").read_text()
-    for text, name in [(initial, "initial"), (future, "future")]:
+    publish = (ROOT / "tools/release/publish.sh").read_text()
+    for text, name in [(release, "release"), (future, "future")]:
         actions = re.findall(r"uses:\s*([^@\s]+)@([^\s]+)", text)
         require(
             all(
@@ -102,12 +165,14 @@ def validate_release_workflows() -> None:
         )
         require("persist-credentials: false" in text, f"{name} checkout credentials")
     for needle in [
-        "v0.1.0",
-        "git cat-file -t refs/tags/v0.1.0",
-        "git rev-parse refs/tags/v0.1.0^{commit}",
-        "! gh release view v0.1.0",
+        "tags: [v0.2.0]",
+        'test "${GITHUB_REF_NAME}" = v0.2.0',
+        r'''test "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = 0.2.0''',
+        "git cat-file -t refs/tags/v0.2.0",
+        "git rev-parse refs/tags/v0.2.0^{commit}",
+        "! gh release view v0.2.0",
     ]:
-        require(needle in initial, f"initial release missing {needle}")
+        require(needle in release, f"release workflow missing {needle}")
     for needle in [
         "linux-x64",
         "windows-x64",
@@ -118,6 +183,52 @@ def validate_release_workflows() -> None:
         "publish.sh",
     ]:
         require(needle in future, f"future release missing {needle}")
+    validate_future_release_fragment_lifecycle(future)
+    for needle in [
+        'notes="doc/releases/${tag}.md"',
+        'test -f "${notes}"',
+        '--notes-file "${notes}"',
+    ]:
+        require(needle in publish, f"release publisher missing {needle}")
+    notes = ROOT / f"doc/releases/v{VERSION}.md"
+    require(notes.is_file(), f"release notes missing: {notes.relative_to(ROOT)}")
+
+
+def validate_future_release_fragment_lifecycle(future: str) -> None:
+    target_template = "artifacts/${{ matrix.target }}.fragment.json"
+    producer_outputs = re.findall(r'--output "(artifacts/\$\{\{ matrix\.target \}\}[^"]+)"', future)
+    require(
+        producer_outputs == [target_template],
+        f"future release fragment producer must write {target_template}",
+    )
+
+    targets = ["linux-x64", "windows-x64", "macos-arm64"]
+    expected = [
+        target_template.replace("${{ matrix.target }}", target)
+        for target in targets
+    ]
+    merge_inputs = re.findall(
+        r"--fragment (artifacts/[a-z0-9.-]+\.json)", future
+    )
+    require(
+        merge_inputs == expected,
+        "future release fragment merge inputs do not match producer outputs",
+    )
+
+    cleanup_lines = re.findall(
+        r"^[ \t]*rm ((?:artifacts/[a-z0-9.-]+\.json(?:[ \t]+|$))+)$",
+        future,
+        re.MULTILINE,
+    )
+    require(
+        len(cleanup_lines) == 1,
+        "future release must have exactly one fragment cleanup command",
+    )
+    cleanup_inputs = cleanup_lines[0].split()
+    require(
+        cleanup_inputs == expected,
+        "future release fragment cleanup inputs do not match producer outputs",
+    )
 
 
 def fnv1a64(data: bytes) -> int:
@@ -167,16 +278,14 @@ def validate_fwir_conformance() -> None:
             ),
             f"FWIR corpus host metadata: {name}",
         )
-        required_surfaces = {
+        interpreter_surfaces = {
             "decode",
             "reencode",
             "inspect",
             "interpret",
-            "emit-c",
-            "native",
         }
         require(
-            required_surfaces <= set(surfaces.split(",")),
+            set(surfaces.split(",")) == interpreter_surfaces,
             f"FWIR corpus surfaces: {name}",
         )
 
@@ -237,8 +346,9 @@ def validate_product_cutover() -> None:
     lowering = production_source("src/lowering.rs")
     evaluator = production_source("src/evaluator.rs")
     interpreter = production_source("src/interpreter.rs")
-    emitter = production_source("src/c_emitter.rs")
     api = production_source("src/fwir_api.rs")
+    library = production_source("src/lib.rs")
+    cli = production_source("src/main.rs")
     cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
     production_tree = "\n".join(
         production_source(str(path.relative_to(ROOT)).replace("\\", "/"))
@@ -279,11 +389,31 @@ def validate_product_cutover() -> None:
         "program: &VerifiedProgram" in interpreter,
         "interpreter does not require VerifiedProgram",
     )
+    for removed in ("src/c_emitter.rs", "src/native_builder.rs"):
+        require(not (ROOT / removed).exists(), f"removed backend source remains: {removed}")
     require(
-        "emit_verified_c_program(" in emitter
-        and "program: &VerifiedProgram" in emitter
-        and "emit_c_from_verified_program(" in api,
-        "C/native generation does not route through verified IR",
+        not (ROOT / "tools/validation/c11_journey.py").exists()
+        and (ROOT / "tools/validation/interpreter_journey.py").is_file(),
+        "interpreter-only validation journey",
+    )
+    require(
+        "evaluate_verified_program(" in api
+        and "program: &VerifiedProgram" in api,
+        "public artifact execution does not route through the verified interpreter",
+    )
+    for token in (
+        "emit_c_source",
+        "emit_c_from_verified_program",
+        "build_native",
+        "NativeBuild",
+        "CEmitter",
+    ):
+        require(token not in production_tree, f"removed backend API remains: {token}")
+    for token in ("mod c_emitter", "mod native_builder", "emit_c_", "build_native"):
+        require(token not in library, f"removed library surface remains: {token}")
+    require(
+        re.search(r'"(?:emit-c|emit-c-ir|build|build-ir)"', cli) is None,
+        "removed CLI command remains",
     )
     for relative, source, forbidden in (
         (
@@ -296,26 +426,48 @@ def validate_product_cutover() -> None:
             interpreter,
             ("evaluate_expr(", "select_call(", "primitive_from_name(", "ExprKind"),
         ),
-        (
-            "src/c_emitter.rs",
-            emitter,
-            (
-                "struct CGenerator",
-                "emit_parameterized_program(",
-                "emit_constant_program(",
-                "runtime_failure_program(",
-                "static_expression_type(",
-                "known_vector_length(",
-                "primitive_tag(",
-                "evaluate_source_with_configuration(",
-                "static int fw_apply(",
-                "fw_apply_scalar",
-                "FW_INC",
-            ),
-        ),
     ):
         for token in forbidden:
             require(token not in source, f"legacy backend token {token} in {relative}")
+
+
+def validate_interpreter_only_documentation() -> None:
+    active_documents = [
+        "README.md",
+        "doc/architecture.md",
+        "examples/README.md",
+        "spec/backend-native-math-v1.md",
+        "spec/container-wide-application-plans.md",
+        "spec/fwir-v1-encoding-measurements.md",
+        "spec/fwir-v1-encoding.md",
+        "spec/typed-fwir-semantic-contract.md",
+    ]
+    forbidden = (
+        "emit-c",
+        "emit-c-ir",
+        "build-ir",
+        "strict C11",
+        "strict-C11",
+        "generated C",
+        "C compiler",
+        "C emitter",
+        "C/native",
+        "native backend",
+        "native builder",
+        "native executable",
+        "cross-backend",
+        "src/c_emitter.rs",
+        "src/native_builder.rs",
+        "emit_c_",
+        "build_native",
+    )
+    for relative in active_documents:
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for token in forbidden:
+            require(
+                token.casefold() not in text.casefold(),
+                f"active documentation retains {token}: {relative}",
+            )
 
 def package(target: str) -> None:
     require(target in {"linux-x64", "windows-x64", "macos-arm64"}, "unknown target")
@@ -451,7 +603,7 @@ def main() -> None:
                 "REPL output-device failure diagnostic",
             )
         subprocess.run(
-            [sys.executable, str(ROOT / "tools/validation/c11_journey.py")],
+            [sys.executable, str(ROOT / "tools/validation/interpreter_journey.py")],
             cwd=ROOT,
             check=True,
         )

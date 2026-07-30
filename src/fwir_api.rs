@@ -1,10 +1,9 @@
 use crate::{
-    CEmissionResult, Error, ErrorKind, EvaluationConfiguration, FwirEncodeError, FwirEncodeOptions,
-    NativeBuildRequest, NativeBuildResult, ProgramResult, RunnerEvaluationResult, SourceLocation,
-    VerifiedProgram, build_native, encode_fwir, evaluate_verified_program, format_value,
+    Error, ErrorKind, EvaluationConfiguration, FwirEncodeError, FwirEncodeOptions, ProgramResult,
+    RunnerEvaluationResult, SourceLocation, VerifiedProgram, encode_fwir,
+    evaluate_verified_program,
 };
 use std::fmt::Write as _;
-use std::path::Path;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -22,7 +21,14 @@ impl std::fmt::Display for CompileFwirError {
     }
 }
 
-impl std::error::Error for CompileFwirError {}
+impl std::error::Error for CompileFwirError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Compile(error) => Some(error),
+            Self::Encode(error) => Some(error),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum FwirInspectError {
@@ -37,7 +43,14 @@ impl std::fmt::Display for FwirInspectError {
     }
 }
 
-impl std::error::Error for FwirInspectError {}
+impl std::error::Error for FwirInspectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::SizeOverflow | Self::AllocationUnavailable => None,
+        }
+    }
+}
 
 /// Compiles source through the sole typed lowerer into a verified program.
 ///
@@ -59,7 +72,7 @@ pub fn compile_source_to_verified_program(
         .map_err(crate::lowering::CompileError::into_evaluation_error)
 }
 
-/// Compiles source and returns canonical FWIR v1.0 bytes.
+/// Compiles source and returns canonical FWIR v1 bytes at its required minor.
 ///
 /// The default logical source name is `<source>`; use
 /// [`compile_source_to_fwir_with_name`] when diagnostics need a stable name.
@@ -96,52 +109,12 @@ pub fn evaluate_verified_program_with_arguments(
     let decoded = crate::interpreter::decode_verified_arguments(program, arguments)?;
     let ProgramResult { values, usage } =
         evaluate_verified_program(program, &decoded, configuration)?;
-    let mut formatted = Vec::new();
-    formatted.try_reserve_exact(values.len()).map_err(|_| {
-        Error::new(
-            ErrorKind::FormattingError,
-            SourceLocation::start(),
-            "unable to allocate formatted output",
-        )
-    })?;
-    for value in &values {
-        formatted.push(format_value(value)?);
-    }
+    let (formatted, presentations) = crate::evaluator::format_runner_values(program, &values)?;
     Ok(RunnerEvaluationResult {
         values,
         formatted,
+        presentations,
         usage,
-    })
-}
-
-/// Emits deterministic strict C11 from a verified program.
-///
-/// Selected implementations, conversions, lifting, shapes, ownership, and
-/// diagnostics come only from the verified records.
-pub fn emit_c_from_verified_program(
-    program: &VerifiedProgram,
-    configuration: EvaluationConfiguration,
-) -> Result<CEmissionResult, Error> {
-    crate::c_emitter::emit_verified_c_program(program, configuration)
-}
-
-/// Emits C and builds a native executable from the same verified program.
-///
-/// The selected compiler is an external trusted process and the resulting
-/// executable is not a sandboxed form of FWIR.
-pub fn build_native_from_verified_program(
-    program: &VerifiedProgram,
-    output_path: &Path,
-    explicit_compiler: Option<&str>,
-    environment_compiler: Option<&str>,
-    configuration: EvaluationConfiguration,
-) -> Result<NativeBuildResult, Error> {
-    let emitted = emit_c_from_verified_program(program, configuration)?;
-    build_native(&NativeBuildRequest {
-        c_source: &emitted.source,
-        output_path,
-        explicit_compiler,
-        environment_compiler,
     })
 }
 
@@ -168,6 +141,9 @@ pub fn inspect_fwir(program: &VerifiedProgram) -> Result<String, FwirInspectErro
         ),
     )?;
     append_format(&mut output, format_args!("\n"))?;
+    for (index, feature) in raw.features.iter().enumerate() {
+        append_format(&mut output, format_args!("feature[{index}] id={feature}\n"))?;
+    }
     append_format(
         &mut output,
         format_args!(
@@ -210,6 +186,21 @@ pub fn inspect_fwir(program: &VerifiedProgram) -> Result<String, FwirInspectErro
             &mut output,
             format_args!("operation_reference[{index}] {reference:?}\n"),
         )?;
+    }
+    for (index, node) in raw.nodes.iter().enumerate() {
+        append_format(&mut output, format_args!("node[{index}] {node:?}\n"))?;
+    }
+    for (index, edge) in raw.edges.iter().enumerate() {
+        append_format(&mut output, format_args!("edge[{index}] {edge:?}\n"))?;
+    }
+    for (index, ownership) in raw.ownership.iter().enumerate() {
+        append_format(
+            &mut output,
+            format_args!("ownership[{index}] {ownership:?}\n"),
+        )?;
+    }
+    for (index, root) in raw.roots.iter().enumerate() {
+        append_format(&mut output, format_args!("root[{index}] {root:?}\n"))?;
     }
     output.push_str("canonical-hex ")?;
     for byte in canonical {

@@ -2,10 +2,9 @@ mod repl_terminal;
 
 use faraweave::{
     ArgumentErrorContext, CompileFwirError, Error, ErrorKind, FwirDecodeLimits, FwirEncodeOptions,
-    NativeBuildRequest, VERSION, build_native, build_native_from_verified_program,
-    compile_source_to_fwir_with_name, decode_fwir, emit_c_from_verified_program, emit_c_source,
+    RootPresentation, VERSION, Value, compile_source_to_fwir_with_name, decode_fwir,
     evaluate_expression, evaluate_runner_source, evaluate_verified_program_with_arguments,
-    format_value, inspect_fwir, publish_file_atomically, write_internal_registry_diagnostics,
+    format_value, inspect_fwir, write_internal_registry_diagnostics,
 };
 use std::env;
 use std::ffi::OsString;
@@ -23,18 +22,12 @@ const HELP: &str = "Usage: faraweave <command> [arguments]\n\
                      \x20 repl    Start an interactive Faraweave session\n\
                      \x20 run <source> [-- <arguments...>]\n\
                      \x20         Run a Faraweave source file\n\
-                     \x20 emit-c  Emit C source for a Faraweave source file\n\
-                     \x20 build   Build a Faraweave source file\n\
                      \x20 compile-ir <source> -o <artifact.fwir>\n\
                      \x20         Compile source to canonical FWIR v1\n\
                      \x20 inspect-ir <artifact.fwir>\n\
                      \x20         Inspect a verified FWIR artifact\n\
                      \x20 run-ir <artifact.fwir> [-- <arguments...>]\n\
-                     \x20         Run a verified FWIR artifact\n\
-                     \x20 emit-c-ir <artifact.fwir> -o <output.c>\n\
-                     \x20         Emit C from a verified FWIR artifact\n\
-                     \x20 build-ir <artifact.fwir> -o <output> [--cc <compiler>]\n\
-                     \x20         Build a verified FWIR artifact\n";
+                     \x20         Run a verified FWIR artifact\n";
 const REPL_HISTORY_MAX_ENTRIES: usize = 100;
 const REPL_HISTORY_MAX_BYTES: usize = 65_536;
 
@@ -46,6 +39,24 @@ fn main() -> ExitCode {
 }
 
 fn run_cli(arguments: Vec<OsString>) -> Result<(), ()> {
+    run_cli_with_runner_support(
+        arguments,
+        RunnerFailureInjection::none(),
+        publish_runner_stdout,
+        |failure| {
+            if let Some(diagnostic) = failure.diagnostic() {
+                eprintln!("{diagnostic}");
+            }
+        },
+    )
+}
+
+fn run_cli_with_runner_support(
+    arguments: Vec<OsString>,
+    runner_injection: RunnerFailureInjection,
+    publish_runner_output: impl FnOnce(&[u8]) -> Result<(), ()>,
+    report_runner_failure: impl FnOnce(RunnerCommandFailure),
+) -> Result<(), ()> {
     let Some(command) = arguments.get(1).and_then(|value| value.to_str()) else {
         eprintln!("error: expected a subcommand or --help");
         return Err(());
@@ -67,14 +78,18 @@ fn run_cli(arguments: Vec<OsString>) -> Result<(), ()> {
                 repl()
             }
         }
-        "run" => run_command(&arguments),
-        "emit-c" => emit_c_command(&arguments),
-        "build" => build_command(&arguments),
+        "run" => {
+            run_command(&arguments, runner_injection, publish_runner_output).map_err(|failure| {
+                report_runner_failure(failure);
+            })
+        }
         "compile-ir" => compile_ir_command(&arguments),
         "inspect-ir" => inspect_ir_command(&arguments),
-        "run-ir" => run_ir_command(&arguments),
-        "emit-c-ir" => emit_c_ir_command(&arguments),
-        "build-ir" => build_ir_command(&arguments),
+        "run-ir" => {
+            run_ir_command(&arguments, runner_injection, publish_runner_output).map_err(|failure| {
+                report_runner_failure(failure);
+            })
+        }
         unknown => {
             eprintln!("error: unknown subcommand '{unknown}'");
             Err(())
@@ -115,49 +130,39 @@ fn inspect_ir_command(arguments: &[OsString]) -> Result<(), ()> {
     publish_stdout(inspection.as_bytes())
 }
 
-fn run_ir_command(arguments: &[OsString]) -> Result<(), ()> {
+fn run_ir_command(
+    arguments: &[OsString],
+    injection: RunnerFailureInjection,
+    publish_runner_output: impl FnOnce(&[u8]) -> Result<(), ()>,
+) -> Result<(), RunnerCommandFailure> {
     if arguments.len() == 2 {
         eprintln!("error: expected one artifact path after 'run-ir'");
-        return Err(());
+        return Err(RunnerCommandFailure::Reported);
     }
     if arguments.len() > 3 && arguments.get(3).and_then(|value| value.to_str()) != Some("--") {
         eprintln!("error: expected 'run-ir <artifact.fwir> [-- <arguments...>]'");
-        return Err(());
+        return Err(RunnerCommandFailure::Reported);
     }
     let artifact_path = Path::new(&arguments[2]);
-    let program = read_verified_artifact(artifact_path)?;
+    let program =
+        read_verified_artifact(artifact_path).map_err(|()| RunnerCommandFailure::Reported)?;
     let raw_arguments = arguments.get(4..).unwrap_or_default();
-    let argument_strings =
-        collect_command_line_arguments(raw_arguments, CommandLineArgumentFailureInjection::none())
-            .map_err(|failure| {
-                eprintln!("{}", failure.diagnostic());
-            })?;
+    let argument_strings = collect_command_line_arguments(raw_arguments, injection.arguments)
+        .map_err(RunnerCommandFailure::CommandLineArguments)?;
     match evaluate_verified_program_with_arguments(
         &program,
         &argument_strings,
         faraweave::EvaluationConfiguration::default(),
     ) {
-        Ok(result) => {
-            let mut output = String::new();
-            let output_length = result.formatted.iter().try_fold(0usize, |total, value| {
-                total.checked_add(value.len())?.checked_add(1)
-            });
-            output
-                .try_reserve_exact(output_length.ok_or_else(|| {
-                    eprintln!("error: unable to allocate formatted output");
-                })?)
-                .map_err(|_| {
-                    eprintln!("error: unable to allocate formatted output");
-                })?;
-            for formatted in result.formatted {
-                output.push_str(&formatted);
-                output.push('\n');
-            }
-            publish_runner_stdout(output.as_bytes())
-        }
+        Ok(result) => publish_formatted_runner_output(
+            &result.formatted,
+            &result.presentations,
+            injection.formatted_output,
+            publish_runner_output,
+        ),
         Err(error) => {
             report_error(logical_source_name(&program), &error);
-            Err(())
+            Err(RunnerCommandFailure::Reported)
         }
     }
 }
@@ -197,6 +202,86 @@ impl CommandLineArgumentFailureInjection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormattedOutputFailure {
+    SizeOverflow,
+    AllocationUnavailable,
+}
+
+impl FormattedOutputFailure {
+    const fn diagnostic(self) -> &'static str {
+        "error: unable to allocate formatted output"
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FormattedOutputFailureInjection {
+    refuse_reservation: bool,
+}
+
+impl FormattedOutputFailureInjection {
+    const fn none() -> Self {
+        Self {
+            refuse_reservation: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn refuse_reservation() -> Self {
+        Self {
+            refuse_reservation: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerCommandFailure {
+    Reported,
+    CommandLineArguments(CommandLineArgumentFailure),
+    FormattedOutput(FormattedOutputFailure),
+}
+
+impl RunnerCommandFailure {
+    const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            Self::Reported => None,
+            Self::CommandLineArguments(failure) => Some(failure.diagnostic()),
+            Self::FormattedOutput(failure) => Some(failure.diagnostic()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RunnerFailureInjection {
+    arguments: CommandLineArgumentFailureInjection,
+    formatted_output: FormattedOutputFailureInjection,
+}
+
+impl RunnerFailureInjection {
+    const fn none() -> Self {
+        Self {
+            arguments: CommandLineArgumentFailureInjection::none(),
+            formatted_output: FormattedOutputFailureInjection::none(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn refuse_argument_reservation() -> Self {
+        Self {
+            arguments: CommandLineArgumentFailureInjection::refuse_reservation(),
+            formatted_output: FormattedOutputFailureInjection::none(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn refuse_formatted_output_reservation() -> Self {
+        Self {
+            arguments: CommandLineArgumentFailureInjection::none(),
+            formatted_output: FormattedOutputFailureInjection::refuse_reservation(),
+        }
+    }
+}
+
 fn collect_command_line_arguments(
     arguments: &[OsString],
     injection: CommandLineArgumentFailureInjection,
@@ -215,151 +300,98 @@ fn collect_command_line_arguments(
     Ok(decoded)
 }
 
-fn emit_c_ir_command(arguments: &[OsString]) -> Result<(), ()> {
-    if arguments.len() != 5 || arguments.get(3).and_then(|value| value.to_str()) != Some("-o") {
-        eprintln!("error: expected 'emit-c-ir <artifact.fwir> -o <output.c>'");
-        return Err(());
+#[cfg(test)]
+fn checked_formatted_output_length(
+    formatted_lengths: impl IntoIterator<Item = usize>,
+) -> Result<usize, FormattedOutputFailure> {
+    formatted_lengths
+        .into_iter()
+        .try_fold(0usize, |total, length| {
+            total
+                .checked_add(length)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(FormattedOutputFailure::SizeOverflow)
+        })
+}
+
+fn build_formatted_runner_output(
+    formatted: &[String],
+    presentations: &[RootPresentation],
+    injection: FormattedOutputFailureInjection,
+) -> Result<String, FormattedOutputFailure> {
+    if formatted.len() != presentations.len() {
+        return Err(FormattedOutputFailure::SizeOverflow);
     }
-    let artifact_path = Path::new(&arguments[2]);
-    let output_path = Path::new(&arguments[4]);
-    reject_alias(artifact_path, output_path)?;
-    let program = read_verified_artifact(artifact_path)?;
-    let emitted =
-        emit_c_from_verified_program(&program, faraweave::EvaluationConfiguration::default())
-            .map_err(|error| {
-                report_error(logical_source_name(&program), &error);
+    let output_length =
+        formatted
+            .iter()
+            .zip(presentations)
+            .try_fold(0usize, |total, (value, presentation)| {
+                total
+                    .checked_add(value.len())
+                    .and_then(|length| {
+                        if *presentation == RootPresentation::CanonicalValue {
+                            length.checked_add(1)
+                        } else {
+                            Some(length)
+                        }
+                    })
+                    .ok_or(FormattedOutputFailure::SizeOverflow)
             })?;
-    write_atomically(output_path, emitted.source.as_bytes()).map_err(|message| {
-        eprintln!("{}:1:1: file error: {message}", output_path.display());
-    })
+    let mut output = String::new();
+    if injection.refuse_reservation || output.try_reserve_exact(output_length).is_err() {
+        return Err(FormattedOutputFailure::AllocationUnavailable);
+    }
+    for (value, presentation) in formatted.iter().zip(presentations) {
+        output.push_str(value);
+        if *presentation == RootPresentation::CanonicalValue {
+            output.push('\n');
+        }
+    }
+    Ok(output)
 }
 
-fn build_ir_command(arguments: &[OsString]) -> Result<(), ()> {
-    if !matches!(arguments.len(), 5 | 7)
-        || arguments.get(3).and_then(|value| value.to_str()) != Some("-o")
-        || (arguments.len() == 7
-            && arguments.get(5).and_then(|value| value.to_str()) != Some("--cc"))
-    {
-        eprintln!("error: expected 'build-ir <artifact.fwir> -o <output> [--cc <compiler>]'");
-        return Err(());
-    }
-    let artifact_path = Path::new(&arguments[2]);
-    let output_path = Path::new(&arguments[4]);
-    reject_alias(artifact_path, output_path)?;
-    let program = read_verified_artifact(artifact_path)?;
-    let explicit = arguments.get(6).and_then(|value| value.to_str());
-    if arguments.len() == 7 && explicit.is_none_or(str::is_empty) {
-        eprintln!("error: --cc requires a nonempty compiler");
-        return Err(());
-    }
-    let environment = env::var("CC").ok();
-    build_native_from_verified_program(
-        &program,
-        output_path,
-        explicit,
-        environment.as_deref(),
-        faraweave::EvaluationConfiguration::default(),
-    )
-    .map(|_| ())
-    .map_err(|error| {
-        report_error(logical_source_name(&program), &error);
-    })
+fn publish_formatted_runner_output(
+    formatted: &[String],
+    presentations: &[RootPresentation],
+    injection: FormattedOutputFailureInjection,
+    publish_runner_output: impl FnOnce(&[u8]) -> Result<(), ()>,
+) -> Result<(), RunnerCommandFailure> {
+    let output = build_formatted_runner_output(formatted, presentations, injection)
+        .map_err(RunnerCommandFailure::FormattedOutput)?;
+    publish_runner_output(output.as_bytes()).map_err(|()| RunnerCommandFailure::Reported)
 }
 
-fn run_command(arguments: &[OsString]) -> Result<(), ()> {
+fn run_command(
+    arguments: &[OsString],
+    injection: RunnerFailureInjection,
+    publish_runner_output: impl FnOnce(&[u8]) -> Result<(), ()>,
+) -> Result<(), RunnerCommandFailure> {
     if arguments.len() == 2 {
         eprintln!("error: expected one source path after 'run'");
-        return Err(());
+        return Err(RunnerCommandFailure::Reported);
     }
     if arguments.len() > 3 && arguments.get(3).and_then(|value| value.to_str()) != Some("--") {
         eprintln!("error: expected 'run <source> [-- <arguments...>]'");
-        return Err(());
+        return Err(RunnerCommandFailure::Reported);
     }
     let path = Path::new(&arguments[2]);
-    let source = read_source(path)?;
-    let argument_strings: Vec<&str> = arguments
-        .get(4..)
-        .unwrap_or_default()
-        .iter()
-        .map(|argument| {
-            argument.to_str().ok_or_else(|| {
-                eprintln!("error: unable to decode Unicode command line");
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    let source = read_source(path).map_err(|()| RunnerCommandFailure::Reported)?;
+    let raw_arguments = arguments.get(4..).unwrap_or_default();
+    let argument_strings = collect_command_line_arguments(raw_arguments, injection.arguments)
+        .map_err(RunnerCommandFailure::CommandLineArguments)?;
     match evaluate_runner_source(&source, &argument_strings) {
-        Ok(result) => {
-            let mut output = String::new();
-            for formatted in result.formatted {
-                output.push_str(&formatted);
-                output.push('\n');
-            }
-            publish_runner_stdout(output.as_bytes())
-        }
+        Ok(result) => publish_formatted_runner_output(
+            &result.formatted,
+            &result.presentations,
+            injection.formatted_output,
+            publish_runner_output,
+        ),
         Err(error) => {
             report_error(&path.to_string_lossy(), &error);
-            Err(())
+            Err(RunnerCommandFailure::Reported)
         }
     }
-}
-
-fn emit_c_command(arguments: &[OsString]) -> Result<(), ()> {
-    if arguments.len() == 2 {
-        eprintln!("error: expected a source path after 'emit-c'");
-        return Err(());
-    }
-    if arguments.len() != 5 || arguments.get(3).and_then(|value| value.to_str()) != Some("-o") {
-        eprintln!("error: expected 'emit-c <source> -o <output>'");
-        return Err(());
-    }
-    let source_path = Path::new(&arguments[2]);
-    let output_path = Path::new(&arguments[4]);
-    reject_alias(source_path, output_path)?;
-    let source = read_source(source_path)?;
-    let emitted = emit_c_source(&source).map_err(|error| {
-        report_error(&source_path.to_string_lossy(), &error);
-    })?;
-    write_atomically(output_path, emitted.source.as_bytes()).map_err(|message| {
-        eprintln!("{}:1:1: file error: {message}", output_path.display());
-    })
-}
-
-fn build_command(arguments: &[OsString]) -> Result<(), ()> {
-    if arguments.len() == 2 {
-        eprintln!("error: expected a source path after 'build'");
-        return Err(());
-    }
-    if !matches!(arguments.len(), 5 | 7)
-        || arguments.get(3).and_then(|value| value.to_str()) != Some("-o")
-        || (arguments.len() == 7
-            && arguments.get(5).and_then(|value| value.to_str()) != Some("--cc"))
-    {
-        eprintln!("error: expected 'build <source> -o <output> [--cc <compiler>]'");
-        return Err(());
-    }
-    let source_path = Path::new(&arguments[2]);
-    let output_path = Path::new(&arguments[4]);
-    reject_alias(source_path, output_path)?;
-    let source = read_source(source_path)?;
-    let emitted = emit_c_source(&source).map_err(|error| {
-        report_error(&source_path.to_string_lossy(), &error);
-    })?;
-    let explicit = arguments.get(6).and_then(|value| value.to_str());
-    if arguments.len() == 7 && explicit.is_none_or(str::is_empty) {
-        eprintln!("error: --cc requires a nonempty compiler");
-        return Err(());
-    }
-    let environment = env::var("CC").ok();
-    build_native(&NativeBuildRequest {
-        c_source: &emitted.source,
-        output_path,
-        explicit_compiler: explicit,
-        environment_compiler: environment.as_deref(),
-    })
-    .map(|_| ())
-    .map_err(|error| {
-        eprintln!("error: native build: {}", error.message);
-    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -691,12 +723,21 @@ fn repl() -> Result<(), ()> {
             continue;
         }
         match evaluate_expression(line) {
-            Ok(result) => {
-                let formatted = format_value(&result.value).map_err(|error| {
-                    report_error("<repl>", &error);
-                })?;
-                publish_stdout(format!("{formatted}\n").as_bytes())?;
-            }
+            Ok(result) => match result.presentation {
+                RootPresentation::CanonicalValue => {
+                    let formatted = format_value(&result.value).map_err(|error| {
+                        report_error("<repl>", &error);
+                    })?;
+                    publish_stdout(format!("{formatted}\n").as_bytes())?;
+                }
+                RootPresentation::RawString => {
+                    let Value::String(value) = &result.value else {
+                        eprintln!("error: verified raw String presentation invariant failed");
+                        return Err(());
+                    };
+                    publish_stdout(value.as_bytes())?;
+                }
+            },
             Err(error) => report_error("<repl>", &error),
         }
     }
@@ -874,6 +915,60 @@ fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), &'static str> {
     result
 }
 
+fn publish_file_atomically(temporary: &Path, output: &Path) -> io::Result<()> {
+    if !output.exists() {
+        return fs::rename(temporary, output);
+    }
+    replace_existing_file(temporary, output)
+}
+
+#[cfg(not(windows))]
+fn replace_existing_file(temporary: &Path, output: &Path) -> io::Result<()> {
+    fs::rename(temporary, output)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn replace_existing_file(temporary: &Path, output: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut core::ffi::c_void,
+            reserved: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut output_wide: Vec<u16> = output.as_os_str().encode_wide().collect();
+    let mut temporary_wide: Vec<u16> = temporary.as_os_str().encode_wide().collect();
+    output_wide.push(0);
+    temporary_wide.push(0);
+    // SAFETY: both path buffers are NUL-terminated and live for the call; the
+    // optional backup, exclusion, and reserved pointers are permitted to be
+    // null by ReplaceFileW. Both files were resolved by the caller.
+    let replaced = unsafe {
+        ReplaceFileW(
+            output_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            ptr::null(),
+            1,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn publish_stdout(bytes: &[u8]) -> Result<(), ()> {
     let mut stdout = io::stdout().lock();
     publish_to(&mut stdout, bytes).map_err(|_| {
@@ -993,12 +1088,75 @@ fn report_argument_error(argument: &ArgumentErrorContext) {
 #[cfg(test)]
 mod output_tests {
     use super::{
-        CommandLineArgumentFailure, CommandLineArgumentFailureInjection, OutputFailureReason,
-        OutputPublicationFailure, ReplCommand, collect_command_line_arguments, publish_to,
-        repl_command,
+        CommandLineArgumentFailure, CommandLineArgumentFailureInjection, FormattedOutputFailure,
+        FormattedOutputFailureInjection, OutputFailureReason, OutputPublicationFailure,
+        ReplCommand, RunnerCommandFailure, RunnerFailureInjection, build_formatted_runner_output,
+        checked_formatted_output_length, collect_command_line_arguments,
+        compile_source_to_fwir_with_name, publish_to, repl_command, run_cli_with_runner_support,
     };
+    use faraweave::{FwirEncodeOptions, RootPresentation};
+    use std::cell::Cell;
     use std::ffi::OsString;
+    use std::fs;
     use std::io::{self, Write};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_RUNNER_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct RunnerFixture {
+        directory: PathBuf,
+        source: PathBuf,
+        artifact: PathBuf,
+    }
+
+    impl RunnerFixture {
+        fn new() -> Self {
+            let sequence = NEXT_RUNNER_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "faraweave-runner-seams-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).expect("create runner fixture directory");
+            let source = directory.join("program.faraweave");
+            let artifact = directory.join("program.fwir");
+            let source_text = "parameters[n Int]\ninc[n]\n";
+            fs::write(&source, source_text).expect("write runner source fixture");
+            let bytes = compile_source_to_fwir_with_name(
+                source_text,
+                &source.to_string_lossy(),
+                &FwirEncodeOptions::default(),
+            )
+            .expect("compile runner artifact fixture");
+            fs::write(&artifact, bytes).expect("write runner artifact fixture");
+            Self {
+                directory,
+                source,
+                artifact,
+            }
+        }
+
+        fn arguments(&self, command: &str) -> Vec<OsString> {
+            let input = match command {
+                "run" => &self.source,
+                "run-ir" => &self.artifact,
+                _ => panic!("unsupported runner fixture command"),
+            };
+            vec![
+                OsString::from("faraweave"),
+                OsString::from(command),
+                input.as_os_str().to_owned(),
+                OsString::from("--"),
+                OsString::from("3"),
+            ]
+        }
+    }
+
+    impl Drop for RunnerFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.directory).expect("remove runner fixture directory");
+        }
+    }
 
     struct ShortWriter {
         accepted: usize,
@@ -1011,6 +1169,30 @@ mod output_tests {
                 return Ok(0);
             }
             let count = self.accepted.min(bytes.len());
+            self.accepted -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_ok
+                .then_some(())
+                .ok_or_else(|| io::Error::other("injected flush failure"))
+        }
+    }
+
+    struct RecordingShortWriter {
+        accepted: usize,
+        flush_ok: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for RecordingShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.accepted == 0 {
+                return Ok(0);
+            }
+            let count = self.accepted.min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..count]);
             self.accepted -= count;
             Ok(count)
         }
@@ -1100,6 +1282,188 @@ mod output_tests {
             failure.diagnostic(),
             "error: unable to decode Unicode command line"
         );
+    }
+
+    #[test]
+    fn formatted_output_size_is_checked_before_reservation() {
+        assert_eq!(checked_formatted_output_length([3, 0, 4]), Ok(10));
+        assert_eq!(
+            checked_formatted_output_length([usize::MAX]),
+            Err(FormattedOutputFailure::SizeOverflow)
+        );
+        assert_eq!(
+            checked_formatted_output_length([usize::MAX - 1, 0]),
+            Err(FormattedOutputFailure::SizeOverflow)
+        );
+    }
+
+    #[test]
+    fn formatted_output_reservation_refusal_is_explicit_and_transactional() {
+        let formatted = vec!["first".to_owned(), "é".to_owned()];
+        let presentations = vec![
+            RootPresentation::CanonicalValue,
+            RootPresentation::CanonicalValue,
+        ];
+        let failure = build_formatted_runner_output(
+            &formatted,
+            &presentations,
+            FormattedOutputFailureInjection::refuse_reservation(),
+        )
+        .expect_err("injected formatted output reservation refusal");
+        assert_eq!(failure, FormattedOutputFailure::AllocationUnavailable);
+        assert_eq!(
+            failure.diagnostic(),
+            "error: unable to allocate formatted output"
+        );
+        assert_eq!(
+            build_formatted_runner_output(
+                &formatted,
+                &presentations,
+                FormattedOutputFailureInjection::none()
+            ),
+            Ok("first\né\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn raw_and_canonical_roots_publish_in_source_order_without_implicit_raw_newline() {
+        let formatted = vec!["1".to_owned(), "raw=é\0".to_owned(), "\"tail\"".to_owned()];
+        let presentations = vec![
+            RootPresentation::CanonicalValue,
+            RootPresentation::RawString,
+            RootPresentation::CanonicalValue,
+        ];
+        assert_eq!(
+            build_formatted_runner_output(
+                &formatted,
+                &presentations,
+                FormattedOutputFailureInjection::none(),
+            ),
+            Ok("1\nraw=é\0\"tail\"\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn mixed_root_output_failures_report_exact_bytes_and_only_the_accepted_prefix() {
+        let formatted = vec!["1".to_owned(), "raw=é\0".to_owned(), "\"tail\"".to_owned()];
+        let presentations = vec![
+            RootPresentation::CanonicalValue,
+            RootPresentation::RawString,
+            RootPresentation::CanonicalValue,
+        ];
+        let output = build_formatted_runner_output(
+            &formatted,
+            &presentations,
+            FormattedOutputFailureInjection::none(),
+        )
+        .expect("build mixed output");
+        assert_eq!(output.as_bytes(), b"1\nraw=\xc3\xa9\0\"tail\"\n");
+
+        let mut short = RecordingShortWriter {
+            accepted: 9,
+            flush_ok: true,
+            bytes: Vec::new(),
+        };
+        let write_failure =
+            publish_to(&mut short, output.as_bytes()).expect_err("mixed short write");
+        assert_eq!(
+            write_failure,
+            OutputPublicationFailure {
+                reason: OutputFailureReason::WriteFailed,
+                pending_byte_count: 16,
+                accepted_byte_count: 9,
+                output_position: 9,
+            }
+        );
+        assert_eq!(short.bytes, b"1\nraw=\xc3\xa9\0");
+
+        let mut flush = RecordingShortWriter {
+            accepted: usize::MAX,
+            flush_ok: false,
+            bytes: Vec::new(),
+        };
+        let flush_failure =
+            publish_to(&mut flush, output.as_bytes()).expect_err("mixed flush failure");
+        assert_eq!(
+            flush_failure,
+            OutputPublicationFailure {
+                reason: OutputFailureReason::FlushFailed,
+                pending_byte_count: 16,
+                accepted_byte_count: 16,
+                output_position: 16,
+            }
+        );
+        assert_eq!(flush.bytes, output.as_bytes());
+    }
+
+    #[test]
+    fn both_runner_entry_paths_use_fallible_argument_reservation() {
+        let fixture = RunnerFixture::new();
+        for command in ["run", "run-ir"] {
+            let published_bytes = Cell::new(0usize);
+            let observed_failure = Cell::new(None);
+            run_cli_with_runner_support(
+                fixture.arguments(command),
+                RunnerFailureInjection::refuse_argument_reservation(),
+                |bytes| {
+                    published_bytes.set(published_bytes.get() + bytes.len());
+                    Ok(())
+                },
+                |failure| observed_failure.set(Some(failure)),
+            )
+            .expect_err("injected runner argument reservation refusal");
+            let failure = observed_failure
+                .get()
+                .expect("runner argument failure was reported");
+            assert_eq!(
+                failure,
+                RunnerCommandFailure::CommandLineArguments(
+                    CommandLineArgumentFailure::AllocationUnavailable
+                ),
+                "{command}"
+            );
+            assert_eq!(
+                failure.diagnostic(),
+                Some("error: unable to allocate command-line arguments"),
+                "{command}"
+            );
+            assert_eq!(published_bytes.get(), 0, "{command}");
+        }
+    }
+
+    #[test]
+    fn both_runner_entry_paths_pre_reserve_complete_formatted_output() {
+        let fixture = RunnerFixture::new();
+        for command in ["run", "run-ir"] {
+            let published_bytes = Cell::new(0usize);
+            let observed_failure = Cell::new(None);
+            run_cli_with_runner_support(
+                fixture.arguments(command),
+                RunnerFailureInjection::refuse_formatted_output_reservation(),
+                |bytes| {
+                    published_bytes.set(published_bytes.get() + bytes.len());
+                    Ok(())
+                },
+                |failure| observed_failure.set(Some(failure)),
+            )
+            .expect_err("injected runner formatted output reservation refusal");
+            let failure = observed_failure
+                .get()
+                .expect("runner formatted output failure was reported");
+            assert_eq!(
+                failure,
+                RunnerCommandFailure::FormattedOutput(
+                    FormattedOutputFailure::AllocationUnavailable
+                ),
+                "{command}"
+            );
+            assert_eq!(
+                failure.diagnostic(),
+                Some("error: unable to allocate formatted output"),
+                "{command}"
+            );
+            assert_eq!(published_bytes.get(), 0, "{command}");
+        }
     }
 
     #[test]

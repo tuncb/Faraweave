@@ -23,6 +23,7 @@ pub(crate) enum Conversion {
 pub(crate) enum OperandConsumption {
     Elementwise,
     WholeVector,
+    AtomicScalar,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +40,7 @@ pub(crate) enum ResultCardinality {
     DynamicVector,
     PreserveOperand(u16),
     OperandPlusOne(u16),
+    SubsetOfOperand(u16),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,8 +52,15 @@ pub(crate) enum WorkAdmission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionSequence {
+    Combined,
+    WorkThenResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceAdmissionPlan {
     pub work: WorkAdmission,
+    pub sequence: AdmissionSequence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +82,7 @@ pub(crate) enum StructuralBehavior {
     VectorNoneOf,
     Foldl,
     Scanl,
+    VectorFilter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,9 +106,12 @@ pub(crate) enum ScalarKernel {
     LengthBoolVector,
     LengthIntVector,
     LengthDoubleVector,
+    LengthString,
+    LengthStringVector,
     SortBoolVector,
     SortIntVector,
     SortDoubleVector,
+    SortStringVector,
     SumIntVector,
     SumDoubleVector,
     AllOfBoolVector,
@@ -110,12 +123,17 @@ pub(crate) enum ScalarKernel {
     ScanlBool,
     ScanlInt,
     ScanlDouble,
+    FilterBool,
+    FilterInt,
+    FilterDouble,
     EqualsBool,
     EqualsInt,
     EqualsDouble,
+    EqualsString,
     NotEqualsBool,
     NotEqualsInt,
     NotEqualsDouble,
+    NotEqualsString,
     NotBool,
     AndBool,
     OrBool,
@@ -127,8 +145,10 @@ pub(crate) enum ScalarKernel {
     IsNegativeDouble,
     LessThanInt,
     LessThanDouble,
+    LessThanString,
     GreaterThanInt,
     GreaterThanDouble,
+    GreaterThanString,
     IotaInt,
     SqrtDouble,
     ExpDouble,
@@ -226,10 +246,10 @@ impl InternalRegistryDiagnosticFailureInjection {
     }
 }
 
-const PRIMITIVE_COUNT: u16 = 38;
-const SIGNATURE_COUNT: u16 = 63;
-const IMPLEMENTATION_COUNT: u16 = 63;
-const APPLICATION_PLAN_COUNT: u16 = 10;
+const PRIMITIVE_COUNT: u16 = 39;
+const SIGNATURE_COUNT: u16 = 73;
+const IMPLEMENTATION_COUNT: u16 = 73;
+const APPLICATION_PLAN_COUNT: u16 = 11;
 
 const fn elementwise(element_type: ScalarType) -> OperandDescriptor {
     OperandDescriptor {
@@ -245,6 +265,13 @@ const fn whole_vector(element_type: ScalarType) -> OperandDescriptor {
     }
 }
 
+const fn atomic_scalar(element_type: ScalarType) -> OperandDescriptor {
+    OperandDescriptor {
+        element_type,
+        consumption: OperandConsumption::AtomicScalar,
+    }
+}
+
 const INT1: &[OperandDescriptor] = &[elementwise(ScalarType::Int)];
 const DOUBLE1: &[OperandDescriptor] = &[elementwise(ScalarType::Double)];
 const BOOL1: &[OperandDescriptor] = &[elementwise(ScalarType::Bool)];
@@ -254,9 +281,15 @@ const DOUBLE2: &[OperandDescriptor] = &[
     elementwise(ScalarType::Double),
 ];
 const BOOL2: &[OperandDescriptor] = &[elementwise(ScalarType::Bool), elementwise(ScalarType::Bool)];
+const STRING2: &[OperandDescriptor] = &[
+    elementwise(ScalarType::String),
+    elementwise(ScalarType::String),
+];
 const WHOLE_BOOL1: &[OperandDescriptor] = &[whole_vector(ScalarType::Bool)];
 const WHOLE_INT1: &[OperandDescriptor] = &[whole_vector(ScalarType::Int)];
 const WHOLE_DOUBLE1: &[OperandDescriptor] = &[whole_vector(ScalarType::Double)];
+const WHOLE_STRING1: &[OperandDescriptor] = &[whole_vector(ScalarType::String)];
+const ATOMIC_STRING1: &[OperandDescriptor] = &[atomic_scalar(ScalarType::String)];
 const FOLDL_BOOL: &[OperandDescriptor] = &[
     elementwise(ScalarType::Bool),
     whole_vector(ScalarType::Bool),
@@ -273,6 +306,7 @@ const ELEMENTWISE_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::Elementwise,
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::ResultCardinality,
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -281,6 +315,7 @@ const IOTA_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::DynamicVector,
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::ResultCardinality,
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -289,6 +324,7 @@ const LENGTH_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::Scalar,
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::Constant(1),
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -297,6 +333,7 @@ const SORT_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::PreserveOperand(1),
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::OperandCardinality(1),
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -305,6 +342,7 @@ const SUM_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::Scalar,
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::OperandCardinality(1),
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -313,6 +351,7 @@ const ALL_OF_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::Scalar,
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::OperandCardinality(1),
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -321,6 +360,7 @@ const ANY_OF_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::Scalar,
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::OperandCardinality(1),
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -329,6 +369,7 @@ const NONE_OF_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::Scalar,
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::OperandCardinality(1),
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -337,6 +378,7 @@ const FOLDL_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::Scalar,
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::OperandCardinality(2),
+        sequence: AdmissionSequence::Combined,
     },
 };
 
@@ -345,6 +387,16 @@ const SCANL_PLAN: ApplicationPlan = ApplicationPlan {
     result_cardinality: ResultCardinality::OperandPlusOne(2),
     resources: ResourceAdmissionPlan {
         work: WorkAdmission::OperandCardinality(2),
+        sequence: AdmissionSequence::Combined,
+    },
+};
+
+const FILTER_PLAN: ApplicationPlan = ApplicationPlan {
+    id: ApplicationPlanId(11),
+    result_cardinality: ResultCardinality::SubsetOfOperand(1),
+    resources: ResourceAdmissionPlan {
+        work: WorkAdmission::OperandCardinality(1),
+        sequence: AdmissionSequence::WorkThenResult,
     },
 };
 
@@ -359,6 +411,7 @@ const APPLICATION_PLANS: &[ApplicationPlan] = &[
     NONE_OF_PLAN,
     FOLDL_PLAN,
     SCANL_PLAN,
+    FILTER_PLAN,
 ];
 
 pub(crate) const BACKEND_NATIVE_MATH_FIRST_PRIMITIVE_ID: u16 = 29;
@@ -1039,6 +1092,116 @@ pub(crate) const SEMANTIC_REGISTRY: &[SemanticDescriptor] = &[
         ELEMENTWISE_PLAN,
         TruncDouble
     ),
+    descriptor!(
+        39,
+        "filter",
+        64,
+        64,
+        WHOLE_BOOL1,
+        Bool,
+        VectorFilter,
+        FILTER_PLAN,
+        FilterBool
+    ),
+    descriptor!(
+        39,
+        "filter",
+        65,
+        65,
+        WHOLE_INT1,
+        Int,
+        VectorFilter,
+        FILTER_PLAN,
+        FilterInt
+    ),
+    descriptor!(
+        39,
+        "filter",
+        66,
+        66,
+        WHOLE_DOUBLE1,
+        Double,
+        VectorFilter,
+        FILTER_PLAN,
+        FilterDouble
+    ),
+    descriptor!(
+        8,
+        "equals",
+        67,
+        67,
+        STRING2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        EqualsString
+    ),
+    descriptor!(
+        9,
+        "not_equals",
+        68,
+        68,
+        STRING2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        NotEqualsString
+    ),
+    descriptor!(
+        17,
+        "less_than",
+        69,
+        69,
+        STRING2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        LessThanString
+    ),
+    descriptor!(
+        18,
+        "greater_than",
+        70,
+        70,
+        STRING2,
+        Bool,
+        Elementwise,
+        ELEMENTWISE_PLAN,
+        GreaterThanString
+    ),
+    descriptor!(
+        21,
+        "length",
+        71,
+        71,
+        ATOMIC_STRING1,
+        Int,
+        VectorLength,
+        LENGTH_PLAN,
+        LengthString
+    ),
+    descriptor!(
+        21,
+        "length",
+        72,
+        72,
+        WHOLE_STRING1,
+        Int,
+        VectorLength,
+        LENGTH_PLAN,
+        LengthStringVector
+    ),
+    descriptor!(
+        22,
+        "sort",
+        73,
+        73,
+        WHOLE_STRING1,
+        String,
+        VectorSort,
+        SORT_PLAN,
+        SortStringVector
+    ),
 ];
 
 impl PrimitiveId {
@@ -1133,6 +1296,22 @@ pub(crate) fn conversion(actual: ScalarType, accepted: ScalarType) -> Option<Con
     }
 }
 
+pub(crate) fn is_total_unary_predicate(descriptor: &SemanticDescriptor) -> bool {
+    descriptor.behavior == StructuralBehavior::Elementwise
+        && descriptor.result == ScalarType::Bool
+        && descriptor.parameters.len() == 1
+        && matches!(
+            descriptor.kernel,
+            ScalarKernel::NotBool
+                | ScalarKernel::OddInt
+                | ScalarKernel::EvenInt
+                | ScalarKernel::IsPositiveInt
+                | ScalarKernel::IsPositiveDouble
+                | ScalarKernel::IsNegativeInt
+                | ScalarKernel::IsNegativeDouble
+        )
+}
+
 /// Writes a human-readable view of the production semantic registry.
 ///
 /// This is internal diagnostic output: its spelling and layout are not a stable
@@ -1218,6 +1397,12 @@ fn write_registry_diagnostics(
         write_result_cardinality(output, descriptor.application_plan.result_cardinality)?;
         write!(output, " work=").map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
         write_work_admission(output, descriptor.application_plan.resources.work)?;
+        write!(
+            output,
+            " admission_sequence={}",
+            admission_sequence_name(descriptor.application_plan.resources.sequence)
+        )
+        .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
         writeln!(output, " kernel={}", scalar_kernel_name(descriptor.kernel),)
             .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)?;
     }
@@ -1261,6 +1446,7 @@ const fn operand_consumption_name(value: OperandConsumption) -> &'static str {
     match value {
         OperandConsumption::Elementwise => "elementwise",
         OperandConsumption::WholeVector => "whole_vector",
+        OperandConsumption::AtomicScalar => "atomic_scalar",
     }
 }
 
@@ -1277,6 +1463,9 @@ fn write_result_cardinality(
         }
         ResultCardinality::OperandPlusOne(position) => {
             write!(output, "operand_plus_one({position})")
+        }
+        ResultCardinality::SubsetOfOperand(position) => {
+            write!(output, "subset_of_operand({position})")
         }
     }
     .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)
@@ -1296,6 +1485,13 @@ fn write_work_admission(
     .map_err(|_| InternalRegistryDiagnosticError::WriteFailed)
 }
 
+const fn admission_sequence_name(value: AdmissionSequence) -> &'static str {
+    match value {
+        AdmissionSequence::Combined => "combined",
+        AdmissionSequence::WorkThenResult => "work_then_result",
+    }
+}
+
 const fn structural_behavior_name(value: StructuralBehavior) -> &'static str {
     match value {
         StructuralBehavior::Elementwise => "elementwise",
@@ -1308,6 +1504,7 @@ const fn structural_behavior_name(value: StructuralBehavior) -> &'static str {
         StructuralBehavior::VectorNoneOf => "vector_none_of",
         StructuralBehavior::Foldl => "foldl",
         StructuralBehavior::Scanl => "scanl",
+        StructuralBehavior::VectorFilter => "vector_filter",
     }
 }
 
@@ -1332,9 +1529,11 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::EqualsBool => "equals_bool",
         ScalarKernel::EqualsInt => "equals_int",
         ScalarKernel::EqualsDouble => "equals_double",
+        ScalarKernel::EqualsString => "equals_string",
         ScalarKernel::NotEqualsBool => "not_equals_bool",
         ScalarKernel::NotEqualsInt => "not_equals_int",
         ScalarKernel::NotEqualsDouble => "not_equals_double",
+        ScalarKernel::NotEqualsString => "not_equals_string",
         ScalarKernel::NotBool => "not_bool",
         ScalarKernel::AndBool => "and_bool",
         ScalarKernel::OrBool => "or_bool",
@@ -1346,15 +1545,20 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::IsNegativeDouble => "is_negative_double",
         ScalarKernel::LessThanInt => "less_than_int",
         ScalarKernel::LessThanDouble => "less_than_double",
+        ScalarKernel::LessThanString => "less_than_string",
         ScalarKernel::GreaterThanInt => "greater_than_int",
         ScalarKernel::GreaterThanDouble => "greater_than_double",
+        ScalarKernel::GreaterThanString => "greater_than_string",
         ScalarKernel::IotaInt => "iota_int",
         ScalarKernel::LengthBoolVector => "length_bool_vector",
         ScalarKernel::LengthIntVector => "length_int_vector",
         ScalarKernel::LengthDoubleVector => "length_double_vector",
+        ScalarKernel::LengthString => "length_string",
+        ScalarKernel::LengthStringVector => "length_string_vector",
         ScalarKernel::SortBoolVector => "sort_bool_vector",
         ScalarKernel::SortIntVector => "sort_int_vector",
         ScalarKernel::SortDoubleVector => "sort_double_vector",
+        ScalarKernel::SortStringVector => "sort_string_vector",
         ScalarKernel::SumIntVector => "sum_int_vector",
         ScalarKernel::SumDoubleVector => "sum_double_vector",
         ScalarKernel::AllOfBoolVector => "all_of_bool_vector",
@@ -1366,6 +1570,9 @@ const fn scalar_kernel_name(value: ScalarKernel) -> &'static str {
         ScalarKernel::ScanlBool => "scanl_bool",
         ScalarKernel::ScanlInt => "scanl_int",
         ScalarKernel::ScanlDouble => "scanl_double",
+        ScalarKernel::FilterBool => "filter_bool",
+        ScalarKernel::FilterInt => "filter_int",
+        ScalarKernel::FilterDouble => "filter_double",
         ScalarKernel::SqrtDouble => "sqrt_double",
         ScalarKernel::ExpDouble => "exp_double",
         ScalarKernel::LogDouble => "log_double",
@@ -1553,18 +1760,31 @@ fn valid_application_plan(descriptor: &SemanticDescriptor) -> bool {
             .iter()
             .all(|operand| operand.consumption == OperandConsumption::Elementwise),
         ResultCardinality::DynamicVector => true,
-        ResultCardinality::Scalar => descriptor
-            .parameters
-            .iter()
-            .any(|operand| operand.consumption == OperandConsumption::WholeVector),
+        ResultCardinality::Scalar => descriptor.parameters.iter().any(|operand| {
+            matches!(
+                operand.consumption,
+                OperandConsumption::WholeVector | OperandConsumption::AtomicScalar
+            )
+        }),
         ResultCardinality::PreserveOperand(position)
-        | ResultCardinality::OperandPlusOne(position) => whole_vector_at(position),
+        | ResultCardinality::OperandPlusOne(position)
+        | ResultCardinality::SubsetOfOperand(position) => whole_vector_at(position),
     };
     let work_valid = match descriptor.application_plan.resources.work {
         WorkAdmission::Constant(_) | WorkAdmission::ResultCardinality => true,
         WorkAdmission::OperandCardinality(position) => whole_vector_at(position),
     };
-    result_valid && work_valid
+    let sequence_valid = match descriptor.application_plan.resources.sequence {
+        AdmissionSequence::Combined => !matches!(
+            descriptor.application_plan.result_cardinality,
+            ResultCardinality::SubsetOfOperand(_)
+        ),
+        AdmissionSequence::WorkThenResult => matches!(
+            descriptor.application_plan.result_cardinality,
+            ResultCardinality::SubsetOfOperand(_)
+        ),
+    };
+    result_valid && work_valid && sequence_valid
 }
 
 #[cfg(test)]
@@ -1651,7 +1871,13 @@ mod tests {
             );
         }
         let mut descriptors = SEMANTIC_REGISTRY.iter().collect::<Vec<_>>();
-        descriptors.sort_unstable_by_key(|descriptor| descriptor.signature_id.numeric());
+        descriptors.sort_unstable_by_key(|descriptor| {
+            (
+                descriptor.primitive_id.numeric(),
+                descriptor.signature_id.numeric(),
+                descriptor.implementation_id.numeric(),
+            )
+        });
         for (descriptor, line) in descriptors.into_iter().zip(signature_lines) {
             let marker = format!(
                 "  signature id={} implementation={} ",
@@ -1696,19 +1922,19 @@ mod tests {
         assert!(output.contains(
             "primitive id=19 name=iota behavior=iota\n  signature id=34 implementation=34 \
              parameters=[1:accepted=Int,lift=elementwise,actual={Int:identity}] result=Int \
-             application_plan=2 result_cardinality=dynamic_vector work=result_cardinality \
-             kernel=iota_int\n"
+            application_plan=2 result_cardinality=dynamic_vector work=result_cardinality \
+             admission_sequence=combined kernel=iota_int\n"
         ));
         assert!(output.contains(
             "primitive id=21 name=length behavior=vector_length\n  signature id=37 \
              implementation=37 parameters=[1:accepted=Bool,lift=whole_vector,\
              actual={Bool:identity}] result=Int application_plan=3 result_cardinality=scalar \
-             work=constant(1) kernel=length_bool_vector\n  signature id=38 implementation=38 \
+             work=constant(1) admission_sequence=combined kernel=length_bool_vector\n  signature id=38 implementation=38 \
              parameters=[1:accepted=Int,lift=whole_vector,actual={Int:identity}] result=Int \
-             application_plan=3 result_cardinality=scalar work=constant(1) \
+             application_plan=3 result_cardinality=scalar work=constant(1) admission_sequence=combined \
              kernel=length_int_vector\n  signature id=39 implementation=39 \
              parameters=[1:accepted=Double,lift=whole_vector,actual={Double:identity}] result=Int \
-             application_plan=3 result_cardinality=scalar work=constant(1) \
+             application_plan=3 result_cardinality=scalar work=constant(1) admission_sequence=combined \
              kernel=length_double_vector\n"
         ));
         assert!(
@@ -1870,6 +2096,16 @@ mod tests {
             (36, "floor"),
             (37, "ceil"),
             (38, "trunc"),
+            (39, "filter"),
+            (39, "filter"),
+            (39, "filter"),
+            (8, "equals"),
+            (9, "not_equals"),
+            (17, "less_than"),
+            (18, "greater_than"),
+            (21, "length"),
+            (21, "length"),
+            (22, "sort"),
         ];
         assert_eq!(SEMANTIC_REGISTRY.len(), expected_primitives.len());
         for (index, (descriptor, expected)) in SEMANTIC_REGISTRY
@@ -1895,6 +2131,7 @@ mod tests {
         assert_eq!(primitive_from_name("none_of"), primitive_from_numeric(26));
         assert_eq!(primitive_from_name("foldl"), primitive_from_numeric(27));
         assert_eq!(primitive_from_name("scanl"), primitive_from_numeric(28));
+        assert_eq!(primitive_from_name("filter"), primitive_from_numeric(39));
         assert_eq!(
             signature_from_numeric(36).map(|descriptor| descriptor.primitive_name),
             Ok("div")
@@ -2079,7 +2316,10 @@ mod tests {
                     descriptor.application_plan == LENGTH_PLAN
                         && descriptor.result == ScalarType::Int
                         && descriptor.parameters.len() == 1
-                        && descriptor.parameters[0].consumption == OperandConsumption::WholeVector
+                        && matches!(
+                            descriptor.parameters[0].consumption,
+                            OperandConsumption::WholeVector | OperandConsumption::AtomicScalar
+                        )
                 })
         );
         assert_eq!(
@@ -2171,15 +2411,24 @@ mod tests {
             Err(RegistryLookupError::PrimitiveId)
         );
         assert_eq!(
-            signature_from_numeric(64),
+            signature_from_numeric(66).map(|descriptor| descriptor.primitive_name),
+            Ok("filter")
+        );
+        assert_eq!(
+            implementation_from_numeric(66).map(|descriptor| descriptor.kernel),
+            Ok(ScalarKernel::FilterDouble)
+        );
+        assert_eq!(application_plan_from_numeric(11), Ok(FILTER_PLAN));
+        assert_eq!(
+            signature_from_numeric(74),
             Err(RegistryLookupError::SignatureId)
         );
         assert_eq!(
-            implementation_from_numeric(64),
+            implementation_from_numeric(74),
             Err(RegistryLookupError::ImplementationId)
         );
         assert_eq!(
-            application_plan_from_numeric(11),
+            application_plan_from_numeric(12),
             Err(RegistryLookupError::ApplicationPlanId)
         );
     }
@@ -2217,9 +2466,13 @@ mod tests {
             Err(RegistryValidationError::DuplicatePrimitiveName)
         );
 
-        let missing = &SEMANTIC_REGISTRY[..SEMANTIC_REGISTRY.len() - 3];
+        let missing = SEMANTIC_REGISTRY
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.primitive_id.numeric() != 39)
+            .collect::<Vec<_>>();
         assert_eq!(
-            validate_registry(missing),
+            validate_registry(&missing),
             Err(RegistryValidationError::MissingPrimitiveId)
         );
 
@@ -2327,6 +2580,7 @@ mod tests {
             result_cardinality: ResultCardinality::Scalar,
             resources: ResourceAdmissionPlan {
                 work: WorkAdmission::Constant(1),
+                sequence: AdmissionSequence::Combined,
             },
         };
         assert_eq!(
@@ -2348,6 +2602,7 @@ mod tests {
             result_cardinality: ResultCardinality::Scalar,
             resources: ResourceAdmissionPlan {
                 work: WorkAdmission::OperandCardinality(1),
+                sequence: AdmissionSequence::Combined,
             },
         };
 
@@ -2398,6 +2653,7 @@ mod tests {
             result_cardinality: ResultCardinality::Scalar,
             resources: ResourceAdmissionPlan {
                 work: WorkAdmission::OperandCardinality(1),
+                sequence: AdmissionSequence::Combined,
             },
         };
         assert!(valid_application_plan(&descriptor));
@@ -2406,6 +2662,11 @@ mod tests {
         assert!(valid_application_plan(&descriptor));
         descriptor.application_plan.result_cardinality = ResultCardinality::OperandPlusOne(1);
         assert!(valid_application_plan(&descriptor));
+        descriptor.application_plan.result_cardinality = ResultCardinality::SubsetOfOperand(1);
+        assert!(!valid_application_plan(&descriptor));
+        descriptor.application_plan.resources.sequence = AdmissionSequence::WorkThenResult;
+        assert!(valid_application_plan(&descriptor));
+        descriptor.application_plan.resources.sequence = AdmissionSequence::Combined;
 
         descriptor.application_plan.result_cardinality = ResultCardinality::PreserveOperand(2);
         assert!(!valid_application_plan(&descriptor));

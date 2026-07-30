@@ -32,14 +32,20 @@ Result = Elementwise
        | DynamicVector
        | PreserveOperand(one-based position)
        | OperandPlusOne(one-based position)
+       | SubsetOfOperand(one-based position)
 
 Work   = Constant(n)
        | ResultCardinality
        | OperandCardinality(one-based position)
+
+Admission = Combined
+          | WorkThenResult
 ```
 
-`PreserveOperand` and `OperandPlusOne` may reference only a `WholeVector`
-operand. Checked overflow of `OperandPlusOne`, result byte sizing, prospective
+`PreserveOperand`, `OperandPlusOne`, and `SubsetOfOperand` may reference only a
+`WholeVector` operand. `SubsetOfOperand` always produces dynamic vector
+metadata and requires `WorkThenResult`; every other result rule uses
+`Combined`. Checked overflow of `OperandPlusOne`, result byte sizing, prospective
 live bytes, work, allocation ordinal, admission commit, physical allocation,
 kernel execution, and cleanup retain the failure order in `FWIR-SEM-014`.
 Work is admitted in full before implementation execution, so short-circuiting
@@ -54,8 +60,8 @@ conversion, result type, result cardinality, lift/container mode, shape
 sidecars, resource plan references, and required features before any backend
 runs.
 
-The interpreter and C emitter consume the verified implementation and
-application-plan IDs directly. They must not use a source name to recover
+The interpreter consumes the verified implementation and application-plan IDs
+directly. It must not use a source name to recover
 container semantics, repeat overload selection, treat a whole vector as a
 sequence of scalar calls, or derive a different work request.
 
@@ -73,8 +79,8 @@ physical format minor 1. With that feature, mandatory section
 `node:u32`, `application_plan_id:u16`, and `reserved:u16`. Every SelectedApply
 has exactly one nonzero plan record and the reserved field is zero.
 
-`NODE.a7` remains zero except for a `foldl` or `scanl` SelectedApply under
-feature 6, where it is the one-based index of the selected reducer's `OPRF`
+`NODE.a7` remains zero except for a `foldl`, `scanl`, or `filter` SelectedApply under
+feature 6, where it is the one-based index of the selected operation's `OPRF`
 record.
 Semantic/format 1.0 artifacts omit
 section 17, retain their exact canonical bytes, and keep their previous
@@ -239,11 +245,33 @@ a reducer fault reports its zero-based input step.
 
 The output is live together with the input during every reducer step. On a
 fault, the output allocation is released first, followed by the ordinary
-reverse input cleanup; completed work stays committed, no uninitialized value
-is observed, and generated C follows the same admission and cleanup order.
+reverse input cleanup; completed work stays committed and no uninitialized
+value is observed.
 The semantic initialized prefix is the seed plus completed accumulators;
 homogeneous scalar-vector slots own no child resources, so prefix cleanup is
 the single output-buffer release rather than per-element release events.
+
+## Stable unary-predicate vector filter (`FWIR-PLAN-013`)
+
+Primitive ID `39=filter` has Bool, Int, and Double whole-vector signatures with
+matching signature/implementation IDs 64, 65, and 66. It accepts one
+lowering-selected exact, total, pure `T -> Bool` `OPRF` predicate and one whole
+vector of `T`; application-plan ID 11 returns `SubsetOfOperand(1)`, admits
+`OperandCardinality(1)` work, and selects `WorkThenResult`.
+
+The interpreter admits all `n` work units before inspecting the input, invokes
+the predicate in increasing index order to discover `k`, then admits exactly
+`k` output elements with zero additional work while the input remains live.
+It allocates no Boolean mask, preserves order and element bits, and returns
+dynamic vector metadata even for a static or typed-empty input.
+
+Work stays committed if exact output admission or physical allocation fails.
+Zero-length work and output admissions emit their ordinary observer events
+without allocation ordinals; positive output refusal releases the input in
+reverse ownership order, and a natural physical allocation failure refunds
+only the output live-byte charge. Predicate selection, result type, subset
+plan, split sequence, ownership, and release points are reconstructed from the
+selected identities before interpreter execution.
 
 ## Evidence (`FWIR-PLAN-004`)
 
@@ -251,56 +279,54 @@ Registry unit tests cover stable plan lookup and changed operand/plan
 meanings. Typed-program tests cover plan reconstruction, feature/minor rules,
 and exact malformed fields; codec tests cover byte-identical 1.0 round trips,
 explicit 1.1 round trips, unknown plan rejection, and reduced-stack deep
-graphs. The full Rust and strict-C11 journeys retain cross-backend value,
-failure, resource, and allocation-refusal parity for all existing plans.
+graphs. The full Rust suites retain interpreter value, failure, resource, and
+allocation-refusal coverage for all existing plans.
 Issue #40 additionally maps `FWIR-PLAN-005` to
 `vector_length_records_container_plan_for_static_dynamic_and_empty_vectors`,
 `length_container_plan_roundtrips_and_dispatches_by_verified_identity`,
-`length_charges_constant_work_borrows_input_and_has_no_result_allocation`, and
-the strict C11 journey.
+`length_charges_constant_work_borrows_input_and_has_no_result_allocation`.
 Issue #41 maps `FWIR-PLAN-006` to
 `vector_sort_records_preserved_container_plan_for_static_dynamic_and_empty_vectors`,
 `sort_container_plan_roundtrips_and_dispatches_by_verified_identity`,
 `sort_covers_exhaustive_small_bools_integer_edges_and_total_double_order`,
-`sort_admits_owned_output_with_input_live_and_cleans_up_refused_output`, the
-randomized generated-C differential corpus, and the strict C11 journey.
+`sort_admits_owned_output_with_input_live_and_cleans_up_refused_output`.
 Issue #42 maps `FWIR-PLAN-007` to
 `vector_sum_records_scalar_container_plan_for_static_dynamic_and_empty_vectors`,
 `sum_container_plan_roundtrips_and_dispatches_by_verified_identity`,
 `sum_int_overflow_reports_the_first_reduction_step_and_operands`,
 `sum_double_is_left_to_right_strict_and_preserves_special_value_bits`,
-`sum_charges_full_work_before_reduction_and_allocates_no_result`, and the
-strict C11 success/failure journeys.
+`sum_charges_full_work_before_reduction_and_allocates_no_result`.
 Issue #43 maps `FWIR-PLAN-008` to
 `all_of_records_scalar_container_plan_for_static_dynamic_and_empty_vectors`,
 `all_of_container_plan_roundtrips_and_dispatches_by_verified_identity`,
 `all_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_false_position`,
-`all_of_work_and_observer_trace_are_independent_of_the_decisive_position`, and
-the strict C11 success journey.
+`all_of_work_and_observer_trace_are_independent_of_the_decisive_position`.
 Issue #44 maps `FWIR-PLAN-009` to
 `any_of_records_scalar_container_plan_for_static_dynamic_and_empty_vectors`,
 `any_of_container_plan_roundtrips_and_dispatches_by_verified_identity`,
 `any_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`,
-`any_of_work_and_observer_trace_are_independent_of_the_decisive_position`, and
-the strict C11 success journey.
+`any_of_work_and_observer_trace_are_independent_of_the_decisive_position`.
 Issue #45 maps `FWIR-PLAN-010` to
 `none_of_records_scalar_container_plan_for_static_dynamic_and_empty_vectors`,
 `none_of_container_plan_roundtrips_and_dispatches_by_its_own_verified_identity`,
 `none_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`,
-`none_of_work_and_observer_trace_use_its_identity_at_every_decisive_position`,
-and the strict C11 success journey.
+`none_of_work_and_observer_trace_use_its_identity_at_every_decisive_position`.
 Issue #46 maps `FWIR-PLAN-011` to
 `foldl_records_reducer_identity_initializer_conversion_and_vector_work_plan`,
 `foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities`,
 `foldl_accepts_bool_int_double_empty_dynamic_and_non_associative_reducers`,
 `foldl_reports_the_leftmost_reducer_fault_with_step_operands_and_reference_origin`,
-`foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly`,
-and the strict C11 success/failure journeys.
+`foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly`.
 Issue #47 maps `FWIR-PLAN-012` to
 `scanl_records_reducer_identity_initializer_conversion_and_plus_one_plan`,
 `scanl_roundtrips_reducer_links_plus_one_shape_and_direct_dispatch`,
 `scanl_is_seed_inclusive_for_all_types_empty_dynamic_and_non_associative_inputs`,
 `scanl_reports_the_leftmost_reducer_fault_and_initialized_prefix`,
 `scanl_admits_n_plus_one_output_before_population_with_input_live`,
-`scanl_fault_releases_output_before_input_and_retains_full_work`, and the
-strict C11 success/failure journeys.
+`scanl_fault_releases_output_before_input_and_retains_full_work`.
+Issue #86 maps `FWIR-PLAN-013` to
+`filter_records_predicate_identity_dynamic_subset_plan_and_owned_input`,
+`filter_roundtrips_predicate_links_dynamic_subset_metadata_and_direct_dispatch`,
+`filter_is_stable_typed_and_exact_for_every_allowed_predicate`,
+`filter_splits_work_and_exact_result_admission_with_input_live`, and
+`filter_refusals_preserve_phase_order_committed_work_and_cleanup`.

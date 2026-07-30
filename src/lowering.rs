@@ -1,5 +1,8 @@
 use crate::parser::parse;
-use crate::parser::{CallSyntax, Expr, ExprKind, Program, validate_parameter_declarations};
+use crate::parser::{
+    CallSyntax, ConnectedPlaceholder, ConnectedTemplate, Declaration, Expr, ExprKind, Program,
+    reserved_syntax_name, validate_parameter_declarations,
+};
 use crate::primitive::resolve_names;
 use crate::semantic_registry::{
     Conversion as RegistryConversion, OperandConsumption, ResultCardinality, SemanticDescriptor,
@@ -10,10 +13,14 @@ use crate::typed_program::{
     BuildError, Cardinality, ConstantRecord, Edge, FanOutBranch, Feature, IndexRange, LiftMode,
     Node, NodeIndex, NodeKind, OperationReference, Origin, OriginIndex, OriginPosition, OriginSpan,
     Ownership, OwnershipMode, Parameter, RawProgramBuilder, ReleaseAfter, Root, RootIndex,
-    ScalarConstant, ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess, VerifiedProgram,
-    VerifyError,
+    RootPresentation, ScalarConstant, ShapePlan, SourceUnit, TypeIndex, TypeRecord, ValueAccess,
+    VerifiedProgram, VerifyError,
 };
-use crate::{Error, ErrorKind, ScalarType, SourceLocation, SourceSpan, Type, Value};
+use crate::{
+    BindingErrorContext, BindingErrorReason, ConnectedApplicationErrorContext,
+    ConnectedApplicationErrorReason, Error, ErrorKind, ScalarType, SourceLocation, SourceSpan,
+    Type, Value,
+};
 use std::fmt::Write as _;
 
 #[derive(Debug)]
@@ -36,7 +43,15 @@ impl std::fmt::Display for CompileError {
     }
 }
 
-impl std::error::Error for CompileError {}
+impl std::error::Error for CompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::Build(error) => Some(error),
+            Self::Verify(error) => Some(error),
+        }
+    }
+}
 
 impl CompileError {
     pub(crate) fn into_evaluation_error(self) -> Error {
@@ -92,8 +107,15 @@ struct Lowerer {
     needs_application_plans: bool,
     needs_operation_references: bool,
     needs_backend_native_math: bool,
+    needs_connected_bindings: bool,
+    needs_user_bindings: bool,
+    needs_strings: bool,
+    needs_value_formatting: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
+    binding_resolution: BindingResolution,
+    bindings: Vec<Option<Lowered>>,
+    binding_last_consumers: Vec<Option<NodeIndex>>,
     first_shape_error: Option<Error>,
     diagnostics: DiagnosticReservations,
 }
@@ -132,6 +154,7 @@ struct Lowered {
     value_type: Type,
     tuple_elements: Vec<TupleElement>,
     access: ValueAccess,
+    binding: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -140,6 +163,32 @@ struct TupleElement {
     cardinality: Option<Cardinality>,
     origin: OriginIndex,
     location: SourceLocation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BindingUseMode {
+    Borrow,
+    Move,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedBindingReference {
+    offset: usize,
+    symbol: ResolvedSymbol,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResolvedSymbol {
+    Parameter(usize),
+    Binding {
+        binding: usize,
+        mode: BindingUseMode,
+    },
+}
+
+#[derive(Default)]
+struct BindingResolution {
+    references: Vec<ResolvedBindingReference>,
 }
 
 pub(crate) fn compile_source_with_name(
@@ -163,10 +212,398 @@ pub(crate) fn compile_parsed_source_with_name(
     program: &Program,
 ) -> Result<VerifiedProgram, CompileError> {
     validate_parameter_declarations(program)?;
+    validate_format_forms(program)?;
+    let binding_resolution = analyze_bindings(program)?;
     validate_operation_reference_positions(program)?;
     resolve_names(program)?;
     validate_program_arities(program)?;
-    lower_program(source, diagnostic_name, program)
+    lower_program(source, diagnostic_name, program, binding_resolution)
+}
+
+fn analyze_bindings(program: &Program) -> Result<BindingResolution, LowerError> {
+    let mut declaration_names = Vec::new();
+    declaration_names
+        .try_reserve_exact(program.declarations.len())
+        .map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Node,
+            })
+        })?;
+    declaration_names.extend(0..program.declarations.len());
+    declaration_names.sort_unstable_by(|left, right| {
+        program.declarations[*left]
+            .name
+            .cmp(&program.declarations[*right].name)
+            .then_with(|| left.cmp(right))
+    });
+    let mut duplicate_in_source_order = None;
+    let mut group_start = 0;
+    while group_start < declaration_names.len() {
+        let earliest = declaration_names[group_start];
+        let mut group_end = group_start + 1;
+        while group_end < declaration_names.len()
+            && program.declarations[declaration_names[group_end]].name
+                == program.declarations[earliest].name
+        {
+            let duplicate = declaration_names[group_end];
+            if duplicate_in_source_order.is_none_or(|(current, _)| duplicate < current) {
+                duplicate_in_source_order = Some((duplicate, earliest));
+            }
+            group_end += 1;
+        }
+        group_start = group_end;
+    }
+    if let Some((duplicate, earlier)) = duplicate_in_source_order {
+        let declaration = &program.declarations[duplicate];
+        return Err(binding_error(
+            BindingErrorReason::DuplicateName,
+            declaration,
+            Some(declaration.name_span),
+            Some(program.declarations[earlier].name_span),
+            "duplicate binding declaration",
+        ));
+    }
+    for declaration in &program.declarations {
+        if let Some(parameter) = program
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == declaration.name)
+        {
+            return Err(binding_error(
+                BindingErrorReason::Shadowing,
+                declaration,
+                Some(declaration.name_span),
+                Some(parameter.name_span),
+                "binding name shadows a parameter",
+            ));
+        }
+        if reserved_syntax_name(&declaration.name) || primitive_from_name(&declaration.name).is_ok()
+        {
+            return Err(binding_error(
+                BindingErrorReason::ReservedName,
+                declaration,
+                Some(declaration.name_span),
+                Some(declaration.name_span),
+                "binding name is reserved",
+            ));
+        }
+    }
+
+    let mut resolution = BindingResolution::default();
+    let mut uses: Vec<Vec<(BindingUseMode, SourceSpan)>> = Vec::new();
+    uses.try_reserve_exact(program.declarations.len())
+        .map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Node,
+            })
+        })?;
+    uses.resize_with(program.declarations.len(), Vec::new);
+
+    let mut next_declaration = 0usize;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(next_declaration)
+            .is_some_and(|declaration| declaration.before_root == boundary)
+        {
+            let declaration = &program.declarations[next_declaration];
+            analyze_expression_bindings(
+                program,
+                &declaration.initializer,
+                true,
+                Some(next_declaration),
+                next_declaration,
+                &declaration_names,
+                &mut resolution,
+                &mut uses,
+            )?;
+            next_declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            analyze_expression_bindings(
+                program,
+                root,
+                true,
+                None,
+                next_declaration,
+                &declaration_names,
+                &mut resolution,
+                &mut uses,
+            )?;
+        }
+    }
+
+    for (index, declaration_uses) in uses.iter().enumerate() {
+        let declaration = &program.declarations[index];
+        if declaration_uses.is_empty() {
+            return Err(binding_error(
+                BindingErrorReason::UnusedBinding,
+                declaration,
+                None,
+                Some(declaration.name_span),
+                "binding is never used",
+            ));
+        }
+        let mut moved = None;
+        for (mode, span) in declaration_uses {
+            match (*mode, moved) {
+                (BindingUseMode::Move, Some(previous)) => {
+                    return Err(binding_reference_error(
+                        BindingErrorReason::MultipleOwnershipEscape,
+                        declaration,
+                        *span,
+                        Some(previous),
+                        "binding has more than one ownership escape",
+                    ));
+                }
+                (BindingUseMode::Move, None) => moved = Some(*span),
+                (BindingUseMode::Borrow, Some(previous)) => {
+                    return Err(binding_reference_error(
+                        BindingErrorReason::UseAfterMove,
+                        declaration,
+                        *span,
+                        Some(previous),
+                        "binding is used after its ownership move",
+                    ));
+                }
+                (BindingUseMode::Borrow, None) => {}
+            }
+        }
+    }
+    resolution
+        .references
+        .sort_unstable_by_key(|reference| reference.offset);
+    Ok(resolution)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_expression_bindings(
+    program: &Program,
+    expression: &Expr,
+    owning: bool,
+    current_declaration: Option<usize>,
+    active_declarations: usize,
+    declaration_names: &[usize],
+    resolution: &mut BindingResolution,
+    uses: &mut [Vec<(BindingUseMode, SourceSpan)>],
+) -> Result<(), LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.push((expression, owning));
+    while let Some((current, current_owning)) = pending.pop() {
+        match &current.kind {
+            ExprKind::UnresolvedName { name, name_span } => {
+                let declaration_index = declaration_names
+                    .binary_search_by(|index| {
+                        program.declarations[*index]
+                            .name
+                            .as_str()
+                            .cmp(name.as_str())
+                    })
+                    .ok()
+                    .and_then(|position| declaration_names.get(position))
+                    .copied();
+                let binding = declaration_index.filter(|index| *index < active_declarations);
+                let Some(binding) = binding else {
+                    if let Some(parameter) = program
+                        .parameters
+                        .iter()
+                        .position(|parameter| parameter.name == *name)
+                    {
+                        resolution.references.try_reserve(1).map_err(|_| {
+                            LowerError::Build(BuildError::AllocationUnavailable {
+                                arena: crate::Arena::Node,
+                            })
+                        })?;
+                        resolution.references.push(ResolvedBindingReference {
+                            offset: name_span.begin.offset,
+                            symbol: ResolvedSymbol::Parameter(parameter),
+                        });
+                        continue;
+                    }
+                    let declaration =
+                        current_declaration.and_then(|index| program.declarations.get(index));
+                    if let Some(declaration) = declaration
+                        && declaration.name == *name
+                    {
+                        return Err(binding_reference_error(
+                            BindingErrorReason::SelfReference,
+                            declaration,
+                            *name_span,
+                            Some(declaration.name_span),
+                            "binding initializer references its own name",
+                        ));
+                    }
+                    if let Some(future) = declaration_index
+                        .filter(|index| *index >= active_declarations)
+                        .and_then(|index| program.declarations.get(index))
+                    {
+                        return Err(binding_reference_error(
+                            BindingErrorReason::ForwardReference,
+                            future,
+                            *name_span,
+                            Some(future.name_span),
+                            "binding name is not visible before its declaration",
+                        ));
+                    }
+                    return Err(binding_unknown_reference_error(*name_span));
+                };
+                let mode = if current_owning {
+                    BindingUseMode::Move
+                } else {
+                    BindingUseMode::Borrow
+                };
+                resolution.references.try_reserve(1).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                resolution.references.push(ResolvedBindingReference {
+                    offset: name_span.begin.offset,
+                    symbol: ResolvedSymbol::Binding { binding, mode },
+                });
+                let binding_uses = uses.get_mut(binding).ok_or_else(|| {
+                    LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                binding_uses.try_reserve(1).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                binding_uses.push((mode, *name_span));
+            }
+            ExprKind::Tuple(elements) => {
+                pending.try_reserve(elements.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(elements.iter().rev().map(|element| (element, true)));
+            }
+            ExprKind::Call { arguments, .. } => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
+            }
+            ExprKind::Format { arguments, .. } => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
+            }
+            ExprKind::Connected { templates, operand } => {
+                let additional = templates
+                    .iter()
+                    .try_fold(1usize, |count, template| {
+                        count.checked_add(template.arguments.len())
+                    })
+                    .ok_or(LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    }))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.push((operand, false));
+                for template in templates.iter().rev() {
+                    pending.extend(
+                        template
+                            .arguments
+                            .iter()
+                            .rev()
+                            .map(|argument| (argument, false)),
+                    );
+                }
+            }
+            ExprKind::Fanout { operand, branches } => {
+                let additional = branches.len().checked_add(1).ok_or(LowerError::Build(
+                    BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    },
+                ))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(branches.iter().rev().map(|branch| (branch, true)));
+                pending.push((operand, false));
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Vector(_, _)
+            | ExprKind::DeepTuple { .. }
+            | ExprKind::UnaryChain { .. }
+            | ExprKind::OperationReference { .. }
+            | ExprKind::ConnectedPlaceholder(_)
+            | ExprKind::Placeholder => {}
+        }
+    }
+    Ok(())
+}
+
+fn binding_error(
+    reason: BindingErrorReason,
+    declaration: &Declaration,
+    reference_span: Option<SourceSpan>,
+    related_span: Option<SourceSpan>,
+    message: &'static str,
+) -> LowerError {
+    let primary = reference_span.unwrap_or(declaration.name_span);
+    let mut error = Error::at_span(ErrorKind::BindingError, primary, message);
+    error.binding = BindingErrorContext::try_new(
+        reason,
+        Some(declaration.span),
+        Some(declaration.name_span),
+        Some(declaration.initializer_span),
+        reference_span,
+        related_span,
+    );
+    LowerError::Source(error)
+}
+
+fn binding_reference_error(
+    reason: BindingErrorReason,
+    declaration: &Declaration,
+    reference_span: SourceSpan,
+    related_span: Option<SourceSpan>,
+    message: &'static str,
+) -> LowerError {
+    binding_error(
+        reason,
+        declaration,
+        Some(reference_span),
+        related_span,
+        message,
+    )
+}
+
+fn binding_unknown_reference_error(reference_span: SourceSpan) -> LowerError {
+    let mut error = Error::at_span(
+        ErrorKind::BindingError,
+        reference_span,
+        "unknown parameter or binding name",
+    );
+    error.binding = BindingErrorContext::try_new(
+        BindingErrorReason::UnknownName,
+        None,
+        None,
+        None,
+        Some(reference_span),
+        None,
+    );
+    LowerError::Source(error)
 }
 
 #[derive(Clone, Copy)]
@@ -175,14 +612,248 @@ enum StructuralValue {
     Tuple(usize),
 }
 
-fn validate_operation_reference_positions(program: &Program) -> Result<(), LowerError> {
+fn validate_format_forms(program: &Program) -> Result<(), LowerError> {
+    let mut declaration = 0usize;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            validate_format_expression(&program.declarations[declaration].initializer, false)?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            validate_format_expression(root, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_format_expression(expression: &Expr, root: bool) -> Result<(), LowerError> {
     let mut pending = Vec::new();
-    pending.try_reserve(program.roots.len()).map_err(|_| {
+    pending.try_reserve(1).map_err(|_| {
         LowerError::Build(BuildError::AllocationUnavailable {
             arena: crate::Arena::Node,
         })
     })?;
-    pending.extend(program.roots.iter().rev().map(|root| (root, false)));
+    pending.push((expression, root));
+    while let Some((current, is_root)) = pending.pop() {
+        match &current.kind {
+            ExprKind::Format {
+                raw,
+                arguments,
+                keyword_span,
+            } => {
+                let keyword = if *raw { "printf" } else { "format" };
+                if *raw && !is_root {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::TypeError,
+                        *keyword_span,
+                        "printf is valid only as a program root",
+                    )));
+                }
+                let Some(template_expression) = arguments.first() else {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::ArityError,
+                        *keyword_span,
+                        if *raw {
+                            "printf requires a String literal template"
+                        } else {
+                            "format requires a String literal template"
+                        },
+                    )));
+                };
+                let ExprKind::Literal(Value::String(template)) = &template_expression.kind else {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::TypeError,
+                        template_expression.span,
+                        if *raw {
+                            "printf template must be a String literal"
+                        } else {
+                            "format template must be a String literal"
+                        },
+                    )));
+                };
+                let placeholder_count =
+                    validate_format_template(template, template_expression.span, keyword)?;
+                let supplied = arguments.len().saturating_sub(1);
+                if placeholder_count != supplied {
+                    return Err(format_count_mismatch_error(
+                        template_expression.span,
+                        keyword,
+                        placeholder_count,
+                        supplied,
+                    )?);
+                }
+                pending.try_reserve(supplied).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(
+                    arguments
+                        .iter()
+                        .skip(1)
+                        .rev()
+                        .map(|argument| (argument, false)),
+                );
+            }
+            ExprKind::Call { arguments, .. } | ExprKind::Tuple(arguments) => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
+            }
+            ExprKind::Connected { templates, operand } => {
+                let count = templates
+                    .iter()
+                    .try_fold(1usize, |count, template| {
+                        count.checked_add(template.arguments.len())
+                    })
+                    .ok_or(LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    }))?;
+                pending.try_reserve(count).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.push((operand, false));
+                for template in templates.iter().rev() {
+                    pending.extend(
+                        template
+                            .arguments
+                            .iter()
+                            .rev()
+                            .map(|argument| (argument, false)),
+                    );
+                }
+            }
+            ExprKind::Fanout { operand, branches } => {
+                pending
+                    .try_reserve(branches.len().saturating_add(1))
+                    .map_err(|_| {
+                        LowerError::Build(BuildError::AllocationUnavailable {
+                            arena: crate::Arena::Node,
+                        })
+                    })?;
+                pending.extend(branches.iter().rev().map(|branch| (branch, false)));
+                pending.push((operand, false));
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Vector(_, _)
+            | ExprKind::DeepTuple { .. }
+            | ExprKind::UnaryChain { .. }
+            | ExprKind::OperationReference { .. }
+            | ExprKind::UnresolvedName { .. }
+            | ExprKind::ConnectedPlaceholder(_)
+            | ExprKind::Placeholder => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_format_template(
+    template: &str,
+    span: SourceSpan,
+    keyword: &str,
+) -> Result<usize, LowerError> {
+    let bytes = template.as_bytes();
+    let mut index = 0usize;
+    let mut placeholders = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' if bytes.get(index + 1) == Some(&b'{') => index += 2,
+            b'}' if bytes.get(index + 1) == Some(&b'}') => index += 2,
+            b'{' if bytes.get(index + 1) == Some(&b'}') => {
+                placeholders = placeholders.checked_add(1).ok_or(LowerError::Build(
+                    BuildError::CountOverflow {
+                        arena: crate::Arena::Edge,
+                    },
+                ))?;
+                index += 2;
+            }
+            b'{' | b'}' => {
+                let message = if keyword == "printf" {
+                    "malformed printf template brace"
+                } else {
+                    "malformed format template brace"
+                };
+                return Err(LowerError::Source(Error::at_span(
+                    ErrorKind::FormattingError,
+                    span,
+                    message,
+                )));
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(placeholders)
+}
+
+fn format_count_mismatch_error(
+    span: SourceSpan,
+    keyword: &str,
+    placeholders: usize,
+    supplied: usize,
+) -> Result<LowerError, LowerError> {
+    let mut message = String::new();
+    message.try_reserve_exact(112).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    write!(
+        &mut message,
+        "{keyword} template has {placeholders} placeholder(s) but received {supplied} interpolation argument(s)"
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    let mut error = Error::at_span(ErrorKind::ArityError, span, message);
+    error.actual_arity = Some(supplied);
+    error.expected_arity.try_reserve_exact(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    error.expected_arity.push(placeholders);
+    Ok(LowerError::Source(error))
+}
+
+fn validate_operation_reference_positions(program: &Program) -> Result<(), LowerError> {
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            validate_operation_reference_expression(
+                &program.declarations[declaration].initializer,
+            )?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            validate_operation_reference_expression(root)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_reference_expression(expression: &Expr) -> Result<(), LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.push((expression, false));
     while let Some((expression, accepted)) = pending.pop() {
         match &expression.kind {
             ExprKind::OperationReference { .. } if accepted => {}
@@ -205,6 +876,74 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
                 })?;
                 for (index, argument) in arguments.iter().enumerate().rev() {
                     pending.push((argument, operation_reference_position(name, index)));
+                }
+            }
+            ExprKind::Format { arguments, .. } => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
+            }
+            ExprKind::Connected { templates, operand } => {
+                let template_arguments = templates
+                    .iter()
+                    .try_fold(0usize, |count, template| {
+                        count.checked_add(template.arguments.len())
+                    })
+                    .ok_or(LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    }))?;
+                let operand_arguments = match &operand.kind {
+                    ExprKind::Tuple(elements) => elements.len(),
+                    _ => 1,
+                };
+                let additional =
+                    template_arguments
+                        .checked_add(operand_arguments)
+                        .ok_or(LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::Node,
+                        }))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                let Some(final_template) = templates.last() else {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::SyntaxError,
+                        expression.span,
+                        "connected application requires a template",
+                    )));
+                };
+                match &operand.kind {
+                    ExprKind::Tuple(elements) => {
+                        for (index, element) in elements.iter().enumerate().rev() {
+                            pending.push((
+                                element,
+                                operation_reference_position(
+                                    &final_template.name,
+                                    final_template.arguments.len().saturating_add(index),
+                                ),
+                            ));
+                        }
+                    }
+                    _ => pending.push((
+                        operand,
+                        operation_reference_position(
+                            &final_template.name,
+                            final_template.arguments.len(),
+                        ),
+                    )),
+                }
+                for template in templates.iter().rev() {
+                    for (index, argument) in template.arguments.iter().enumerate().rev() {
+                        pending.push((
+                            argument,
+                            operation_reference_position(&template.name, index),
+                        ));
+                    }
                 }
             }
             ExprKind::Tuple(elements) => {
@@ -233,8 +972,8 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
             | ExprKind::Vector(_, _)
             | ExprKind::DeepTuple { .. }
             | ExprKind::UnaryChain { .. }
-            | ExprKind::Parameter(_)
             | ExprKind::UnresolvedName { .. }
+            | ExprKind::ConnectedPlaceholder(_)
             | ExprKind::Placeholder => {}
         }
     }
@@ -242,12 +981,31 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
 }
 
 fn operation_reference_position(consumer: &str, zero_based_argument: usize) -> bool {
-    matches!(consumer, "foldl" | "scanl") && zero_based_argument == 0
+    matches!(consumer, "foldl" | "scanl" | "filter") && zero_based_argument == 0
 }
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
-    for root in &program.roots {
-        let _ = validate_expr_arities(root, None)?;
+    let mut deferred_connected_error = None;
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            let _ = validate_expr_arities(
+                &program.declarations[declaration].initializer,
+                None,
+                &mut deferred_connected_error,
+            )?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            let _ = validate_expr_arities(root, None, &mut deferred_connected_error)?;
+        }
+    }
+    if let Some(error) = deferred_connected_error {
+        return Err(LowerError::Source(error));
     }
     Ok(())
 }
@@ -255,6 +1013,7 @@ fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
 fn validate_expr_arities(
     expression: &Expr,
     placeholder: Option<StructuralValue>,
+    deferred_connected_error: &mut Option<Error>,
 ) -> Result<StructuralValue, LowerError> {
     match &expression.kind {
         ExprKind::Call {
@@ -263,9 +1022,34 @@ fn validate_expr_arities(
             arguments,
             ..
         } => {
+            if let Some(placeholder) = arguments
+                .iter()
+                .find(|argument| matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)))
+            {
+                return Err(connected_placeholder_error(
+                    ConnectedApplicationErrorReason::MissingOperand,
+                    placeholder.span,
+                    expression.span,
+                    placeholder.span,
+                    arguments.len(),
+                    0,
+                    "connected placeholder template requires an adjacent operand",
+                ));
+            }
             let mut spread_width = None;
             for argument in arguments {
-                let value = validate_expr_arities(argument, placeholder)?;
+                if let Some(span) = first_unbound_connected_placeholder(argument)? {
+                    return Err(connected_placeholder_error(
+                        ConnectedApplicationErrorReason::NestedPlaceholder,
+                        span,
+                        expression.span,
+                        span,
+                        arguments.len(),
+                        0,
+                        "connected placeholders must be immediate template argument slots",
+                    ));
+                }
+                let value = validate_expr_arities(argument, placeholder, deferred_connected_error)?;
                 if arguments.len() == 1 {
                     spread_width = match value {
                         StructuralValue::Tuple(width) => Some(width),
@@ -278,19 +1062,164 @@ fn validate_expr_arities(
             } else {
                 arguments.len()
             };
+            if *syntax == CallSyntax::Prefix
+                && arguments.len() == 1
+                && matches!(arguments[0].kind, ExprKind::UnresolvedName { .. })
+            {
+                return Ok(StructuralValue::NonTuple);
+            }
             validate_arity(name, actual, expression.span.begin)?;
+            Ok(StructuralValue::NonTuple)
+        }
+        ExprKind::Format { arguments, .. } => {
+            for argument in arguments.iter().skip(1) {
+                let _ = validate_expr_arities(argument, placeholder, deferred_connected_error)?;
+            }
+            Ok(StructuralValue::NonTuple)
+        }
+        ExprKind::Connected { templates, operand } => {
+            for template in templates {
+                for argument in &template.arguments {
+                    if matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)) {
+                        continue;
+                    }
+                    if let Some(span) = first_unbound_connected_placeholder(argument)? {
+                        return Err(connected_placeholder_error(
+                            ConnectedApplicationErrorReason::NestedPlaceholder,
+                            span,
+                            template.span,
+                            operand.span,
+                            template.arguments.len(),
+                            0,
+                            "connected placeholders must be immediate template argument slots",
+                        ));
+                    }
+                    let _ = validate_expr_arities(argument, placeholder, deferred_connected_error)?;
+                }
+            }
+            let operand_value =
+                validate_expr_arities(operand, placeholder, deferred_connected_error)?;
+            for (index, template) in templates.iter().enumerate().rev() {
+                let connected_placeholder_count = template
+                    .arguments
+                    .iter()
+                    .filter(|argument| matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)))
+                    .count();
+                if connected_placeholder_count != 0 {
+                    let selected_operand = if index + 1 == templates.len() {
+                        operand_value
+                    } else {
+                        StructuralValue::NonTuple
+                    };
+                    let width = match selected_operand {
+                        StructuralValue::NonTuple => 1,
+                        StructuralValue::Tuple(width) => width,
+                    };
+                    if width == 0 {
+                        return Err(connected_placeholder_error(
+                            ConnectedApplicationErrorReason::EmptyTupleOperand,
+                            operand.span,
+                            template.span,
+                            operand.span,
+                            template.arguments.len(),
+                            0,
+                            "connected placeholder operand cannot be an empty tuple",
+                        ));
+                    }
+                    let mut effective_arity = template
+                        .arguments
+                        .len()
+                        .checked_sub(connected_placeholder_count)
+                        .ok_or(LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::Edge,
+                        }))?;
+                    for argument in &template.arguments {
+                        let ExprKind::ConnectedPlaceholder(connected_placeholder) = &argument.kind
+                        else {
+                            continue;
+                        };
+                        let supplied = match *connected_placeholder {
+                            ConnectedPlaceholder::Whole => match selected_operand {
+                                StructuralValue::NonTuple => 1,
+                                StructuralValue::Tuple(tuple_width) => tuple_width,
+                            },
+                            ConnectedPlaceholder::Element(element) => {
+                                if usize::try_from(element)
+                                    .ok()
+                                    .is_none_or(|element| element == 0 || element > width)
+                                {
+                                    return Err(connected_placeholder_error(
+                                        ConnectedApplicationErrorReason::PlaceholderIndexOutOfRange,
+                                        argument.span,
+                                        template.span,
+                                        operand.span,
+                                        template.arguments.len(),
+                                        width,
+                                        "connected placeholder index is outside the operand",
+                                    ));
+                                }
+                                1
+                            }
+                        };
+                        effective_arity =
+                            effective_arity
+                                .checked_add(supplied)
+                                .ok_or(LowerError::Build(BuildError::CountOverflow {
+                                    arena: crate::Arena::Edge,
+                                }))?;
+                    }
+                    validate_arity(&template.name, effective_arity, template.span.begin)?;
+                    continue;
+                }
+                let final_template = index + 1 == templates.len();
+                let (supplied_width, runtime_tuple, operand_span) = if final_template {
+                    match &operand.kind {
+                        ExprKind::Tuple(elements) => (elements.len(), false, operand.span),
+                        _ => (
+                            1,
+                            matches!(operand_value, StructuralValue::Tuple(_)),
+                            operand.span,
+                        ),
+                    }
+                } else {
+                    (
+                        1,
+                        false,
+                        SourceSpan {
+                            begin: templates[index + 1].span.begin,
+                            end: operand.span.end,
+                        },
+                    )
+                };
+                let completion = validate_connected_arity(
+                    &template.name,
+                    template.arguments.len(),
+                    supplied_width,
+                    runtime_tuple,
+                    template.span,
+                    operand_span,
+                );
+                match completion {
+                    Err(LowerError::Source(error)) if error.kind == ErrorKind::TypeError => {
+                        if deferred_connected_error.is_none() {
+                            *deferred_connected_error = Some(error);
+                        }
+                    }
+                    result => result?,
+                }
+            }
             Ok(StructuralValue::NonTuple)
         }
         ExprKind::Tuple(elements) => {
             for element in elements {
-                let _ = validate_expr_arities(element, placeholder)?;
+                let _ = validate_expr_arities(element, placeholder, deferred_connected_error)?;
             }
             Ok(StructuralValue::Tuple(elements.len()))
         }
         ExprKind::Fanout { operand, branches } => {
-            let operand = validate_expr_arities(operand, placeholder)?;
+            let operand = validate_expr_arities(operand, placeholder, deferred_connected_error)?;
             for branch in branches {
-                let _ = validate_expr_arities(branch, Some(operand))?;
+                let _ = validate_expr_arities(branch, Some(operand), deferred_connected_error)?;
             }
             Ok(StructuralValue::Tuple(branches.len()))
         }
@@ -307,13 +1236,93 @@ fn validate_expr_arities(
                 "placeholder has no fanout operand",
             ))
         }),
+        ExprKind::ConnectedPlaceholder(_) => Err(connected_placeholder_error(
+            ConnectedApplicationErrorReason::PlaceholderOutsideTemplate,
+            expression.span,
+            expression.span,
+            expression.span,
+            0,
+            0,
+            "connected placeholder is not an immediate slot of a connected template",
+        )),
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
         | ExprKind::DeepTuple { .. }
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => Ok(StructuralValue::NonTuple),
     }
+}
+
+fn first_unbound_connected_placeholder(
+    expression: &Expr,
+) -> Result<Option<SourceSpan>, LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.push(expression);
+    while let Some(current) = pending.pop() {
+        match &current.kind {
+            ExprKind::ConnectedPlaceholder(_) => return Ok(Some(current.span)),
+            ExprKind::Call { arguments, .. }
+            | ExprKind::Format { arguments, .. }
+            | ExprKind::Tuple(arguments) => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev());
+            }
+            // A nested connected application owns and validates its placeholders.
+            ExprKind::Connected { .. } => {}
+            ExprKind::Fanout { operand, branches } => {
+                let additional = branches.len().checked_add(1).ok_or(LowerError::Build(
+                    BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    },
+                ))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(branches.iter().rev());
+                pending.push(operand);
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Vector(_, _)
+            | ExprKind::DeepTuple { .. }
+            | ExprKind::UnaryChain { .. }
+            | ExprKind::OperationReference { .. }
+            | ExprKind::UnresolvedName { .. }
+            | ExprKind::Placeholder => {}
+        }
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connected_placeholder_error(
+    reason: ConnectedApplicationErrorReason,
+    primary_span: SourceSpan,
+    template_span: SourceSpan,
+    operand_span: SourceSpan,
+    template_arity: usize,
+    supplied_width: usize,
+    message: &'static str,
+) -> LowerError {
+    let mut error = Error::at_span(ErrorKind::SyntaxError, primary_span, message);
+    error.connected_application = Some(ConnectedApplicationErrorContext {
+        reason,
+        template_arity,
+        supplied_width,
+        template_span,
+        operand_span,
+    });
+    LowerError::Source(error)
 }
 
 fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result<(), LowerError> {
@@ -325,7 +1334,7 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
             )?));
         }
     };
-    let reference_arguments = usize::from(matches!(name, "foldl" | "scanl"));
+    let reference_arguments = usize::from(matches!(name, "foldl" | "scanl" | "filter"));
     if descriptors(primitive).any(|descriptor| {
         descriptor.parameters.len().checked_add(reference_arguments) == Some(actual)
     }) {
@@ -402,6 +1411,150 @@ fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result
     Err(LowerError::Source(error))
 }
 
+fn validate_connected_arity(
+    name: &str,
+    template_arity: usize,
+    supplied_width: usize,
+    runtime_tuple: bool,
+    template_span: SourceSpan,
+    operand_span: SourceSpan,
+) -> Result<(), LowerError> {
+    let primitive = match primitive_from_name(name) {
+        Ok(primitive) => primitive,
+        Err(_) => {
+            return Err(LowerError::Source(unknown_primitive_diagnostic(
+                name,
+                template_span.begin,
+            )?));
+        }
+    };
+    let reference_arguments = usize::from(matches!(name, "foldl" | "scanl" | "filter"));
+    let mut accepted = Vec::new();
+    for descriptor in descriptors(primitive) {
+        let arity = descriptor
+            .parameters
+            .len()
+            .checked_add(reference_arguments)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Node,
+            }))?;
+        if !accepted.contains(&arity) {
+            accepted.try_reserve(1).map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Node,
+                })
+            })?;
+            accepted.push(arity);
+        }
+    }
+    accepted.sort_unstable();
+    let actual = template_arity
+        .checked_add(supplied_width)
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::Node,
+        }))?;
+    let reason =
+        connected_completion_reason(&accepted, template_arity, supplied_width, runtime_tuple);
+    if reason.is_none() {
+        return Ok(());
+    }
+    let reason = reason.unwrap_or(ConnectedApplicationErrorReason::AmbiguousCompletion);
+    let reason_name = reason.name();
+    let capacity = name
+        .len()
+        .checked_add(reason_name.len())
+        .and_then(|length| length.checked_add(96))
+        .ok_or(LowerError::Build(BuildError::CountOverflow {
+            arena: crate::Arena::Node,
+        }))?;
+    let mut message = String::new();
+    message.try_reserve_exact(capacity).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    write!(
+        &mut message,
+        "{name} connected completion failed: {reason_name} \
+         (template_arity={template_arity}, supplied_width={supplied_width})"
+    )
+    .map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    let primary_span = if reason == ConnectedApplicationErrorReason::AlreadyComplete {
+        template_span
+    } else {
+        operand_span
+    };
+    let kind = if matches!(
+        reason,
+        ConnectedApplicationErrorReason::AmbiguousCompletion
+            | ConnectedApplicationErrorReason::RuntimeTupleOperand
+    ) {
+        ErrorKind::TypeError
+    } else {
+        ErrorKind::ArityError
+    };
+    let mut error = Error::at_span(kind, primary_span, message);
+    error.primitive = Some(try_clone_string(name, crate::Arena::Node)?);
+    error.expected_arity = accepted;
+    error.actual_arity = Some(actual);
+    error.connected_application = Some(ConnectedApplicationErrorContext {
+        reason,
+        template_arity,
+        supplied_width,
+        template_span,
+        operand_span,
+    });
+    Err(LowerError::Source(error))
+}
+
+fn connected_completion_reason(
+    accepted: &[usize],
+    template_arity: usize,
+    supplied_width: usize,
+    runtime_tuple: bool,
+) -> Option<ConnectedApplicationErrorReason> {
+    if accepted.contains(&template_arity) {
+        return Some(ConnectedApplicationErrorReason::AlreadyComplete);
+    }
+    if supplied_width == 0 {
+        return Some(ConnectedApplicationErrorReason::EmptyTupleOperand);
+    }
+    if runtime_tuple {
+        return Some(ConnectedApplicationErrorReason::RuntimeTupleOperand);
+    }
+    let Some(actual) = template_arity.checked_add(supplied_width) else {
+        return Some(ConnectedApplicationErrorReason::SurplusCompletion);
+    };
+    let exact = accepted.iter().filter(|arity| **arity == actual).count();
+    if exact == 1 {
+        return None;
+    }
+    if exact > 1 {
+        return Some(ConnectedApplicationErrorReason::AmbiguousCompletion);
+    }
+    let mut candidates = accepted
+        .iter()
+        .copied()
+        .filter(|arity| *arity > template_arity);
+    let Some(first) = candidates.next() else {
+        return Some(ConnectedApplicationErrorReason::SurplusCompletion);
+    };
+    let (minimum, maximum) = candidates.fold((first, first), |(minimum, maximum), arity| {
+        (minimum.min(arity), maximum.max(arity))
+    });
+    if actual < minimum {
+        Some(ConnectedApplicationErrorReason::MissingCompletion)
+    } else if actual > maximum {
+        Some(ConnectedApplicationErrorReason::SurplusCompletion)
+    } else {
+        Some(ConnectedApplicationErrorReason::AmbiguousCompletion)
+    }
+}
+
 fn unknown_primitive_diagnostic(name: &str, location: SourceLocation) -> Result<Error, LowerError> {
     let capacity =
         name.len()
@@ -427,31 +1580,62 @@ fn lower_program(
     source: &str,
     diagnostic_name: &str,
     program: &Program,
+    resolution: BindingResolution,
 ) -> Result<VerifiedProgram, LowerError> {
     let builder = RawProgramBuilder::new();
-    lower_program_with_builder(source, diagnostic_name, program, builder)
+    lower_program_with_builder_and_resolution(
+        source,
+        diagnostic_name,
+        program,
+        builder,
+        resolution,
+        DiagnosticReservations::default(),
+    )
 }
 
+#[allow(dead_code)]
 fn lower_program_with_builder(
     source: &str,
     diagnostic_name: &str,
     program: &Program,
     builder: RawProgramBuilder,
 ) -> Result<VerifiedProgram, LowerError> {
-    lower_program_with_builder_and_diagnostics(
+    let resolution = analyze_bindings(program)?;
+    lower_program_with_builder_and_resolution(
         source,
         diagnostic_name,
         program,
         builder,
+        resolution,
         DiagnosticReservations::default(),
     )
 }
 
+#[allow(dead_code)]
 fn lower_program_with_builder_and_diagnostics(
     source: &str,
     diagnostic_name: &str,
     program: &Program,
+    builder: RawProgramBuilder,
+    diagnostics: DiagnosticReservations,
+) -> Result<VerifiedProgram, LowerError> {
+    let resolution = analyze_bindings(program)?;
+    lower_program_with_builder_and_resolution(
+        source,
+        diagnostic_name,
+        program,
+        builder,
+        resolution,
+        diagnostics,
+    )
+}
+
+fn lower_program_with_builder_and_resolution(
+    source: &str,
+    diagnostic_name: &str,
+    program: &Program,
     mut builder: RawProgramBuilder,
+    binding_resolution: BindingResolution,
     diagnostics: DiagnosticReservations,
 ) -> Result<VerifiedProgram, LowerError> {
     let byte_length = u32::try_from(source.len()).map_err(|_| {
@@ -475,8 +1659,15 @@ fn lower_program_with_builder_and_diagnostics(
         needs_application_plans: false,
         needs_operation_references: false,
         needs_backend_native_math: false,
+        needs_connected_bindings: false,
+        needs_user_bindings: false,
+        needs_strings: false,
+        needs_value_formatting: false,
         placeholder: None,
         releases: Vec::new(),
+        binding_resolution,
+        bindings: Vec::new(),
+        binding_last_consumers: Vec::new(),
         first_shape_error: None,
         diagnostics,
     };
@@ -502,6 +1693,7 @@ fn lower_program_with_builder_and_diagnostics(
             })
         })?;
     for (slot, parameter) in program.parameters.iter().enumerate() {
+        lowerer.needs_strings |= parameter.scalar_type == ScalarType::String;
         let declaration_origin = lowerer.push_origin(parameter.span)?;
         let name_origin = lowerer.push_origin(parameter.name_span)?;
         let slot = u32::try_from(slot).map_err(|_| {
@@ -523,9 +1715,47 @@ fn lower_program_with_builder_and_diagnostics(
         lowerer.parameter_scalar_types.push(parameter.scalar_type);
     }
 
-    for (root_index, root) in program.roots.iter().enumerate() {
-        let lowered = lowerer.lower_expr(root)?;
-        let root_index = RootIndex(u32::try_from(root_index).map_err(|_| {
+    lowerer
+        .bindings
+        .try_reserve_exact(program.declarations.len())
+        .map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Node,
+            })
+        })?;
+    lowerer
+        .bindings
+        .resize_with(program.declarations.len(), || None);
+    lowerer
+        .binding_last_consumers
+        .try_reserve_exact(program.declarations.len())
+        .map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Ownership,
+            })
+        })?;
+    lowerer
+        .binding_last_consumers
+        .resize(program.declarations.len(), None);
+
+    let mut next_declaration = 0usize;
+    for root_boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(next_declaration)
+            .is_some_and(|declaration| declaration.before_root == root_boundary)
+        {
+            lowerer.lower_declaration(next_declaration, &program.declarations[next_declaration])?;
+            next_declaration += 1;
+        }
+        let Some(root) = program.roots.get(root_boundary) else {
+            continue;
+        };
+        let mut lowered = lowerer.lower_expr(root)?;
+        if lowered.binding.is_some() && lowered.access == ValueAccess::BindingMove {
+            lowered = lowerer.materialize_binding_move(lowered)?;
+        }
+        let root_index = RootIndex(u32::try_from(root_boundary).map_err(|_| {
             LowerError::Build(BuildError::CountOverflow {
                 arena: crate::Arena::Root,
             })
@@ -536,7 +1766,29 @@ fn lower_program_with_builder_and_diagnostics(
         lowerer.builder.push_root(Root {
             node: lowered.node,
             origin: lowered.origin,
+            presentation: match root.kind {
+                ExprKind::Format { raw: true, .. } => RootPresentation::RawString,
+                _ => RootPresentation::CanonicalValue,
+            },
         })?;
+    }
+    for binding in 0..lowerer.bindings.len() {
+        let owner = lowerer
+            .bindings
+            .get(binding)
+            .and_then(Option::as_ref)
+            .map(|lowered| lowered.node)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Ownership,
+            }))?;
+        let consumer = lowerer
+            .binding_last_consumers
+            .get(binding)
+            .and_then(|consumer| *consumer)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Ownership,
+            }))?;
+        lowerer.set_release(owner, ReleaseAfter::Node(consumer))?;
     }
     if let Some(error) = lowerer.first_shape_error {
         return Err(LowerError::Source(error));
@@ -586,6 +1838,28 @@ fn lower_program_with_builder_and_diagnostics(
         lowerer
             .builder
             .push_feature(Feature::BackendNativeMathV1.numeric())?;
+    }
+    if lowerer.needs_connected_bindings {
+        lowerer.builder.set_semantic_minor(2);
+        lowerer
+            .builder
+            .push_feature(Feature::ConnectedApplicationBindings.numeric())?;
+    }
+    if lowerer.needs_user_bindings {
+        lowerer.builder.set_semantic_minor(3);
+        lowerer
+            .builder
+            .push_feature(Feature::ImmutableBindings.numeric())?;
+    }
+    if lowerer.needs_strings {
+        lowerer.builder.set_semantic_minor(4);
+        lowerer.builder.push_feature(Feature::Strings.numeric())?;
+    }
+    if lowerer.needs_value_formatting {
+        lowerer.builder.set_semantic_minor(5);
+        lowerer
+            .builder
+            .push_feature(Feature::ValueFormatting.numeric())?;
     }
     Ok(lowerer.builder.finish()?.verify()?)
 }
@@ -643,56 +1917,246 @@ impl Lowerer {
         })
     }
 
-    fn lower_expr(&mut self, expression: &Expr) -> Result<Lowered, LowerError> {
-        let origin = self.push_origin(expression.span)?;
-        match &expression.kind {
-            ExprKind::Literal(value) => self.lower_scalar(value, origin, expression.span.begin),
-            ExprKind::Vector(element_type, values) => {
-                self.lower_vector(*element_type, values, origin, expression.span.begin)
-            }
-            ExprKind::Parameter(index) => {
-                let result_type = self.parameter_types.get(*index).copied().ok_or_else(|| {
+    fn lower_declaration(
+        &mut self,
+        binding: usize,
+        declaration: &Declaration,
+    ) -> Result<(), LowerError> {
+        let initializer = self.lower_expr(&declaration.initializer)?;
+        let declaration_origin = self.push_origin(declaration.span)?;
+        let name_origin = self.push_origin(declaration.name_span)?;
+        let initializer_origin = self.push_origin(declaration.initializer_span)?;
+        let edge_start = self.builder.finish_preview_edges()?;
+        self.builder.push_edge(Edge {
+            producer: initializer.node,
+            argument_position: 1,
+            access: initializer.access,
+            cardinality: initializer.cardinality,
+            conversion: crate::Conversion::Identity,
+            ownership: if initializer.borrowed {
+                OwnershipMode::ImmutableBorrow
+            } else {
+                OwnershipMode::InfallibleTransfer
+            },
+            origin: initializer.origin,
+        })?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::Binding {
+                declaration_origin,
+                name_origin,
+                initializer_origin,
+            },
+            result_type: initializer.result_type,
+            cardinality: initializer.cardinality,
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin: declaration_origin,
+        })?;
+        self.register_node(node)?;
+        if let Some(source_binding) = initializer.binding {
+            self.record_binding_consumer(source_binding, node)?;
+        } else if !initializer.borrowed {
+            self.set_release(initializer.node, ReleaseAfter::Node(node))?;
+        }
+        let stored = Lowered {
+            node,
+            result_type: initializer.result_type,
+            cardinality: initializer.cardinality,
+            origin: declaration_origin,
+            location: declaration.name_span.begin,
+            borrowed: true,
+            value_type: initializer.value_type,
+            tuple_elements: initializer.tuple_elements,
+            access: ValueAccess::BindingBorrowWhole,
+            binding: Some(binding),
+        };
+        let destination =
+            self.bindings
+                .get_mut(binding)
+                .ok_or(LowerError::Build(BuildError::CountOverflow {
+                    arena: crate::Arena::Node,
+                }))?;
+        *destination = Some(stored);
+        self.needs_user_bindings = true;
+        Ok(())
+    }
+
+    fn lower_resolved_reference(
+        &mut self,
+        expression: &Expr,
+        origin: OriginIndex,
+    ) -> Result<Lowered, LowerError> {
+        let reference = self
+            .binding_resolution
+            .references
+            .binary_search_by_key(&expression.span.begin.offset, |reference| reference.offset)
+            .ok()
+            .and_then(|index| self.binding_resolution.references.get(index))
+            .copied()
+            .ok_or_else(|| binding_unknown_reference_error(expression.span))?;
+        let ResolvedSymbol::Binding { binding, mode } = reference.symbol else {
+            let ResolvedSymbol::Parameter(parameter) = reference.symbol else {
+                return Err(binding_unknown_reference_error(expression.span));
+            };
+            let result_type = self
+                .parameter_types
+                .get(parameter)
+                .copied()
+                .ok_or_else(|| {
                     LowerError::Source(Error::at_span(
                         ErrorKind::ParameterError,
                         expression.span,
                         "invalid parameter reference",
                     ))
                 })?;
-                let parameter = crate::ParameterIndex(u32::try_from(*index).map_err(|_| {
+            let parameter_index =
+                crate::ParameterIndex(u32::try_from(parameter).map_err(|_| {
                     LowerError::Build(BuildError::CountOverflow {
                         arena: crate::Arena::Parameter,
                     })
                 })?);
-                let node = self.builder.push_node(Node {
-                    kind: NodeKind::ParameterBorrow { parameter },
-                    result_type,
-                    cardinality: Some(Cardinality::StaticScalar),
-                    edges: IndexRange {
-                        start: self.builder.finish_preview_edges()?,
-                        count: 0,
+            let node = self.builder.push_node(Node {
+                kind: NodeKind::ParameterBorrow {
+                    parameter: parameter_index,
+                },
+                result_type,
+                cardinality: Some(Cardinality::StaticScalar),
+                edges: IndexRange {
+                    start: self.builder.finish_preview_edges()?,
+                    count: 0,
+                },
+                origin,
+            })?;
+            self.register_node(node)?;
+            return Ok(Lowered {
+                node,
+                result_type,
+                cardinality: Some(Cardinality::StaticScalar),
+                origin,
+                location: expression.span.begin,
+                borrowed: true,
+                value_type: Type::Scalar(*self.parameter_scalar_types.get(parameter).ok_or_else(
+                    || {
+                        LowerError::Source(Error::at_span(
+                            ErrorKind::ParameterError,
+                            expression.span,
+                            "invalid parameter reference",
+                        ))
                     },
-                    origin,
-                })?;
-                self.register_node(node)?;
-                Ok(Lowered {
-                    node,
-                    result_type,
-                    cardinality: Some(Cardinality::StaticScalar),
-                    origin,
-                    location: expression.span.begin,
-                    borrowed: true,
-                    value_type: Type::Scalar(*self.parameter_scalar_types.get(*index).ok_or_else(
-                        || {
-                            LowerError::Source(Error::at_span(
-                                ErrorKind::ParameterError,
-                                expression.span,
-                                "invalid parameter reference",
-                            ))
-                        },
-                    )?),
-                    tuple_elements: Vec::new(),
-                    access: ValueAccess::WholeValue,
-                })
+                )?),
+                tuple_elements: Vec::new(),
+                access: ValueAccess::WholeValue,
+                binding: None,
+            });
+        };
+        let mut lowered = self
+            .bindings
+            .get(binding)
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Node,
+            }))?;
+        lowered.origin = origin;
+        lowered.location = expression.span.begin;
+        lowered.borrowed = mode == BindingUseMode::Borrow;
+        lowered.access = match mode {
+            BindingUseMode::Borrow => ValueAccess::BindingBorrowWhole,
+            BindingUseMode::Move => ValueAccess::BindingMove,
+        };
+        Ok(lowered)
+    }
+
+    fn materialize_binding_move(&mut self, binding: Lowered) -> Result<Lowered, LowerError> {
+        let binding_index =
+            binding
+                .binding
+                .ok_or(LowerError::Build(BuildError::CountOverflow {
+                    arena: crate::Arena::Node,
+                }))?;
+        let edge_start = self.builder.finish_preview_edges()?;
+        self.builder.push_edge(Edge {
+            producer: binding.node,
+            argument_position: 1,
+            access: ValueAccess::BindingMove,
+            cardinality: binding.cardinality,
+            conversion: crate::Conversion::Identity,
+            ownership: OwnershipMode::InfallibleTransfer,
+            origin: binding.origin,
+        })?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::BindingMove,
+            result_type: binding.result_type,
+            cardinality: binding.cardinality,
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin: binding.origin,
+        })?;
+        self.register_node(node)?;
+        self.record_binding_consumer(binding_index, node)?;
+        Ok(Lowered {
+            node,
+            binding: None,
+            ..binding
+        })
+    }
+
+    fn materialize_binding_borrow(&mut self, binding: Lowered) -> Result<Lowered, LowerError> {
+        let edge_start = self.builder.finish_preview_edges()?;
+        self.builder.push_edge(Edge {
+            producer: binding.node,
+            argument_position: 1,
+            access: ValueAccess::BindingBorrowWhole,
+            cardinality: binding.cardinality,
+            conversion: crate::Conversion::Identity,
+            ownership: OwnershipMode::ImmutableBorrow,
+            origin: binding.origin,
+        })?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::BindingBorrow,
+            result_type: binding.result_type,
+            cardinality: binding.cardinality,
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin: binding.origin,
+        })?;
+        self.register_node(node)?;
+        Ok(Lowered {
+            node,
+            borrowed: false,
+            access: ValueAccess::WholeValue,
+            binding: None,
+            ..binding
+        })
+    }
+
+    fn record_binding_consumer(
+        &mut self,
+        binding: usize,
+        consumer: NodeIndex,
+    ) -> Result<(), LowerError> {
+        let destination = self
+            .binding_last_consumers
+            .get_mut(binding)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Ownership,
+            }))?;
+        *destination = Some(consumer);
+        Ok(())
+    }
+
+    fn lower_expr(&mut self, expression: &Expr) -> Result<Lowered, LowerError> {
+        let origin = self.push_origin(expression.span)?;
+        match &expression.kind {
+            ExprKind::Literal(value) => self.lower_scalar(value, origin, expression.span.begin),
+            ExprKind::Vector(element_type, values) => {
+                self.lower_vector(*element_type, values, origin, expression.span.begin)
             }
             ExprKind::Tuple(elements) => self.lower_tuple(elements, origin, expression.span.begin),
             ExprKind::DeepTuple { depth, leaf } => {
@@ -739,6 +2203,14 @@ impl Lowerer {
                 origin,
                 expression.span.begin,
             ),
+            ExprKind::Format {
+                arguments,
+                keyword_span,
+                ..
+            } => self.lower_format(arguments, *keyword_span, origin, expression.span.begin),
+            ExprKind::Connected { templates, operand } => {
+                self.lower_connected(expression, templates, operand, origin)
+            }
             ExprKind::Placeholder => {
                 let mut placeholder = self.placeholder.take().ok_or_else(|| {
                     LowerError::Source(Error::at_span(
@@ -756,6 +2228,7 @@ impl Lowerer {
             ExprKind::Fanout { operand, branches } => {
                 self.lower_fan_out(expression, operand, branches, origin)
             }
+            ExprKind::UnresolvedName { .. } => self.lower_resolved_reference(expression, origin),
             _ => Err(LowerError::Source(Error::at_span(
                 ErrorKind::TypeError,
                 expression.span,
@@ -770,7 +2243,7 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
-        let scalar = scalar_constant(value).ok_or_else(|| {
+        let scalar = self.scalar_constant(value)?.ok_or_else(|| {
             LowerError::Source(Error::new(
                 ErrorKind::TypeError,
                 SourceLocation::start(),
@@ -807,6 +2280,110 @@ impl Lowerer {
             value_type: Type::Scalar(scalar_type),
             tuple_elements: Vec::new(),
             access: ValueAccess::WholeValue,
+            binding: None,
+        })
+    }
+
+    fn lower_format(
+        &mut self,
+        arguments: &[Expr],
+        keyword_span: SourceSpan,
+        origin: OriginIndex,
+        location: SourceLocation,
+    ) -> Result<Lowered, LowerError> {
+        let template_expression = arguments.first().ok_or_else(|| {
+            LowerError::Source(Error::new(
+                ErrorKind::ArityError,
+                location,
+                "format requires a String literal template",
+            ))
+        })?;
+        let ExprKind::Literal(Value::String(template)) = &template_expression.kind else {
+            return Err(LowerError::Source(Error::at_span(
+                ErrorKind::TypeError,
+                template_expression.span,
+                "format template must be a String literal",
+            )));
+        };
+        let template_origin = self.push_origin(template_expression.span)?;
+        let keyword_origin = self.push_origin(keyword_span)?;
+        let template = self
+            .builder
+            .push_string_value(try_clone_string(template, crate::Arena::StringValue)?)?;
+        let mut lowered = Vec::new();
+        lowered
+            .try_reserve_exact(arguments.len().saturating_sub(1))
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Node,
+                })
+            })?;
+        for argument in arguments.iter().skip(1) {
+            lowered.push(self.lower_expr(argument)?);
+        }
+        let edge_start = self.builder.finish_preview_edges()?;
+        for (position, argument) in lowered.iter().enumerate() {
+            self.builder.push_edge(Edge {
+                producer: argument.node,
+                argument_position: u32::try_from(position + 1).map_err(|_| {
+                    LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Edge,
+                    })
+                })?,
+                access: argument.access,
+                cardinality: argument.cardinality,
+                conversion: crate::Conversion::Identity,
+                ownership: if argument.borrowed {
+                    OwnershipMode::ImmutableBorrow
+                } else {
+                    OwnershipMode::OwnedInput
+                },
+                origin: argument.origin,
+            })?;
+        }
+        let count = u32::try_from(lowered.len()).map_err(|_| {
+            LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        let result_type = self
+            .builder
+            .push_type(TypeRecord::Scalar(ScalarType::String))?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::Format {
+                template,
+                template_origin,
+                keyword_origin,
+            },
+            result_type,
+            cardinality: Some(Cardinality::StaticScalar),
+            edges: IndexRange {
+                start: edge_start,
+                count,
+            },
+            origin,
+        })?;
+        self.register_node(node)?;
+        for argument in &lowered {
+            if let Some(binding) = argument.binding {
+                self.record_binding_consumer(binding, node)?;
+            } else if !argument.borrowed {
+                self.set_release(argument.node, ReleaseAfter::Node(node))?;
+            }
+        }
+        self.needs_strings = true;
+        self.needs_value_formatting = true;
+        Ok(Lowered {
+            node,
+            result_type,
+            cardinality: Some(Cardinality::StaticScalar),
+            origin,
+            location,
+            borrowed: false,
+            value_type: Type::Scalar(ScalarType::String),
+            tuple_elements: Vec::new(),
+            access: ValueAccess::WholeValue,
+            binding: None,
         })
     }
 
@@ -817,9 +2394,10 @@ impl Lowerer {
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
+        self.needs_strings |= element_type == ScalarType::String;
         let start = self.builder.finish_preview_constant_elements()?;
         for value in values {
-            let scalar = scalar_constant(value).ok_or_else(|| {
+            let scalar = self.scalar_constant(value)?.ok_or_else(|| {
                 LowerError::Source(Error::new(
                     ErrorKind::TypeError,
                     SourceLocation::start(),
@@ -860,6 +2438,29 @@ impl Lowerer {
             value_type: Type::Vector(element_type),
             tuple_elements: Vec::new(),
             access: ValueAccess::WholeValue,
+            binding: None,
+        })
+    }
+
+    fn scalar_constant(&mut self, value: &Value) -> Result<Option<ScalarConstant>, LowerError> {
+        Ok(match value {
+            Value::Bool(value) => Some(ScalarConstant::Bool(*value)),
+            Value::Int(value) => Some(ScalarConstant::Int(*value)),
+            Value::Double(value) => Some(ScalarConstant::DoubleBits(value.to_bits())),
+            Value::String(value) => {
+                self.needs_strings = true;
+                let mut copy = String::new();
+                copy.try_reserve_exact(value.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::StringValue,
+                    })
+                })?;
+                copy.push_str(value);
+                Some(ScalarConstant::String(
+                    self.builder.push_string_value(copy)?,
+                ))
+            }
+            _ => None,
         })
     }
 
@@ -906,7 +2507,7 @@ impl Lowerer {
             self.builder.push_edge(Edge {
                 producer: element.node,
                 argument_position,
-                access: ValueAccess::WholeValue,
+                access: element.access,
                 cardinality: element.cardinality,
                 conversion: crate::Conversion::Identity,
                 ownership: if element.borrowed {
@@ -929,7 +2530,9 @@ impl Lowerer {
         })?;
         self.register_node(node)?;
         for element in &lowered {
-            if !element.borrowed {
+            if let Some(binding) = element.binding {
+                self.record_binding_consumer(binding, node)?;
+            } else if !element.borrowed {
                 self.set_release(element.node, ReleaseAfter::Node(node))?;
             }
         }
@@ -968,6 +2571,7 @@ impl Lowerer {
             value_type,
             tuple_elements,
             access: ValueAccess::WholeValue,
+            binding: None,
         })
     }
 
@@ -1065,10 +2669,446 @@ impl Lowerer {
                 },
                 tuple_elements,
                 access: ValueAccess::WholeValue,
+                binding: None,
             };
         }
         self.needs_tuples |= depth != 0;
         Ok(current)
+    }
+
+    fn lower_connected<'a>(
+        &mut self,
+        expression: &Expr,
+        templates: &'a [ConnectedTemplate],
+        operand: &'a Expr,
+        origin: OriginIndex,
+    ) -> Result<Lowered, LowerError> {
+        if templates.is_empty() {
+            return Err(LowerError::Source(Error::at_span(
+                ErrorKind::SyntaxError,
+                expression.span,
+                "connected application requires a template",
+            )));
+        }
+        let mut lowered_templates: Vec<Vec<AuthoredCallOperand<'a>>> = Vec::new();
+        let mut call_origins = Vec::new();
+        let mut primitive_origins = Vec::new();
+        lowered_templates
+            .try_reserve_exact(templates.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Node,
+                })
+            })?;
+        call_origins
+            .try_reserve_exact(templates.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Origin,
+                })
+            })?;
+        primitive_origins
+            .try_reserve_exact(templates.len())
+            .map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Origin,
+                })
+            })?;
+        for (index, template) in templates.iter().enumerate() {
+            let call_origin = if index == 0 {
+                origin
+            } else {
+                self.push_origin(SourceSpan {
+                    begin: template.span.begin,
+                    end: operand.span.end,
+                })?
+            };
+            let primitive_origin = self.push_origin(template.name_span)?;
+            let mut arguments = Vec::new();
+            arguments
+                .try_reserve_exact(template.arguments.len())
+                .map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+            for argument in &template.arguments {
+                arguments.push(self.lower_authored_call_operand(argument)?);
+            }
+            call_origins.push(call_origin);
+            primitive_origins.push(primitive_origin);
+            lowered_templates.push(arguments);
+        }
+
+        let mut supplied = Vec::new();
+        let final_has_placeholders = templates.last().is_some_and(|template| {
+            template
+                .arguments
+                .iter()
+                .any(|argument| matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)))
+        });
+        let mut placeholder_operand = None;
+        if final_has_placeholders {
+            let AuthoredCallOperand::Value(lowered_operand) =
+                self.lower_authored_call_operand(operand)?
+            else {
+                return Err(LowerError::Source(Error::at_span(
+                    ErrorKind::SyntaxError,
+                    operand.span,
+                    "connected operand must produce a value",
+                )));
+            };
+            placeholder_operand = Some(lowered_operand);
+        } else {
+            let supplied_expressions: &[Expr] = match &operand.kind {
+                ExprKind::Tuple(elements) => elements,
+                _ => std::slice::from_ref(operand),
+            };
+            supplied
+                .try_reserve_exact(supplied_expressions.len())
+                .map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+            for supplied_expression in supplied_expressions {
+                supplied.push(self.lower_authored_call_operand(supplied_expression)?);
+            }
+        }
+
+        let mut current = None;
+        for index in (0..templates.len()).rev() {
+            let mut arguments = std::mem::take(&mut lowered_templates[index]);
+            let has_placeholders = templates[index]
+                .arguments
+                .iter()
+                .any(|argument| matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)));
+            if has_placeholders {
+                let selected_operand = if index + 1 == templates.len() {
+                    placeholder_operand.take()
+                } else {
+                    current.take()
+                }
+                .ok_or_else(|| {
+                    LowerError::Source(Error::at_span(
+                        ErrorKind::TypeError,
+                        expression.span,
+                        "connected placeholder application has no operand",
+                    ))
+                })?;
+                let binding = self.lower_connected_binding(selected_operand)?;
+                arguments = self.expand_connected_placeholders(arguments, &binding)?;
+                let applied = self.lower_connected_selected_call(
+                    &templates[index].name,
+                    primitive_origins[index],
+                    call_origins[index],
+                    templates[index].span.begin,
+                    arguments,
+                )?;
+                self.set_release(binding.node, ReleaseAfter::Node(applied.node))?;
+                current = Some(applied);
+                continue;
+            }
+            if index + 1 == templates.len() {
+                arguments.append(&mut supplied);
+            } else {
+                let Some(inner) = current.take() else {
+                    return Err(LowerError::Source(Error::at_span(
+                        ErrorKind::TypeError,
+                        expression.span,
+                        "connected application has no inner result",
+                    )));
+                };
+                arguments.try_reserve(1).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Edge,
+                    })
+                })?;
+                arguments.push(AuthoredCallOperand::Value(inner));
+            }
+            current = Some(self.lower_connected_selected_call(
+                &templates[index].name,
+                primitive_origins[index],
+                call_origins[index],
+                templates[index].span.begin,
+                arguments,
+            )?);
+        }
+        current.ok_or_else(|| {
+            LowerError::Source(Error::at_span(
+                ErrorKind::TypeError,
+                expression.span,
+                "connected application has no result",
+            ))
+        })
+    }
+
+    fn lower_connected_binding(&mut self, operand: Lowered) -> Result<Lowered, LowerError> {
+        let edge_start = self.builder.finish_preview_edges()?;
+        self.builder.push_edge(Edge {
+            producer: operand.node,
+            argument_position: 1,
+            access: operand.access,
+            cardinality: operand.cardinality,
+            conversion: crate::Conversion::Identity,
+            ownership: if operand.borrowed {
+                OwnershipMode::ImmutableBorrow
+            } else {
+                OwnershipMode::InfallibleTransfer
+            },
+            origin: operand.origin,
+        })?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::ConnectedBinding,
+            result_type: operand.result_type,
+            cardinality: operand.cardinality,
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin: operand.origin,
+        })?;
+        self.register_node(node)?;
+        if !operand.borrowed {
+            self.set_release(operand.node, ReleaseAfter::Node(node))?;
+        }
+        self.needs_connected_bindings = true;
+        Ok(Lowered {
+            node,
+            result_type: operand.result_type,
+            cardinality: operand.cardinality,
+            origin: operand.origin,
+            location: operand.location,
+            borrowed: false,
+            value_type: operand.value_type,
+            tuple_elements: operand.tuple_elements,
+            access: ValueAccess::WholeValue,
+            binding: operand.binding,
+        })
+    }
+
+    fn expand_connected_placeholders<'a>(
+        &mut self,
+        arguments: Vec<AuthoredCallOperand<'a>>,
+        binding: &Lowered,
+    ) -> Result<Vec<AuthoredCallOperand<'a>>, LowerError> {
+        let mut expanded = Vec::new();
+        expanded.try_reserve(arguments.len()).map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        for argument in arguments {
+            let AuthoredCallOperand::Placeholder {
+                placeholder,
+                origin,
+                location,
+            } = argument
+            else {
+                expanded.push(argument);
+                continue;
+            };
+            match placeholder {
+                ConnectedPlaceholder::Whole if !binding.tuple_elements.is_empty() => {
+                    expanded
+                        .try_reserve(binding.tuple_elements.len())
+                        .map_err(|_| {
+                            LowerError::Build(BuildError::AllocationUnavailable {
+                                arena: crate::Arena::Edge,
+                            })
+                        })?;
+                    for (element, metadata) in binding.tuple_elements.iter().enumerate() {
+                        expanded.push(AuthoredCallOperand::Bound(
+                            CallOperand::ConnectedBindingElement {
+                                binding: binding.node,
+                                user_binding: binding.binding,
+                                element: u32::try_from(element).map_err(|_| {
+                                    LowerError::Build(BuildError::CountOverflow {
+                                        arena: crate::Arena::Edge,
+                                    })
+                                })?,
+                                metadata: try_clone_tuple_element(metadata, origin, location)?,
+                            },
+                        ));
+                    }
+                }
+                ConnectedPlaceholder::Whole => {
+                    expanded.push(AuthoredCallOperand::Bound(CallOperand::Whole(
+                        connected_binding_whole(
+                            binding,
+                            ValueAccess::ConnectedBindingWhole,
+                            origin,
+                            location,
+                        )?,
+                    )));
+                }
+                ConnectedPlaceholder::Element(one_based)
+                    if binding.tuple_elements.is_empty() && one_based == 1 =>
+                {
+                    expanded.push(AuthoredCallOperand::Bound(CallOperand::Whole(
+                        connected_binding_whole(
+                            binding,
+                            ValueAccess::ConnectedBindingElement(0),
+                            origin,
+                            location,
+                        )?,
+                    )));
+                }
+                ConnectedPlaceholder::Element(one_based) => {
+                    let zero_based = one_based.checked_sub(1).ok_or_else(|| {
+                        LowerError::Source(Error::new(
+                            ErrorKind::SyntaxError,
+                            location,
+                            "connected placeholder index must be one-based",
+                        ))
+                    })?;
+                    let metadata =
+                        binding
+                            .tuple_elements
+                            .get(zero_based as usize)
+                            .ok_or_else(|| {
+                                LowerError::Source(Error::new(
+                                    ErrorKind::TypeError,
+                                    location,
+                                    "connected placeholder index is outside the operand",
+                                ))
+                            })?;
+                    expanded.push(AuthoredCallOperand::Bound(
+                        CallOperand::ConnectedBindingElement {
+                            binding: binding.node,
+                            user_binding: binding.binding,
+                            element: zero_based,
+                            metadata: try_clone_tuple_element(metadata, origin, location)?,
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(expanded)
+    }
+
+    fn lower_authored_call_operand<'a>(
+        &mut self,
+        expression: &'a Expr,
+    ) -> Result<AuthoredCallOperand<'a>, LowerError> {
+        if let ExprKind::ConnectedPlaceholder(placeholder) = &expression.kind {
+            return Ok(AuthoredCallOperand::Placeholder {
+                placeholder: *placeholder,
+                origin: self.push_origin(expression.span)?,
+                location: expression.span.begin,
+            });
+        }
+        if let ExprKind::OperationReference { name, name_span } = &expression.kind {
+            return Ok(AuthoredCallOperand::OperationReference {
+                name,
+                name_span: *name_span,
+                origin: self.push_origin(expression.span)?,
+            });
+        }
+        self.lower_expr(expression).map(AuthoredCallOperand::Value)
+    }
+
+    fn lower_connected_selected_call(
+        &mut self,
+        name: &str,
+        primitive_origin: OriginIndex,
+        origin: OriginIndex,
+        location: SourceLocation,
+        arguments: Vec<AuthoredCallOperand<'_>>,
+    ) -> Result<Lowered, LowerError> {
+        if name == "filter" {
+            let mut arguments = arguments.into_iter();
+            let (Some(reference), Some(vector), None) =
+                (arguments.next(), arguments.next(), arguments.next())
+            else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::ArityError,
+                    location,
+                    "connected filter application has invalid arity",
+                )));
+            };
+            let AuthoredCallOperand::OperationReference {
+                name: reference_name,
+                name_span,
+                origin: reference_origin,
+            } = reference
+            else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    location,
+                    "connected filter argument 1 must be an operation reference",
+                )));
+            };
+            let mut operands = Vec::new();
+            operands.try_reserve_exact(1).map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Edge,
+                })
+            })?;
+            operands.push(authored_value_operand(vector, location)?);
+            return self.lower_selected_call(
+                name,
+                primitive_origin,
+                origin,
+                location,
+                operands,
+                Some((reference_name, name_span, reference_origin)),
+            );
+        }
+        if matches!(name, "foldl" | "scanl") {
+            let mut arguments = arguments.into_iter();
+            let (Some(reference), Some(initializer), Some(vector), None) = (
+                arguments.next(),
+                arguments.next(),
+                arguments.next(),
+                arguments.next(),
+            ) else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::ArityError,
+                    location,
+                    "connected reducer application has invalid arity",
+                )));
+            };
+            let AuthoredCallOperand::OperationReference {
+                name: reference_name,
+                name_span,
+                origin: reference_origin,
+            } = reference
+            else {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    location,
+                    "connected reducer argument 1 must be an operation reference",
+                )));
+            };
+            let mut operands = Vec::new();
+            operands.try_reserve_exact(2).map_err(|_| {
+                LowerError::Build(BuildError::AllocationUnavailable {
+                    arena: crate::Arena::Edge,
+                })
+            })?;
+            operands.push(authored_value_operand(initializer, location)?);
+            operands.push(authored_value_operand(vector, location)?);
+            return self.lower_selected_call(
+                name,
+                primitive_origin,
+                origin,
+                location,
+                operands,
+                Some((reference_name, name_span, reference_origin)),
+            );
+        }
+
+        let mut operands = Vec::new();
+        operands.try_reserve_exact(arguments.len()).map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        for argument in arguments {
+            operands.push(authored_value_operand(argument, location)?);
+        }
+        self.lower_selected_call(name, primitive_origin, origin, location, operands, None)
     }
 
     fn lower_call(
@@ -1082,6 +3122,9 @@ impl Lowerer {
     ) -> Result<Lowered, LowerError> {
         if matches!(name, "foldl" | "scanl") {
             return self.lower_reducer_consumer(name, arguments, name_span, origin, location);
+        }
+        if name == "filter" {
+            return self.lower_filter_consumer(arguments, name_span, origin, location);
         }
         let primitive_origin = self.push_origin(name_span)?;
         let mut lowered = Vec::new();
@@ -1175,6 +3218,51 @@ impl Lowerer {
         )
     }
 
+    fn lower_filter_consumer(
+        &mut self,
+        arguments: &[Expr],
+        name_span: SourceSpan,
+        origin: OriginIndex,
+        location: SourceLocation,
+    ) -> Result<Lowered, LowerError> {
+        let [reference_expression, vector] = arguments else {
+            return Err(LowerError::Source(Error::new(
+                ErrorKind::ArityError,
+                location,
+                "filter requires a predicate reference and vector",
+            )));
+        };
+        let ExprKind::OperationReference {
+            name: predicate_name,
+            name_span: predicate_name_span,
+        } = &reference_expression.kind
+        else {
+            return Err(LowerError::Source(Error::at_span(
+                ErrorKind::TypeError,
+                reference_expression.span,
+                "filter argument 1 must be a built-in operation reference",
+            )));
+        };
+        let primitive_origin = self.push_origin(name_span)?;
+        let reference_origin = self.push_origin(reference_expression.span)?;
+        let vector = self.lower_expr(vector)?;
+        let mut operands = Vec::new();
+        operands.try_reserve_exact(1).map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        operands.push(CallOperand::Whole(vector));
+        self.lower_selected_call(
+            "filter",
+            primitive_origin,
+            origin,
+            location,
+            operands,
+            Some((predicate_name, *predicate_name_span, reference_origin)),
+        )
+    }
+
     fn lower_prefix_call(
         &mut self,
         name: &str,
@@ -1183,6 +3271,37 @@ impl Lowerer {
         location: SourceLocation,
         tuple: Lowered,
     ) -> Result<Lowered, LowerError> {
+        if let Some(binding) = tuple.binding {
+            let mut operands = Vec::new();
+            operands
+                .try_reserve(tuple.tuple_elements.len())
+                .map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Edge,
+                    })
+                })?;
+            for (element, metadata) in tuple.tuple_elements.into_iter().enumerate() {
+                operands.push(CallOperand::BindingElement {
+                    binding: tuple.node,
+                    binding_index: binding,
+                    element: u32::try_from(element).map_err(|_| {
+                        LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::Edge,
+                        })
+                    })?,
+                    metadata,
+                });
+            }
+            self.needs_spread = true;
+            return self.lower_selected_call(
+                name,
+                primitive_origin,
+                origin,
+                location,
+                operands,
+                None,
+            );
+        }
         let edge_start = self.builder.finish_preview_edges()?;
         self.builder.push_edge(Edge {
             producer: tuple.node,
@@ -1260,13 +3379,36 @@ impl Lowerer {
         };
         let operation_reference =
             if let Some((reference_name, reference_span, reference_origin)) = operation_reference {
+                let (parameter_types, result_type, exact_parameters, require_total_unary) =
+                    if descriptor.behavior == StructuralBehavior::VectorFilter {
+                        (
+                            [Some(descriptor.result), None],
+                            Some(ScalarType::Bool),
+                            true,
+                            true,
+                        )
+                    } else {
+                        (
+                            [Some(descriptor.result), Some(descriptor.result)],
+                            Some(descriptor.result),
+                            false,
+                            false,
+                        )
+                    };
+                let parameter_types = if descriptor.behavior == StructuralBehavior::VectorFilter {
+                    &parameter_types[..1]
+                } else {
+                    &parameter_types[..]
+                };
                 let reference = resolve_operation_reference(
                     reference_name,
                     reference_span,
                     reference_origin,
                     OperationReferenceConstraint {
-                        parameter_types: &[Some(descriptor.result), Some(descriptor.result)],
-                        result_type: Some(descriptor.result),
+                        parameter_types,
+                        result_type,
+                        exact_parameters,
+                        require_total_unary,
                     },
                     &mut self.diagnostics,
                 )?;
@@ -1284,6 +3426,7 @@ impl Lowerer {
                 ResultCardinality::Scalar
                     | ResultCardinality::PreserveOperand(_)
                     | ResultCardinality::OperandPlusOne(_)
+                    | ResultCardinality::SubsetOfOperand(_)
             );
         let edge_start = self.builder.finish_preview_edges()?;
         let mut static_anchor = None;
@@ -1336,6 +3479,15 @@ impl Lowerer {
                     ErrorKind::TypeError,
                     SourceLocation::start(),
                     "selected whole-vector operand is not a vector",
+                )));
+            }
+            if accepted.consumption == OperandConsumption::AtomicScalar
+                && !matches!(value_type, Type::Scalar(_))
+            {
+                return Err(LowerError::Source(Error::new(
+                    ErrorKind::TypeError,
+                    SourceLocation::start(),
+                    "selected atomic-scalar operand is not a scalar",
                 )));
             }
             if accepted.consumption == OperandConsumption::Elementwise
@@ -1517,7 +3669,8 @@ impl Lowerer {
         } else {
             let position = match descriptor.application_plan.result_cardinality {
                 ResultCardinality::PreserveOperand(position)
-                | ResultCardinality::OperandPlusOne(position) => position,
+                | ResultCardinality::OperandPlusOne(position)
+                | ResultCardinality::SubsetOfOperand(position) => position,
                 _ => {
                     return Err(LowerError::Source(Error::new(
                         ErrorKind::TypeError,
@@ -1527,6 +3680,12 @@ impl Lowerer {
                 }
             };
             let result_cardinality = match operand_cardinality(position) {
+                Some(Cardinality::StaticVector(_) | Cardinality::DynamicVector)
+                    if descriptor.application_plan.result_cardinality
+                        == ResultCardinality::SubsetOfOperand(position) =>
+                {
+                    Some(Cardinality::DynamicVector)
+                }
                 Some(Cardinality::StaticVector(length))
                     if descriptor.application_plan.result_cardinality
                         == ResultCardinality::OperandPlusOne(position) =>
@@ -1591,10 +3750,25 @@ impl Lowerer {
         })?;
         self.register_node(node)?;
         for operand in operands {
-            if let CallOperand::Whole(lowered) = operand
-                && !lowered.borrowed
-            {
-                self.set_release(lowered.node, ReleaseAfter::Node(node))?;
+            match operand {
+                CallOperand::Whole(lowered) => {
+                    if let Some(binding) = lowered.binding {
+                        self.record_binding_consumer(binding, node)?;
+                    } else if !lowered.borrowed {
+                        self.set_release(lowered.node, ReleaseAfter::Node(node))?;
+                    }
+                }
+                CallOperand::BindingElement { binding_index, .. } => {
+                    self.record_binding_consumer(binding_index, node)?;
+                }
+                CallOperand::ConnectedBindingElement {
+                    user_binding: Some(binding),
+                    ..
+                } => self.record_binding_consumer(binding, node)?,
+                CallOperand::TupleElement { .. }
+                | CallOperand::ConnectedBindingElement {
+                    user_binding: None, ..
+                } => {}
             }
         }
         self.needs_ids = true;
@@ -1610,6 +3784,7 @@ impl Lowerer {
             value_type,
             tuple_elements: Vec::new(),
             access: ValueAccess::WholeValue,
+            binding: None,
         })
     }
 
@@ -1620,7 +3795,11 @@ impl Lowerer {
         branches: &[Expr],
         origin: OriginIndex,
     ) -> Result<Lowered, LowerError> {
-        let operand = self.lower_expr(operand)?;
+        let mut operand = self.lower_expr(operand)?;
+        let source_binding = operand.binding;
+        if source_binding.is_some() {
+            operand = self.materialize_binding_borrow(operand)?;
+        }
         let branch_start = self.builder.finish_preview_branches()?;
         let mut branch_roots = Vec::new();
         let mut result_elements = Vec::new();
@@ -1685,7 +3864,7 @@ impl Lowerer {
         self.builder.push_edge(Edge {
             producer: operand.node,
             argument_position: 1,
-            access: ValueAccess::WholeValue,
+            access: operand.access,
             cardinality: operand.cardinality,
             conversion: crate::Conversion::Identity,
             ownership: if operand.borrowed {
@@ -1713,7 +3892,10 @@ impl Lowerer {
             origin,
         })?;
         self.register_node(node)?;
-        if !operand.borrowed {
+        if let Some(binding) = source_binding {
+            self.record_binding_consumer(binding, node)?;
+            self.set_release(operand.node, ReleaseAfter::Node(node))?;
+        } else if !operand.borrowed {
             self.set_release(operand.node, ReleaseAfter::Node(node))?;
         }
         for root in &branch_roots {
@@ -1754,7 +3936,43 @@ impl Lowerer {
             value_type: Type::Tuple(value_types),
             tuple_elements,
             access: ValueAccess::WholeValue,
+            binding: None,
         })
+    }
+}
+
+enum AuthoredCallOperand<'a> {
+    Value(Lowered),
+    Bound(CallOperand),
+    Placeholder {
+        placeholder: ConnectedPlaceholder,
+        origin: OriginIndex,
+        location: SourceLocation,
+    },
+    OperationReference {
+        name: &'a str,
+        name_span: SourceSpan,
+        origin: OriginIndex,
+    },
+}
+
+fn authored_value_operand(
+    argument: AuthoredCallOperand<'_>,
+    location: SourceLocation,
+) -> Result<CallOperand, LowerError> {
+    match argument {
+        AuthoredCallOperand::Value(value) => Ok(CallOperand::Whole(value)),
+        AuthoredCallOperand::Bound(operand) => Ok(operand),
+        AuthoredCallOperand::OperationReference { .. } => Err(LowerError::Source(Error::new(
+            ErrorKind::SyntaxError,
+            location,
+            "operation reference is not accepted by this connected application",
+        ))),
+        AuthoredCallOperand::Placeholder { .. } => Err(LowerError::Source(Error::new(
+            ErrorKind::SyntaxError,
+            location,
+            "connected placeholder was not bound",
+        ))),
     }
 }
 
@@ -1762,6 +3980,18 @@ enum CallOperand {
     Whole(Lowered),
     TupleElement {
         prepare: NodeIndex,
+        element: u32,
+        metadata: TupleElement,
+    },
+    ConnectedBindingElement {
+        binding: NodeIndex,
+        user_binding: Option<usize>,
+        element: u32,
+        metadata: TupleElement,
+    },
+    BindingElement {
+        binding: NodeIndex,
+        binding_index: usize,
         element: u32,
         metadata: TupleElement,
     },
@@ -1796,6 +4026,34 @@ impl CallOperand {
             } => (
                 *prepare,
                 ValueAccess::TupleElement(*element),
+                &metadata.value_type,
+                metadata.cardinality,
+                metadata.origin,
+                true,
+                metadata.location,
+            ),
+            Self::ConnectedBindingElement {
+                binding,
+                element,
+                metadata,
+                ..
+            } => (
+                *binding,
+                ValueAccess::ConnectedBindingElement(*element),
+                &metadata.value_type,
+                metadata.cardinality,
+                metadata.origin,
+                true,
+                metadata.location,
+            ),
+            Self::BindingElement {
+                binding,
+                element,
+                metadata,
+                ..
+            } => (
+                *binding,
+                ValueAccess::BindingBorrowElement(*element),
                 &metadata.value_type,
                 metadata.cardinality,
                 metadata.origin,
@@ -1930,6 +4188,11 @@ fn select_descriptor_with_argument_offset(
                 {
                     return None;
                 }
+                if accepted.consumption == OperandConsumption::AtomicScalar
+                    && !matches!(operand.parts().2, Type::Scalar(_))
+                {
+                    return None;
+                }
                 let actual = scalar_element(operand.parts().2)?;
                 match conversion(actual, accepted.element_type)? {
                     RegistryConversion::Identity => {}
@@ -1955,7 +4218,10 @@ fn select_descriptor_with_argument_offset(
                     .zip(operands)
                     .take_while(|(accepted, operand)| {
                         (accepted.consumption == OperandConsumption::Elementwise
-                            || matches!(operand.parts().2, Type::Vector(_)))
+                            || (accepted.consumption == OperandConsumption::WholeVector
+                                && matches!(operand.parts().2, Type::Vector(_)))
+                            || (accepted.consumption == OperandConsumption::AtomicScalar
+                                && matches!(operand.parts().2, Type::Scalar(_))))
                             && scalar_element(operand.parts().2).is_some_and(|actual| {
                                 conversion(actual, accepted.element_type).is_some_and(|selected| {
                                     selected == RegistryConversion::Identity
@@ -1998,6 +4264,8 @@ fn select_descriptor_with_argument_offset(
 pub(crate) struct OperationReferenceConstraint<'a> {
     pub parameter_types: &'a [Option<ScalarType>],
     pub result_type: Option<ScalarType>,
+    pub exact_parameters: bool,
+    pub require_total_unary: bool,
 }
 
 #[allow(dead_code)]
@@ -2033,6 +4301,11 @@ pub(crate) fn resolve_operation_reference(
             continue;
         }
         has_elementwise = true;
+        if constraint.require_total_unary
+            && !crate::semantic_registry::is_total_unary_predicate(descriptor)
+        {
+            continue;
+        }
         if constraint
             .result_type
             .is_some_and(|result| descriptor.result != result)
@@ -2052,8 +4325,14 @@ pub(crate) fn resolve_operation_reference(
             };
             match conversion(actual, accepted.element_type) {
                 Some(RegistryConversion::Identity) => {}
-                Some(RegistryConversion::PromoteIntToDouble) => cost += 1,
+                Some(RegistryConversion::PromoteIntToDouble) if !constraint.exact_parameters => {
+                    cost += 1
+                }
                 None => {
+                    compatible = false;
+                    break;
+                }
+                Some(RegistryConversion::PromoteIntToDouble) => {
                     compatible = false;
                     break;
                 }
@@ -2213,15 +4492,55 @@ fn try_clone_lowered(lowered: &Lowered) -> Result<Lowered, LowerError> {
         value_type: try_clone_type(&lowered.value_type)?,
         tuple_elements,
         access: lowered.access,
+        binding: lowered.binding,
+    })
+}
+
+fn connected_binding_whole(
+    binding: &Lowered,
+    access: ValueAccess,
+    origin: OriginIndex,
+    location: SourceLocation,
+) -> Result<Lowered, LowerError> {
+    Ok(Lowered {
+        node: binding.node,
+        result_type: binding.result_type,
+        cardinality: binding.cardinality,
+        origin,
+        location,
+        borrowed: true,
+        value_type: try_clone_type(&binding.value_type)?,
+        tuple_elements: Vec::new(),
+        access,
+        binding: binding.binding,
+    })
+}
+
+fn try_clone_tuple_element(
+    metadata: &TupleElement,
+    origin: OriginIndex,
+    location: SourceLocation,
+) -> Result<TupleElement, LowerError> {
+    Ok(TupleElement {
+        value_type: try_clone_type(&metadata.value_type)?,
+        cardinality: metadata.cardinality,
+        origin,
+        location,
     })
 }
 
 fn placeholder_span(expression: &Expr) -> Option<SourceSpan> {
     match &expression.kind {
         ExprKind::Placeholder => Some(expression.span),
-        ExprKind::Call { arguments, .. } | ExprKind::Tuple(arguments) => {
-            arguments.iter().find_map(placeholder_span)
-        }
+        ExprKind::ConnectedPlaceholder(_) => None,
+        ExprKind::Call { arguments, .. }
+        | ExprKind::Format { arguments, .. }
+        | ExprKind::Tuple(arguments) => arguments.iter().find_map(placeholder_span),
+        ExprKind::Connected { templates, operand } => templates
+            .iter()
+            .flat_map(|template| &template.arguments)
+            .find_map(placeholder_span)
+            .or_else(|| placeholder_span(operand)),
         ExprKind::Fanout { operand, branches } => {
             placeholder_span(operand).or_else(|| branches.iter().find_map(placeholder_span))
         }
@@ -2229,7 +4548,6 @@ fn placeholder_span(expression: &Expr) -> Option<SourceSpan> {
         | ExprKind::Vector(_, _)
         | ExprKind::DeepTuple { .. }
         | ExprKind::UnaryChain { .. }
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => None,
     }
@@ -2273,18 +4591,11 @@ fn origin_position(location: SourceLocation) -> Result<OriginPosition, BuildErro
     })
 }
 
-fn scalar_constant(value: &Value) -> Option<ScalarConstant> {
-    match value {
-        Value::Bool(value) => Some(ScalarConstant::Bool(*value)),
-        Value::Int(value) => Some(ScalarConstant::Int(*value)),
-        Value::Double(value) => Some(ScalarConstant::DoubleBits(value.to_bits())),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Arena, Invariant, MalformedProgram, RecordKind};
+    use std::error::Error as _;
 
     fn debug_digest(program: &VerifiedProgram) -> u64 {
         let text = format!("{:?}", program.as_raw());
@@ -2306,6 +4617,54 @@ mod tests {
             Ok(_) => panic!("source unexpectedly compiled"),
             Err(error) => panic!("expected source diagnostic, got {error:?}"),
         }
+    }
+
+    #[test]
+    fn value_formatting_lowering_records_typed_template_edges_and_root_presentation() {
+        let program = must_compile("printf[\"{}\" [1 \"x\"]]");
+        let raw = program.as_raw();
+        assert_eq!(raw.module.semantic_minor, 5);
+        assert!(raw.features.contains(&Feature::ValueFormatting.numeric()));
+        let Some(NodeKind::Format {
+            template_origin,
+            keyword_origin,
+            ..
+        }) = raw.nodes.last().map(|node| node.kind)
+        else {
+            panic!("missing Format node");
+        };
+        assert_eq!(raw.origins[keyword_origin.0 as usize].span.begin.offset, 1);
+        assert_eq!(raw.origins[keyword_origin.0 as usize].span.end.offset, 7);
+        assert_eq!(raw.origins[template_origin.0 as usize].span.begin.offset, 8);
+        assert_eq!(raw.origins[template_origin.0 as usize].span.end.offset, 12);
+        assert_eq!(raw.roots[0].presentation, RootPresentation::RawString);
+    }
+
+    #[test]
+    fn compile_error_exposes_each_wrapped_phase_error() {
+        let source = CompileError::Source(Error::new(
+            ErrorKind::SyntaxError,
+            SourceLocation::start(),
+            "invalid source",
+        ));
+        let source_error = source.source().expect("source phase error");
+        assert!(source_error.downcast_ref::<Error>().is_some());
+        assert!(source_error.source().is_none());
+
+        let build = CompileError::Build(BuildError::AllocationUnavailable { arena: Arena::Node });
+        let build_error = build.source().expect("build phase error");
+        assert!(build_error.downcast_ref::<BuildError>().is_some());
+        assert!(build_error.source().is_none());
+
+        let verify = CompileError::Verify(VerifyError::MalformedProgram(MalformedProgram {
+            invariant: Invariant::InvalidRecord,
+            record: RecordKind::Node,
+            index: Some(0),
+            field: "kind",
+        }));
+        let verify_error = verify.source().expect("verify phase error");
+        assert!(verify_error.downcast_ref::<VerifyError>().is_some());
+        assert!(verify_error.source().is_none());
     }
 
     #[test]
@@ -2333,6 +4692,40 @@ mod tests {
         let explicit = must_compile("parameters[]\n");
         assert!(explicit.as_raw().parameters.is_empty());
         assert!(explicit.module().parameter_header_origin.is_some());
+    }
+
+    #[test]
+    fn typed_empty_trivia_preserves_canonical_lowering() {
+        for (canonical_source, trivia_source, scalar_type) in [
+            ("Bool()", "Bool( \t)", ScalarType::Bool),
+            ("Int()", "Int(\n)", ScalarType::Int),
+            ("Double()", "Double(\t# empty\r\n )", ScalarType::Double),
+        ] {
+            let canonical = must_compile(canonical_source);
+            let with_trivia = must_compile(trivia_source);
+            let canonical = canonical.as_raw();
+            let with_trivia = with_trivia.as_raw();
+
+            assert_eq!(with_trivia.types, canonical.types, "{trivia_source}");
+            assert_eq!(
+                with_trivia.constants, canonical.constants,
+                "{trivia_source}"
+            );
+            assert_eq!(with_trivia.nodes, canonical.nodes, "{trivia_source}");
+            assert_eq!(with_trivia.edges, canonical.edges, "{trivia_source}");
+            assert_eq!(with_trivia.roots, canonical.roots, "{trivia_source}");
+            assert_eq!(
+                with_trivia.constants,
+                [ConstantRecord::Vector {
+                    element_type: scalar_type,
+                    elements: IndexRange { start: 0, count: 0 },
+                }]
+            );
+            assert_eq!(
+                with_trivia.nodes[0].cardinality,
+                Some(Cardinality::StaticVector(0))
+            );
+        }
     }
 
     #[test]
@@ -2385,6 +4778,8 @@ mod tests {
             OperationReferenceConstraint {
                 parameter_types: &[Some(ScalarType::Int), Some(ScalarType::Int)],
                 result_type: Some(ScalarType::Int),
+                exact_parameters: false,
+                require_total_unary: false,
             },
             &mut diagnostics,
         )
@@ -2406,6 +4801,8 @@ mod tests {
             OperationReferenceConstraint {
                 parameter_types: &[Some(ScalarType::Int), Some(ScalarType::Double)],
                 result_type: Some(ScalarType::Double),
+                exact_parameters: false,
+                require_total_unary: false,
             },
             &mut diagnostics,
         )
@@ -2452,6 +4849,8 @@ mod tests {
                 OperationReferenceConstraint {
                     parameter_types: parameters,
                     result_type: result,
+                    exact_parameters: false,
+                    require_total_unary: false,
                 },
                 &mut diagnostics,
             )
@@ -2468,6 +4867,8 @@ mod tests {
             OperationReferenceConstraint {
                 parameter_types: &[],
                 result_type: None,
+                exact_parameters: false,
+                require_total_unary: false,
             },
             &mut diagnostics,
         )
@@ -2498,6 +4899,8 @@ mod tests {
             OperationReferenceConstraint {
                 parameter_types: &[None, None],
                 result_type: None,
+                exact_parameters: false,
+                require_total_unary: false,
             },
             &mut DiagnosticReservations { refuse_next: true },
         );
@@ -2554,6 +4957,132 @@ mod tests {
         assert_eq!(applies[3].4, LiftMode::DynamicVector);
         assert_eq!(applies[3].0.cardinality, Some(Cardinality::DynamicVector));
         assert_ne!(raw.edges[0].origin, raw.nodes[2].origin);
+    }
+
+    #[test]
+    fn connected_completion_erases_to_existing_selected_calls_in_authored_order() {
+        let program = must_compile("add[10] mul[2] 20\n");
+        let raw = program.as_raw();
+        assert_eq!(raw.module.semantic_major, 1);
+        assert_eq!(raw.module.semantic_minor, 0);
+        assert_eq!(raw.features, vec![Feature::StableSemanticIds.numeric()]);
+        assert_eq!(raw.nodes.len(), 5);
+        assert_eq!(
+            raw.nodes
+                .iter()
+                .filter_map(|node| match node.kind {
+                    NodeKind::SelectedApply {
+                        primitive_id,
+                        implementation_id,
+                        ..
+                    } => Some((primitive_id, implementation_id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [(7, 13), (5, 9)]
+        );
+        assert!(!raw.nodes.iter().any(|node| matches!(
+            node.kind,
+            NodeKind::TupleConstruct | NodeKind::PrefixSpreadPrepare
+        )));
+
+        let tuple_bundle = must_compile("add[] [(1 2) (3 4)]\n");
+        let tuple_raw = tuple_bundle.as_raw();
+        assert_eq!(
+            tuple_raw.features,
+            vec![Feature::StableSemanticIds.numeric()]
+        );
+        assert_eq!(tuple_raw.module.semantic_minor, 0);
+        assert_eq!(tuple_raw.nodes.len(), 3);
+        assert!(
+            !tuple_raw
+                .nodes
+                .iter()
+                .any(|node| matches!(node.kind, NodeKind::TupleConstruct))
+        );
+        assert_eq!(
+            tuple_raw
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, NodeKind::SelectedApply { .. }))
+                .count(),
+            1
+        );
+
+        let filter = must_compile("filter[@odd] (1 2 3)\n");
+        assert_eq!(filter.as_raw().operation_references.len(), 1);
+        assert!(filter.as_raw().nodes.iter().any(|node| matches!(
+            node.kind,
+            NodeKind::SelectedApply {
+                primitive_id: 39,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn connected_completion_diagnostics_are_structured_and_deterministic() {
+        for (source, kind, reason, template_arity, supplied_width, offset) in [
+            (
+                "add[] 1",
+                ErrorKind::ArityError,
+                ConnectedApplicationErrorReason::MissingCompletion,
+                0,
+                1,
+                7,
+            ),
+            (
+                "inc[] [1 2]",
+                ErrorKind::ArityError,
+                ConnectedApplicationErrorReason::SurplusCompletion,
+                0,
+                2,
+                7,
+            ),
+            (
+                "add[1 2] 3",
+                ErrorKind::ArityError,
+                ConnectedApplicationErrorReason::AlreadyComplete,
+                2,
+                1,
+                1,
+            ),
+            (
+                "add[] []",
+                ErrorKind::ArityError,
+                ConnectedApplicationErrorReason::EmptyTupleOperand,
+                0,
+                0,
+                7,
+            ),
+            (
+                "add[] fanout[1 {inc[_]} {inc[_]}]",
+                ErrorKind::TypeError,
+                ConnectedApplicationErrorReason::RuntimeTupleOperand,
+                0,
+                1,
+                7,
+            ),
+        ] {
+            let error = must_source_error(source);
+            assert_eq!(error.kind, kind, "{source}");
+            assert_eq!(error.location.offset, offset, "{source}");
+            assert_eq!(error.primitive.as_deref(), Some(&source[..3]), "{source}");
+            assert!(error.message.contains(reason.name()), "{source}");
+            let context = error
+                .connected_application
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing connected context for {source}"));
+            assert_eq!(context.reason, reason, "{source}");
+            assert_eq!(context.template_arity, template_arity, "{source}");
+            assert_eq!(context.supplied_width, supplied_width, "{source}");
+        }
+
+        assert_eq!(
+            connected_completion_reason(&[1, 3], 0, 2, false),
+            Some(ConnectedApplicationErrorReason::AmbiguousCompletion)
+        );
+        assert_eq!(connected_completion_reason(&[2], 1, 1, false), None);
     }
 
     #[test]
@@ -2927,6 +5456,126 @@ mod tests {
     }
 
     #[test]
+    fn filter_records_predicate_identity_dynamic_subset_plan_and_owned_input() {
+        let program = must_compile(
+            "parameters[n Int]\n\
+             filter[@not Bool()]\n\
+             filter[@odd (1 2 3)]\n\
+             filter[@odd iota[n]]\n\
+             filter[@is_positive Double()]\n",
+        );
+        let raw = program.as_raw();
+        assert_eq!(
+            raw.features,
+            vec![
+                Feature::StableSemanticIds.numeric(),
+                Feature::ApplicationPlans.numeric(),
+                Feature::OperationReferences.numeric(),
+            ]
+        );
+        assert_eq!(
+            raw.operation_references
+                .iter()
+                .map(|reference| (
+                    reference.primitive_id,
+                    reference.signature_id,
+                    reference.implementation_id,
+                ))
+                .collect::<Vec<_>>(),
+            [(10, 21, 21), (13, 24, 24), (13, 24, 24), (15, 27, 27)]
+        );
+        let applies: Vec<_> = raw
+            .nodes
+            .iter()
+            .filter_map(|node| match node.kind {
+                NodeKind::SelectedApply {
+                    primitive_id: 39,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                    shape,
+                    ..
+                } => Some((
+                    node,
+                    signature_id,
+                    implementation_id,
+                    application_plan_id,
+                    operation_reference,
+                    lift,
+                    shape,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applies.len(), 4);
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| (apply.1, apply.2, apply.3, apply.4))
+                .collect::<Vec<_>>(),
+            [
+                (64, 64, 11, Some(crate::OperationReferenceIndex(0))),
+                (65, 65, 11, Some(crate::OperationReferenceIndex(1))),
+                (65, 65, 11, Some(crate::OperationReferenceIndex(2))),
+                (66, 66, 11, Some(crate::OperationReferenceIndex(3))),
+            ]
+        );
+        assert!(applies.iter().all(|apply| {
+            apply.0.cardinality == Some(Cardinality::DynamicVector)
+                && apply.5 == LiftMode::ContainerVector
+                && apply.6.static_anchor.is_none()
+                && apply.6.dynamic_checks.count == 0
+        }));
+        assert_eq!(
+            applies
+                .iter()
+                .map(|apply| {
+                    let edge = &raw.edges[apply.0.edges.start as usize];
+                    (edge.cardinality, edge.conversion, edge.ownership)
+                })
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some(Cardinality::StaticVector(0)),
+                    crate::Conversion::Identity,
+                    OwnershipMode::OwnedInput,
+                ),
+                (
+                    Some(Cardinality::StaticVector(3)),
+                    crate::Conversion::Identity,
+                    OwnershipMode::OwnedInput,
+                ),
+                (
+                    Some(Cardinality::DynamicVector),
+                    crate::Conversion::Identity,
+                    OwnershipMode::OwnedInput,
+                ),
+                (
+                    Some(Cardinality::StaticVector(0)),
+                    crate::Conversion::Identity,
+                    OwnershipMode::OwnedInput,
+                ),
+            ]
+        );
+        for apply in applies {
+            let input = raw.edges[apply.0.edges.start as usize].producer;
+            assert!(raw.ownership.iter().any(|ownership| {
+                ownership.owner == input
+                    && ownership.release_after
+                        == ReleaseAfter::Node(NodeIndex(
+                            raw.nodes
+                                .iter()
+                                .position(|candidate| std::ptr::eq(candidate, apply.0))
+                                .and_then(|index| u32::try_from(index).ok())
+                                .unwrap_or(u32::MAX),
+                        ))
+            }));
+        }
+    }
+
+    #[test]
     fn foldl_records_reducer_identity_initializer_conversion_and_vector_work_plan() {
         let program = must_compile(
             "parameters[n Int]\n\
@@ -3259,6 +5908,30 @@ mod tests {
                         .count(),
                     unary_depth
                 );
+
+                let mut connected = String::new();
+                connected.reserve(unary_depth * 6 + 2);
+                for _ in 0..unary_depth {
+                    connected.push_str("inc[] ");
+                }
+                connected.push('1');
+                let connected_program = must_compile(&connected);
+                assert_eq!(connected_program.as_raw().nodes.len(), unary_depth + 1);
+                assert_eq!(
+                    connected_program
+                        .as_raw()
+                        .nodes
+                        .iter()
+                        .filter(|node| matches!(
+                            node.kind,
+                            NodeKind::SelectedApply {
+                                implementation_id: 1,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    unary_depth
+                );
             });
         let Ok(join) = join else {
             panic!("failed to spawn reduced-stack lowering thread");
@@ -3270,6 +5943,7 @@ mod tests {
     fn allocation_refusal_reaches_every_lowering_arena() {
         let source = "parameters[x Int]\n\
                       add [x 1]\n\
+                      add[x] 1\n\
                       inc[(1 2)]\n\
                       fanout[iota[x] {add[_ iota[1]]}]\n";
         let program = match parse(source) {
@@ -3466,6 +6140,25 @@ mod tests {
         assert_eq!(arity_before_shape.kind, ErrorKind::ArityError);
         assert_eq!(arity_before_shape.location.line, 2);
 
+        let connected_type_before_arity =
+            must_source_error("add[] fanout[1 {inc[_]} {inc[_]}]\nadd[1]\n");
+        assert_eq!(connected_type_before_arity.kind, ErrorKind::ArityError);
+        assert_eq!(connected_type_before_arity.location.line, 2);
+
+        let connected_child_type_before_parent_arity =
+            must_source_error("inc[1] add[] fanout[1 {inc[_]} {inc[_]}]\n");
+        assert_eq!(
+            connected_child_type_before_parent_arity.kind,
+            ErrorKind::ArityError
+        );
+        assert_eq!(
+            connected_child_type_before_parent_arity
+                .connected_application
+                .as_ref()
+                .map(|context| context.reason),
+            Some(ConnectedApplicationErrorReason::AlreadyComplete)
+        );
+
         let shape = must_source_error("add[(1 2) (3 4 5)]\n");
         assert_eq!(shape.kind, ErrorKind::ShapeMismatch);
         assert_eq!(shape.location.column, 11);
@@ -3505,10 +6198,14 @@ mod tests {
              none_of[(true false)]\n\
              foldl[@sub 10 (1 2)]\n\
              scanl[@sub 10 (1 2)]\n\
+             filter[@odd (1 2)]\n\
              add [1 2]\n\
-             fanout[[1 2] {add _}]\n",
+             add[1] 2\n\
+             fanout[[1 2] {add _}]\n\
+             format[\"{}\" x]\n\
+             printf[\"{}\" \"raw\"]\n",
         );
-        assert_eq!(debug_digest(&matrix), 2_540_857_452_231_284_986);
+        assert_eq!(debug_digest(&matrix), 7_959_043_191_995_543_726);
 
         let depth = 256;
         let mut deep = String::new();
@@ -3522,7 +6219,7 @@ mod tests {
         }
         assert_eq!(
             debug_digest(&must_compile(&deep)),
-            13_509_599_112_709_267_319
+            2_634_332_182_400_948_416
         );
 
         let mut unary = String::new();
@@ -3533,7 +6230,7 @@ mod tests {
         unary.push('1');
         assert_eq!(
             debug_digest(&must_compile(&unary)),
-            9_029_834_920_760_033_112
+            17_775_784_161_034_039_731
         );
     }
 
@@ -3574,5 +6271,12 @@ mod tests {
             }
         );
         assert_eq!(mismatch.span, None);
+    }
+
+    #[test]
+    fn immutable_binding_fanout_lowering_is_verified() {
+        let source = "let values = iota[4]\nfoldl[@add 0 values]\nscanl[@add 0 values]\nfanout[values {sum[_]} {length[_]}]\n";
+        let result = compile_source_with_name(source, "binding.faraweave");
+        assert!(result.is_ok(), "{result:?}");
     }
 }

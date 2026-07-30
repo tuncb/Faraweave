@@ -1,6 +1,6 @@
 use crate::{
     Cardinality, ConstantRecord, Conversion, LiftMode, NodeKind, OwnershipMode, ReleaseAfter,
-    ScalarConstant, ScalarType, TypeRecord, ValueAccess, VerifiedProgram,
+    RootPresentation, ScalarConstant, ScalarType, TypeRecord, ValueAccess, VerifiedProgram,
 };
 use std::collections::TryReserveError;
 use std::io::{self, Write};
@@ -225,6 +225,7 @@ fn string_pool_shape(program: &VerifiedProgram) -> Result<(u32, usize, u64), Fwi
         .source_units
         .len()
         .checked_add(raw.parameters.len())
+        .and_then(|count| count.checked_add(raw.string_values.len()))
         .ok_or(FwirEncodeError::CountOverflow {
             field: "string_references",
         })?;
@@ -253,6 +254,25 @@ fn string_pool_shape(program: &VerifiedProgram) -> Result<(u32, usize, u64), Fwi
             bytes = checked_add(
                 bytes,
                 u64::try_from(parameter.name.len())
+                    .map_err(|_| FwirEncodeError::SizeOverflow { field: "strings" })?,
+                "strings",
+            )?;
+        }
+    }
+    for (index, value) in raw.string_values.iter().enumerate() {
+        let seen_in_names =
+            name_already_seen(program, raw.source_units.len(), raw.parameters.len(), value);
+        let seen_in_values = raw.string_values[..index]
+            .iter()
+            .any(|prior| prior == value);
+        if !seen_in_names && !seen_in_values {
+            checked_count(value.len(), "string")?;
+            count = count
+                .checked_add(1)
+                .ok_or(FwirEncodeError::CountOverflow { field: "strings" })?;
+            bytes = checked_add(
+                bytes,
+                u64::try_from(value.len())
                     .map_err(|_| FwirEncodeError::SizeOverflow { field: "strings" })?,
                 "strings",
             )?;
@@ -342,7 +362,31 @@ fn preflight(
         (13, 20, fixed_length(raw.branches.len(), 20, "branches")?),
         (14, 56, fixed_length(raw.nodes.len(), 56, "nodes")?),
         (15, 12, fixed_length(raw.ownership.len(), 12, "ownership")?),
-        (16, 8, fixed_length(raw.roots.len(), 8, "roots")?),
+        (
+            16,
+            if raw
+                .features
+                .binary_search(&crate::Feature::ValueFormatting.numeric())
+                .is_ok()
+            {
+                12
+            } else {
+                8
+            },
+            fixed_length(
+                raw.roots.len(),
+                if raw
+                    .features
+                    .binary_search(&crate::Feature::ValueFormatting.numeric())
+                    .is_ok()
+                {
+                    12
+                } else {
+                    8
+                },
+                "roots",
+            )?,
+        ),
         (
             17,
             8,
@@ -413,15 +457,41 @@ fn preflight(
         string_count,
         string_reference_count,
         total_size,
-        format_minor: u16::from(
-            raw.features
-                .binary_search(&crate::Feature::ApplicationPlans.numeric())
-                .is_ok()
-                || raw
-                    .features
-                    .binary_search(&crate::Feature::OperationReferences.numeric())
-                    .is_ok(),
-        ),
+        format_minor: if raw
+            .features
+            .binary_search(&crate::Feature::ValueFormatting.numeric())
+            .is_ok()
+        {
+            5
+        } else if raw
+            .features
+            .binary_search(&crate::Feature::Strings.numeric())
+            .is_ok()
+        {
+            4
+        } else if raw
+            .features
+            .binary_search(&crate::Feature::ImmutableBindings.numeric())
+            .is_ok()
+        {
+            3
+        } else if raw
+            .features
+            .binary_search(&crate::Feature::ConnectedApplicationBindings.numeric())
+            .is_ok()
+        {
+            2
+        } else {
+            u16::from(
+                raw.features
+                    .binary_search(&crate::Feature::ApplicationPlans.numeric())
+                    .is_ok()
+                    || raw
+                        .features
+                        .binary_search(&crate::Feature::OperationReferences.numeric())
+                        .is_ok(),
+            )
+        },
     })
 }
 
@@ -446,6 +516,11 @@ fn collect_strings<'a>(
     for parameter in &program.as_raw().parameters {
         if !strings.contains(&parameter.name.as_str()) {
             strings.push(&parameter.name);
+        }
+    }
+    for value in &program.as_raw().string_values {
+        if !strings.contains(&value.as_str()) {
+            strings.push(value);
         }
     }
     strings.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -517,15 +592,29 @@ fn scalar_type(value: ScalarType) -> u8 {
         ScalarType::Bool => 1,
         ScalarType::Int => 2,
         ScalarType::Double => 3,
+        ScalarType::String => 4,
     }
 }
 
-fn scalar_payload(value: ScalarConstant) -> (u8, u64) {
-    match value {
+fn scalar_payload(
+    raw: &crate::RawProgram,
+    strings: &[&str],
+    value: ScalarConstant,
+) -> Result<(u8, u64), FwirEncodeError> {
+    Ok(match value {
         ScalarConstant::Bool(value) => (1, u64::from(value)),
         ScalarConstant::Int(value) => (2, u64::from_le_bytes(value.to_le_bytes())),
         ScalarConstant::DoubleBits(value) => (3, value),
-    }
+        ScalarConstant::String(index) => {
+            let value =
+                raw.string_values
+                    .get(index.0 as usize)
+                    .ok_or(FwirEncodeError::CountOverflow {
+                        field: "string_value",
+                    })?;
+            (4, u64::from(string_index(strings, value)?))
+        }
+    })
 }
 
 fn cardinality(value: Option<Cardinality>) -> (u8, u32) {
@@ -626,7 +715,7 @@ fn encode_sections(
     for constant in &raw.constants {
         match constant {
             ConstantRecord::Scalar(value) => {
-                let (scalar, payload) = scalar_payload(*value);
+                let (scalar, payload) = scalar_payload(raw, strings, *value)?;
                 put_u8(output, 1);
                 put_u8(output, scalar);
                 put_u16(output, 0);
@@ -648,7 +737,7 @@ fn encode_sections(
         }
     }
     for element in &raw.constant_elements {
-        let (scalar, payload) = scalar_payload(*element);
+        let (scalar, payload) = scalar_payload(raw, strings, *element)?;
         put_u8(output, scalar);
         output.extend_from_slice(&[0; 3]);
         put_u64(output, payload);
@@ -669,6 +758,11 @@ fn encode_sections(
             ValueAccess::WholeValue => (1, 0),
             ValueAccess::TupleElement(index) => (2, index),
             ValueAccess::FanOutOperandBorrow => (3, 0),
+            ValueAccess::ConnectedBindingWhole => (4, 0),
+            ValueAccess::ConnectedBindingElement(index) => (5, index),
+            ValueAccess::BindingBorrowWhole => (6, 0),
+            ValueAccess::BindingBorrowElement(index) => (7, index),
+            ValueAccess::BindingMove => (8, 0),
         };
         let (cardinality, cardinality_length) = cardinality(edge.cardinality);
         put_u8(output, access.0);
@@ -752,6 +846,54 @@ fn encode_sections(
                 ],
             ),
             NodeKind::PrefixSpreadPrepare => (5, 0, 0, [0; 8]),
+            NodeKind::ConnectedBinding => (7, 0, 0, [0; 8]),
+            NodeKind::Binding {
+                declaration_origin,
+                name_origin,
+                initializer_origin,
+            } => (
+                8,
+                0,
+                0,
+                [
+                    declaration_origin.0,
+                    name_origin.0,
+                    initializer_origin.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            NodeKind::BindingMove => (9, 0, 0, [0; 8]),
+            NodeKind::BindingBorrow => (10, 0, 0, [0; 8]),
+            NodeKind::Format {
+                template,
+                template_origin,
+                keyword_origin,
+            } => {
+                let template = raw.string_values.get(template.0 as usize).ok_or(
+                    FwirEncodeError::CountOverflow {
+                        field: "node.template",
+                    },
+                )?;
+                (
+                    11,
+                    0,
+                    0,
+                    [
+                        string_index(strings, template)?,
+                        template_origin.0,
+                        keyword_origin.0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+            }
             NodeKind::FanOut {
                 branches,
                 keyword_origin,
@@ -802,6 +944,20 @@ fn encode_sections(
     for root in &raw.roots {
         put_u32(output, root.node.0);
         put_u32(output, root.origin.0);
+        if raw
+            .features
+            .binary_search(&crate::Feature::ValueFormatting.numeric())
+            .is_ok()
+        {
+            put_u8(
+                output,
+                match root.presentation {
+                    RootPresentation::CanonicalValue => 1,
+                    RootPresentation::RawString => 2,
+                },
+            );
+            output.extend_from_slice(&[0; 3]);
+        }
     }
     if raw
         .features
@@ -920,7 +1076,11 @@ mod tests {
             owner: node,
             release_after: ReleaseAfter::Root(crate::RootIndex(0)),
         }));
-        must(builder.push_root(Root { node, origin }));
+        must(builder.push_root(Root {
+            node,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(must(builder.finish()).verify())
     }
 
@@ -966,7 +1126,11 @@ mod tests {
             owner: node,
             release_after: ReleaseAfter::Root(crate::RootIndex(0)),
         }));
-        must(builder.push_root(Root { node, origin }));
+        must(builder.push_root(Root {
+            node,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(must(builder.finish()).verify())
     }
 

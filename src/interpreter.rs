@@ -1,6 +1,6 @@
 use crate::evaluator::{EvaluationConfiguration, ProgramResult};
 use crate::primitive::{
-    SelectedApplicationArgument, apply_implementation, apply_reducer_consumer_implementation,
+    SelectedApplicationArgument, apply_implementation, apply_reference_consumer_implementation,
     implementation_name,
 };
 use crate::resources::ResourceContext;
@@ -10,6 +10,35 @@ use crate::{
     ScalarConstant, ScalarType, SourceLocation, SourceSpan, TypeRecord, Value, ValueAccess,
     VerifiedProgram,
 };
+use std::cell::Cell;
+
+thread_local! {
+    static STRING_COPY_FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    static STRING_COPY_ORDINAL: Cell<usize> = const { Cell::new(0) };
+}
+
+fn copy_runtime_string(
+    source: &str,
+    location: SourceLocation,
+    producer: &str,
+) -> Result<String, Error> {
+    if source.is_empty() {
+        return Ok(String::new());
+    }
+    if cfg!(test) {
+        let ordinal = STRING_COPY_ORDINAL.get();
+        STRING_COPY_ORDINAL.set(ordinal.saturating_add(1));
+        if STRING_COPY_FAIL_AT.get() == Some(ordinal) {
+            return Err(execution_allocation_error(location, producer));
+        }
+    }
+    let mut result = String::new();
+    result
+        .try_reserve_exact(source.len())
+        .map_err(|_| execution_allocation_error(location, producer))?;
+    result.push_str(source);
+    Ok(result)
+}
 
 enum Slot<'a> {
     Borrowed(&'a Value),
@@ -105,16 +134,50 @@ fn evaluate_verified_program_observed(
         releases,
         resources,
     };
+    if let Err(mut error) = admit_string_parameters(&mut interpreter.resources, arguments) {
+        error.usage = Some(interpreter.resources.usage);
+        return Err(error);
+    }
     let execution = interpreter.execute();
     match execution {
-        Ok(values) => Ok(ProgramResult {
-            values,
-            usage: interpreter.resources.usage,
-        }),
+        Ok(values) => {
+            release_string_parameters(&mut interpreter.resources, arguments);
+            Ok(ProgramResult {
+                values,
+                usage: interpreter.resources.usage,
+            })
+        }
         Err(mut error) => {
-            interpreter.cleanup_all();
+            if let Err(cleanup_error) = interpreter.cleanup_all() {
+                error = cleanup_error;
+            }
+            release_string_parameters(&mut interpreter.resources, arguments);
             error.usage = Some(interpreter.resources.usage);
             Err(error)
+        }
+    }
+}
+
+fn admit_string_parameters(
+    resources: &mut ResourceContext,
+    arguments: &[Value],
+) -> Result<(), Error> {
+    for (index, argument) in arguments.iter().enumerate() {
+        if let Value::String(value) = argument
+            && let Err(error) =
+                resources.admit_string(value.len(), 0, SourceLocation::start(), "parameter")
+        {
+            release_string_parameters(resources, &arguments[..index]);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn release_string_parameters(resources: &mut ResourceContext, arguments: &[Value]) {
+    for argument in arguments.iter().rev() {
+        if let Value::String(value) = argument {
+            resources.release_bytes(value.len());
         }
     }
 }
@@ -131,7 +194,15 @@ impl<'a> Interpreter<'a> {
             .try_reserve_exact(self.raw.roots.len())
             .map_err(|_| execution_allocation_error(SourceLocation::start(), "program"))?;
         for root in &self.raw.roots {
-            values.push(self.take_output(root.node)?);
+            match self.take_output(root.node) {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    while let Some(value) = values.pop() {
+                        self.resources.release_owned(value)?;
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(values)
     }
@@ -157,6 +228,13 @@ impl<'a> Interpreter<'a> {
             }
             NodeKind::TupleConstruct => self.execute_tuple(index, node, location),
             NodeKind::PrefixSpreadPrepare => self.execute_spread_prepare(index, node, location),
+            NodeKind::ConnectedBinding => self.execute_binding(index, node, location),
+            NodeKind::Binding { .. } => self.execute_user_binding(index, node, location),
+            NodeKind::BindingMove => self.execute_binding_move(index, node, location),
+            NodeKind::BindingBorrow => self.execute_binding(index, node, location),
+            NodeKind::Format { template, .. } => {
+                self.execute_format(index, node, template, location)
+            }
             NodeKind::SelectedApply {
                 implementation_id,
                 application_plan_id,
@@ -193,19 +271,89 @@ impl<'a> Interpreter<'a> {
         values
             .try_reserve_exact(edges.len())
             .map_err(|_| execution_allocation_error(location, "tuple_literal"))?;
-        self.resources
+        let table_bytes = self
+            .resources
             .admit_tuple(edges.len(), location, "tuple_literal")?;
         for edge in &edges {
-            let value = match edge.ownership {
-                OwnershipMode::InfallibleTransfer => self.take_owned(edge.producer, location)?,
-                OwnershipMode::ImmutableBorrow => self.edge_value(*edge)?.clone(),
-                OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
+            let result = match edge.ownership {
+                OwnershipMode::InfallibleTransfer => {
+                    self.take_infallible_transfer(edge.producer, location)
+                }
+                OwnershipMode::ImmutableBorrow => match edge_value(self.raw, &self.slots, *edge) {
+                    Ok(borrowed) => clone_borrowed_value(
+                        &mut self.resources,
+                        borrowed,
+                        location,
+                        "tuple_literal",
+                    ),
+                    Err(error) => Err(error),
+                },
+                OwnershipMode::OwnedInput => Err(execution_invariant_error(location)),
             };
-            values.push(value);
+            match result {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    while let Some(value) = values.pop() {
+                        self.resources.release_owned(value)?;
+                    }
+                    self.resources.refund(table_bytes);
+                    return Err(error);
+                }
+            }
         }
-        self.put_owned(index, Value::Tuple(values.into()), !edges.is_empty())?;
-        self.release_after(index);
+        let value = Value::Tuple(values.into());
+        self.put_owned(index, value, !edges.is_empty())?;
+        self.release_after(index)?;
         Ok(())
+    }
+
+    fn execute_format(
+        &mut self,
+        index: usize,
+        node: crate::Node,
+        template: crate::StringValueIndex,
+        location: SourceLocation,
+    ) -> Result<(), Error> {
+        let edges = self.copy_edges(node.edges, location)?;
+        let template = self
+            .raw
+            .string_values
+            .get(template.0 as usize)
+            .ok_or_else(|| execution_invariant_error(location))?;
+        let required = {
+            let mut arguments = Vec::new();
+            arguments
+                .try_reserve_exact(edges.len())
+                .map_err(|_| execution_allocation_error(location, "format"))?;
+            for edge in &edges {
+                arguments.push(self.edge_value(*edge)?);
+            }
+            crate::value::measure_interpolation(template, &arguments)?
+        };
+        let admitted = self
+            .resources
+            .admit_string(required, required, location, "format")?;
+        let mut output = String::new();
+        if required != 0 && output.try_reserve_exact(required).is_err() {
+            self.resources.refund(admitted);
+            return Err(execution_allocation_error(location, "format"));
+        }
+        let rendered = (|| {
+            let mut arguments = Vec::new();
+            arguments
+                .try_reserve_exact(edges.len())
+                .map_err(|_| execution_allocation_error(location, "format"))?;
+            for edge in &edges {
+                arguments.push(self.edge_value(*edge)?);
+            }
+            crate::value::render_interpolation(template, &arguments, &mut output)
+        })();
+        if let Err(error) = rendered {
+            self.resources.refund(admitted);
+            return Err(error);
+        }
+        self.put_owned(index, Value::String(output), required != 0)?;
+        self.release_after(index)
     }
 
     fn execute_spread_prepare(
@@ -230,7 +378,86 @@ impl<'a> Interpreter<'a> {
             OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
         };
         self.put_slot(index, slot)?;
-        self.release_after(index);
+        self.release_after(index)?;
+        Ok(())
+    }
+
+    fn execute_binding(
+        &mut self,
+        index: usize,
+        node: crate::Node,
+        location: SourceLocation,
+    ) -> Result<(), Error> {
+        let edge = *self
+            .edges(node.edges)?
+            .first()
+            .ok_or_else(|| execution_invariant_error(location))?;
+        let slot = match edge.ownership {
+            OwnershipMode::InfallibleTransfer => {
+                let producer = edge.producer.0 as usize;
+                self.slots
+                    .get_mut(producer)
+                    .and_then(Option::take)
+                    .ok_or_else(|| execution_invariant_error(location))?
+            }
+            OwnershipMode::ImmutableBorrow => Slot::Alias(edge.producer),
+            OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
+        };
+        self.put_slot(index, slot)?;
+        self.release_after(index)?;
+        Ok(())
+    }
+
+    fn execute_user_binding(
+        &mut self,
+        index: usize,
+        node: crate::Node,
+        location: SourceLocation,
+    ) -> Result<(), Error> {
+        let edge = *self
+            .edges(node.edges)?
+            .first()
+            .ok_or_else(|| execution_invariant_error(location))?;
+        match edge.ownership {
+            OwnershipMode::InfallibleTransfer => {
+                let producer = edge.producer.0 as usize;
+                let slot = self
+                    .slots
+                    .get_mut(producer)
+                    .and_then(Option::take)
+                    .ok_or_else(|| execution_invariant_error(location))?;
+                self.put_slot(index, slot)?;
+            }
+            OwnershipMode::ImmutableBorrow => {
+                self.put_slot(index, Slot::Alias(edge.producer))?;
+            }
+            OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
+        }
+        self.release_after(index)?;
+        Ok(())
+    }
+
+    fn execute_binding_move(
+        &mut self,
+        index: usize,
+        node: crate::Node,
+        location: SourceLocation,
+    ) -> Result<(), Error> {
+        let edge = *self
+            .edges(node.edges)?
+            .first()
+            .ok_or_else(|| execution_invariant_error(location))?;
+        if edge.ownership != OwnershipMode::InfallibleTransfer {
+            return Err(execution_invariant_error(location));
+        }
+        let producer = edge.producer.0 as usize;
+        let slot = self
+            .slots
+            .get_mut(producer)
+            .and_then(Option::take)
+            .ok_or_else(|| execution_invariant_error(location))?;
+        self.put_slot(index, slot)?;
+        self.release_after(index)?;
         Ok(())
     }
 
@@ -266,7 +493,7 @@ impl<'a> Interpreter<'a> {
                 .get(reference_index.0 as usize)
                 .ok_or_else(|| execution_invariant_error(location))?;
             let reference_location = self.origin_location(reference.origin)?;
-            apply_reducer_consumer_implementation(
+            apply_reference_consumer_implementation(
                 implementation_id,
                 application_plan_id,
                 &reference,
@@ -291,7 +518,7 @@ impl<'a> Interpreter<'a> {
         drop(arguments);
         let (value, accounted) = applied?;
         self.put_owned(index, value, accounted)?;
-        self.release_after(index);
+        self.release_after(index)?;
         Ok(())
     }
 
@@ -323,7 +550,7 @@ impl<'a> Interpreter<'a> {
             values.push(self.take_owned(root, location)?);
         }
         self.put_owned(index, Value::Tuple(values.into()), true)?;
-        self.release_after(index);
+        self.release_after(index)?;
         let _ = node;
         Ok(())
     }
@@ -393,18 +620,64 @@ impl<'a> Interpreter<'a> {
             .get(index)
             .ok_or_else(|| execution_invariant_error(location))?
         {
-            ConstantRecord::Scalar(value) => Ok((scalar_value(value), false)),
+            ConstantRecord::Scalar(value) => {
+                if let ScalarConstant::String(index) = value {
+                    let source = self
+                        .raw
+                        .string_values
+                        .get(index.0 as usize)
+                        .ok_or_else(|| execution_invariant_error(location))?;
+                    let admitted =
+                        self.resources
+                            .admit_string(source.len(), 0, location, "string_literal")?;
+                    match copy_runtime_string(source, location, "string_literal") {
+                        Ok(value) => Ok((Value::String(value), admitted != 0)),
+                        Err(error) => {
+                            self.resources.refund(admitted);
+                            Err(error)
+                        }
+                    }
+                } else {
+                    Ok((scalar_value(value, location)?, false))
+                }
+            }
             ConstantRecord::Vector {
                 element_type,
                 elements,
             } => {
                 let count = elements.count as usize;
-                let admitted =
-                    self.resources
-                        .admit_vector(element_type, count, location, "vector_literal")?;
                 let values = &self.raw.constant_elements
                     [elements.start as usize..elements.start as usize + count];
-                match build_vector(element_type, values) {
+                let payload_bytes = if element_type == ScalarType::String {
+                    values.iter().try_fold(0usize, |total, value| {
+                        let ScalarConstant::String(index) = value else {
+                            return Err(execution_invariant_error(location));
+                        };
+                        let text = self
+                            .raw
+                            .string_values
+                            .get(index.0 as usize)
+                            .ok_or_else(|| execution_invariant_error(location))?;
+                        total
+                            .checked_add(text.len())
+                            .ok_or_else(|| execution_invariant_error(location))
+                    })?
+                } else {
+                    0
+                };
+                let admitted = if element_type == ScalarType::String {
+                    self.resources.admit_string_vector(
+                        count,
+                        payload_bytes,
+                        0,
+                        location,
+                        "vector_literal",
+                    )?
+                } else {
+                    self.resources
+                        .admit_vector(element_type, count, location, "vector_literal")?
+                };
+                match build_vector(self.raw, element_type, values) {
                     Ok(value) => Ok((value, count != 0)),
                     Err(error) => {
                         self.resources.refund(admitted);
@@ -435,12 +708,47 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    fn take_infallible_transfer(
+        &mut self,
+        producer: NodeIndex,
+        location: SourceLocation,
+    ) -> Result<Value, Error> {
+        let index = producer.0 as usize;
+        match self.slots.get_mut(index).and_then(Option::take) {
+            Some(Slot::Owned { value, .. }) => Ok(value),
+            Some(Slot::Alias(alias)) => match slot_value(&self.slots, alias)? {
+                Value::Bool(value) => Ok(Value::Bool(*value)),
+                Value::Int(value) => Ok(Value::Int(*value)),
+                Value::Double(value) => Ok(Value::Double(*value)),
+                value => {
+                    clone_borrowed_value(&mut self.resources, value, location, "binding_transfer")
+                }
+            },
+            Some(Slot::Borrowed(value)) => match value {
+                Value::Bool(value) => Ok(Value::Bool(*value)),
+                Value::Int(value) => Ok(Value::Int(*value)),
+                Value::Double(value) => Ok(Value::Double(*value)),
+                value => {
+                    clone_borrowed_value(&mut self.resources, value, location, "binding_transfer")
+                }
+            },
+            None => Err(execution_invariant_error(location)),
+        }
+    }
+
     fn take_output(&mut self, producer: NodeIndex) -> Result<Value, Error> {
         let mut index = producer.0 as usize;
         for _ in 0..=self.slots.len() {
             match self.slots.get(index).and_then(Option::as_ref) {
                 Some(Slot::Alias(next)) => index = next.0 as usize,
-                Some(Slot::Borrowed(value)) => return Ok((*value).clone()),
+                Some(Slot::Borrowed(value)) => {
+                    return clone_borrowed_value(
+                        &mut self.resources,
+                        value,
+                        SourceLocation::start(),
+                        "program_result",
+                    );
+                }
                 Some(Slot::Owned { .. }) => {
                     return match self.slots.get_mut(index).and_then(Option::take) {
                         Some(Slot::Owned { value, .. }) => Ok(value),
@@ -469,14 +777,14 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    fn release_after(&mut self, sink: usize) {
+    fn release_after(&mut self, sink: usize) -> Result<(), Error> {
         for owner in self.releases[sink].iter().rev().copied() {
             if let Some(Slot::Owned {
                 value,
                 accounted: true,
             }) = self.slots.get_mut(owner).and_then(Option::take)
             {
-                self.resources.release(&value);
+                self.resources.release_owned(value)?;
             } else if matches!(
                 self.slots.get(owner).and_then(Option::as_ref),
                 Some(Slot::Owned {
@@ -487,18 +795,20 @@ impl<'a> Interpreter<'a> {
                 self.slots[owner] = None;
             }
         }
+        Ok(())
     }
 
-    fn cleanup_all(&mut self) {
+    fn cleanup_all(&mut self) -> Result<(), Error> {
         for slot in self.slots.iter_mut().rev() {
             if let Some(Slot::Owned {
                 value,
                 accounted: true,
             }) = slot.take()
             {
-                self.resources.release(&value);
+                self.resources.release_owned(value)?;
             }
         }
+        Ok(())
     }
 
     fn edges(&self, range: crate::IndexRange) -> Result<&[Edge], Error> {
@@ -556,6 +866,90 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+fn admit_borrowed_copy(
+    resources: &mut ResourceContext,
+    value: &Value,
+    location: SourceLocation,
+    producer: &str,
+) -> Result<usize, Error> {
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(1)
+        .map_err(|_| execution_allocation_error(location, producer))?;
+    pending.push(value);
+    let mut admitted = 0usize;
+    while let Some(value) = pending.pop() {
+        let result = match value {
+            Value::Bool(_) | Value::Int(_) | Value::Double(_) => Ok(0),
+            Value::String(value) => resources.admit_string(value.len(), 0, location, producer),
+            Value::BoolVector(values) => {
+                resources.admit_vector(ScalarType::Bool, values.len(), location, producer)
+            }
+            Value::IntVector(values) => {
+                resources.admit_vector(ScalarType::Int, values.len(), location, producer)
+            }
+            Value::DoubleVector(values) => {
+                resources.admit_vector(ScalarType::Double, values.len(), location, producer)
+            }
+            Value::StringVector(values) => {
+                let payload = values.iter().try_fold(0usize, |total, value| {
+                    total.checked_add(value.len()).ok_or_else(|| {
+                        resources.size_overflow(Some(values.len()), location, producer)
+                    })
+                });
+                match payload {
+                    Ok(payload) => {
+                        resources.admit_string_vector(values.len(), payload, 0, location, producer)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Value::Tuple(values) => match resources.admit_tuple(values.len(), location, producer) {
+                Ok(bytes) => {
+                    if pending.try_reserve(values.len()).is_err() {
+                        resources.refund(admitted.saturating_add(bytes));
+                        return Err(execution_allocation_error(location, producer));
+                    }
+                    pending.extend(values.iter());
+                    Ok(bytes)
+                }
+                Err(error) => Err(error),
+            },
+        };
+        match result {
+            Ok(bytes) => {
+                let Some(total) = admitted.checked_add(bytes) else {
+                    resources.refund(admitted);
+                    resources.refund(bytes);
+                    return Err(resources.size_overflow(None, location, producer));
+                };
+                admitted = total;
+            }
+            Err(error) => {
+                resources.refund(admitted);
+                return Err(error);
+            }
+        }
+    }
+    Ok(admitted)
+}
+
+fn clone_borrowed_value(
+    resources: &mut ResourceContext,
+    value: &Value,
+    location: SourceLocation,
+    producer: &str,
+) -> Result<Value, Error> {
+    let admitted = admit_borrowed_copy(resources, value, location, producer)?;
+    match value.try_clone() {
+        Ok(value) => Ok(value),
+        Err(()) => {
+            resources.refund(admitted);
+            Err(execution_allocation_error(location, producer))
+        }
+    }
+}
+
 fn slot_value<'slots, 'values>(
     slots: &'slots [Option<Slot<'values>>],
     producer: NodeIndex,
@@ -585,7 +979,11 @@ where
 {
     let value = slot_value(slots, edge.producer)?;
     match edge.access {
-        ValueAccess::WholeValue | ValueAccess::FanOutOperandBorrow => Ok(value),
+        ValueAccess::WholeValue
+        | ValueAccess::FanOutOperandBorrow
+        | ValueAccess::ConnectedBindingWhole
+        | ValueAccess::BindingBorrowWhole
+        | ValueAccess::BindingMove => Ok(value),
         ValueAccess::TupleElement(element) => {
             let Value::Tuple(values) = value else {
                 return Err(execution_invariant_error(origin_location(raw, edge.origin)));
@@ -594,6 +992,19 @@ where
                 .get(element as usize)
                 .ok_or_else(|| execution_invariant_error(origin_location(raw, edge.origin)))
         }
+        ValueAccess::ConnectedBindingElement(element) => match value {
+            Value::Tuple(values) => values
+                .get(element as usize)
+                .ok_or_else(|| execution_invariant_error(origin_location(raw, edge.origin))),
+            _ if element == 0 => Ok(value),
+            _ => Err(execution_invariant_error(origin_location(raw, edge.origin))),
+        },
+        ValueAccess::BindingBorrowElement(element) => match value {
+            Value::Tuple(values) => values
+                .get(element as usize)
+                .ok_or_else(|| execution_invariant_error(origin_location(raw, edge.origin))),
+            _ => Err(execution_invariant_error(origin_location(raw, edge.origin))),
+        },
     }
 }
 
@@ -612,15 +1023,20 @@ fn range_indices(range: crate::IndexRange) -> std::ops::Range<usize> {
     range.start as usize..range.start as usize + range.count as usize
 }
 
-fn scalar_value(value: ScalarConstant) -> Value {
-    match value {
+fn scalar_value(value: ScalarConstant, location: SourceLocation) -> Result<Value, Error> {
+    Ok(match value {
         ScalarConstant::Bool(value) => Value::Bool(value),
         ScalarConstant::Int(value) => Value::Int(value),
         ScalarConstant::DoubleBits(value) => Value::Double(f64::from_bits(value)),
-    }
+        ScalarConstant::String(_) => return Err(execution_invariant_error(location)),
+    })
 }
 
-fn build_vector(element_type: ScalarType, values: &[ScalarConstant]) -> Result<Value, Error> {
+fn build_vector(
+    raw: &crate::RawProgram,
+    element_type: ScalarType,
+    values: &[ScalarConstant],
+) -> Result<Value, Error> {
     match element_type {
         ScalarType::Bool => {
             let mut result = Vec::new();
@@ -660,6 +1076,24 @@ fn build_vector(element_type: ScalarType, values: &[ScalarConstant]) -> Result<V
                 result.push(f64::from_bits(*value));
             }
             Ok(Value::DoubleVector(result))
+        }
+        ScalarType::String => {
+            let mut result = Vec::new();
+            result.try_reserve_exact(values.len()).map_err(|_| {
+                execution_allocation_error(SourceLocation::start(), "vector_literal")
+            })?;
+            for value in values {
+                let ScalarConstant::String(index) = value else {
+                    return Err(execution_invariant_error(SourceLocation::start()));
+                };
+                let source = raw
+                    .string_values
+                    .get(index.0 as usize)
+                    .ok_or_else(|| execution_invariant_error(SourceLocation::start()))?;
+                let copy = copy_runtime_string(source, SourceLocation::start(), "vector_literal")?;
+                result.push(copy);
+            }
+            Ok(Value::StringVector(result))
         }
     }
 }
@@ -776,6 +1210,17 @@ pub(crate) fn decode_verified_arguments(
             },
             ScalarType::Int => decode_int(spelling).map(Value::Int),
             ScalarType::Double => decode_double(spelling).map(Value::Double),
+            ScalarType::String => {
+                let mut value = String::new();
+                if value.try_reserve_exact(spelling.len()).is_err() {
+                    return Err(execution_allocation_error(
+                        SourceLocation::start(),
+                        "argument decoding",
+                    ));
+                }
+                value.push_str(spelling);
+                Ok(Value::String(value))
+            }
         };
         match value {
             Ok(value) => decoded.push(value),
@@ -1015,6 +1460,63 @@ mod tests {
         assert_eq!(interpreted, public, "{source}");
     }
 
+    fn evaluate_with_string_copy_failure(
+        source: &str,
+        fail_at: Option<usize>,
+    ) -> (Result<ProgramResult, Error>, Vec<OwnedEvent>) {
+        let verified = compile(source);
+        STRING_COPY_ORDINAL.set(0);
+        STRING_COPY_FAIL_AT.set(fail_at);
+        take_events();
+        let result = evaluate_verified_program_with_observer(
+            &verified,
+            &[],
+            EvaluationConfiguration::default(),
+            observe,
+        );
+        let events = take_events();
+        STRING_COPY_FAIL_AT.set(None);
+        STRING_COPY_ORDINAL.set(0);
+        (result, events)
+    }
+
+    #[test]
+    fn string_constant_copy_is_admitted_first_and_refunded_on_refusal() {
+        let (result, events) = evaluate_with_string_copy_failure("\"payload\"\n", Some(0));
+        let error = result.expect_err("physical String copy refusal");
+        assert_eq!(error.kind, ErrorKind::ResourceError);
+        let usage = error.usage.expect("failure usage");
+        assert_eq!(usage.allocation_attempts, 1);
+        assert_eq!(usage.live_evaluation_bytes, 0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ResourceEventKind::Admission);
+        assert_eq!(events[0].producer, "string_literal");
+        assert_eq!(events[0].requested_bytes, Some("payload".len()));
+
+        let (success, _) = evaluate_with_string_copy_failure("\"payload\"\n", None);
+        assert_eq!(
+            success.expect("String copy succeeds").values,
+            [Value::String("payload".to_owned())]
+        );
+    }
+
+    #[test]
+    fn string_vector_later_copy_refusal_refunds_the_whole_admission() {
+        let (result, events) = evaluate_with_string_copy_failure("(\"a\" \"β\")\n", Some(1));
+        let error = result.expect_err("later String element copy refusal");
+        assert_eq!(error.kind, ErrorKind::ResourceError);
+        let usage = error.usage.expect("failure usage");
+        assert_eq!(usage.allocation_attempts, 1);
+        assert_eq!(usage.live_evaluation_bytes, 0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ResourceEventKind::Admission);
+        assert_eq!(events[0].producer, "vector_literal");
+        assert_eq!(
+            events[0].requested_bytes,
+            Some(2 * 16 + "a".len() + "β".len())
+        );
+    }
+
     #[test]
     fn selected_ir_matches_values_errors_tuples_spread_fanout_and_parameters() {
         for (source, arguments) in [
@@ -1040,6 +1542,9 @@ mod tests {
             ("foldl[@add 1 (2.5 3.5)]\n", vec![]),
             ("scanl[@sub 20 (3 4 5)]\n", vec![]),
             ("scanl[@add 1 (2.5 3.5)]\n", vec![]),
+            ("filter[@not (true false)]\n", vec![]),
+            ("filter[@odd (1 2 3)]\n", vec![]),
+            ("filter[@is_positive (-1.0 0.0 2.0)]\n", vec![]),
             ("add [1 2]\n", vec![]),
             ("[1 (2 3) true]\n", vec![]),
             ("fanout[iota[3] {inc[_]} {add[_ 10]}]\n", vec![]),
@@ -1097,6 +1602,9 @@ mod tests {
             "scanl[@and true (true false)]\n",
             "scanl[@sub 10 (1 2)]\n",
             "scanl[@add 1 (2.0 3.0)]\n",
+            "filter[@not (true false)]\n",
+            "filter[@odd (1 2)]\n",
+            "filter[@is_positive (-1.0 2.0)]\n",
             "equals[true false]\n",
             "equals[1 2]\n",
             "equals[1.0 2.0]\n",
