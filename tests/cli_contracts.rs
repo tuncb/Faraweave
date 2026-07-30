@@ -864,6 +864,69 @@ fn cli_unicode_space_paths_roundtrip_through_verified_fwir() {
     fs::remove_dir_all(directory.parent().expect("test parent")).expect("cleanup");
 }
 
+#[test]
+fn cli_immutable_bindings_run_compile_and_verified_fwir_fail_atomically() {
+    let directory = unique("immutable-bindings");
+    fs::create_dir_all(&directory).expect("mkdir");
+    let source = directory.join("bindings.faraweave");
+    let artifact = directory.join("bindings.fwir");
+    fs::write(
+        &source,
+        "let values = iota[4]\nlet doubled = mul[values 2]\nsum[doubled]\nlength[values]\n",
+    )
+    .expect("binding source");
+
+    let run = Command::new(binary())
+        .arg("run")
+        .arg(&source)
+        .output()
+        .expect("run bindings");
+    assert!(run.status.success(), "{:?}", run.stderr);
+    assert_eq!(run.stdout, b"20\n4\n");
+    assert!(run.stderr.is_empty());
+
+    let compile = Command::new(binary())
+        .arg("compile-ir")
+        .arg(&source)
+        .args(["-o"])
+        .arg(&artifact)
+        .output()
+        .expect("compile bindings");
+    assert!(compile.status.success(), "{:?}", compile.stderr);
+    assert!(compile.stdout.is_empty());
+    assert!(compile.stderr.is_empty());
+
+    let run_ir = Command::new(binary())
+        .arg("run-ir")
+        .arg(&artifact)
+        .output()
+        .expect("run binding FWIR");
+    assert!(run_ir.status.success(), "{:?}", run_ir.stderr);
+    assert_eq!(run_ir.stdout, run.stdout);
+    assert!(run_ir.stderr.is_empty());
+
+    let invalid = directory.join("invalid-bindings.faraweave");
+    fs::write(&invalid, "let value = iota[3]\nvalue\nsum[value]\n").expect("invalid source");
+    for command in ["run", "compile-ir"] {
+        let mut process = Command::new(binary());
+        process.arg(command).arg(&invalid);
+        if command == "compile-ir" {
+            process.arg("-o").arg(directory.join("invalid.fwir"));
+        }
+        let output = process.output().expect("binding failure");
+        assert!(!output.status.success(), "{command}");
+        assert!(output.stdout.is_empty(), "{command}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("BindingError: binding is used after its ownership move"),
+            "{command}: {:?}",
+            output.stderr
+        );
+    }
+
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
 #[cfg(windows)]
 #[test]
 fn cli_windows_long_path_journey() {

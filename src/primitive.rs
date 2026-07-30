@@ -10,8 +10,19 @@ use crate::{
 };
 
 pub(crate) fn resolve_names(program: &Program) -> Result<(), Error> {
-    for root in &program.roots {
-        validate_names(root)?;
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            validate_names(&program.declarations[declaration].initializer)?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            validate_names(root)?;
+        }
     }
     Ok(())
 }
@@ -75,16 +86,9 @@ fn validate_names(expression: &Expr) -> Result<(), Error> {
                 validate_names(branch)?;
             }
         }
-        ExprKind::UnresolvedName { name, name_span } => {
-            return Err(Error::at_span(
-                ErrorKind::UnknownPrimitive,
-                *name_span,
-                format!("unknown primitive '{name}'"),
-            ));
-        }
+        ExprKind::UnresolvedName { .. } => {}
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::ConnectedPlaceholder(_)
         | ExprKind::Placeholder => {}

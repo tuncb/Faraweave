@@ -158,6 +158,9 @@ impl<'a> Interpreter<'a> {
             NodeKind::TupleConstruct => self.execute_tuple(index, node, location),
             NodeKind::PrefixSpreadPrepare => self.execute_spread_prepare(index, node, location),
             NodeKind::ConnectedBinding => self.execute_binding(index, node, location),
+            NodeKind::Binding { .. } => self.execute_user_binding(index, node, location),
+            NodeKind::BindingMove => self.execute_binding_move(index, node, location),
+            NodeKind::BindingBorrow => self.execute_binding(index, node, location),
             NodeKind::SelectedApply {
                 implementation_id,
                 application_plan_id,
@@ -198,7 +201,9 @@ impl<'a> Interpreter<'a> {
             .admit_tuple(edges.len(), location, "tuple_literal")?;
         for edge in &edges {
             let value = match edge.ownership {
-                OwnershipMode::InfallibleTransfer => self.take_owned(edge.producer, location)?,
+                OwnershipMode::InfallibleTransfer => {
+                    self.take_infallible_transfer(edge.producer, location)?
+                }
                 OwnershipMode::ImmutableBorrow => self.edge_value(*edge)?.clone(),
                 OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
             };
@@ -256,6 +261,59 @@ impl<'a> Interpreter<'a> {
             OwnershipMode::ImmutableBorrow => Slot::Alias(edge.producer),
             OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
         };
+        self.put_slot(index, slot)?;
+        self.release_after(index);
+        Ok(())
+    }
+
+    fn execute_user_binding(
+        &mut self,
+        index: usize,
+        node: crate::Node,
+        location: SourceLocation,
+    ) -> Result<(), Error> {
+        let edge = *self
+            .edges(node.edges)?
+            .first()
+            .ok_or_else(|| execution_invariant_error(location))?;
+        match edge.ownership {
+            OwnershipMode::InfallibleTransfer => {
+                let producer = edge.producer.0 as usize;
+                let slot = self
+                    .slots
+                    .get_mut(producer)
+                    .and_then(Option::take)
+                    .ok_or_else(|| execution_invariant_error(location))?;
+                self.put_slot(index, slot)?;
+            }
+            OwnershipMode::ImmutableBorrow => {
+                self.put_slot(index, Slot::Alias(edge.producer))?;
+            }
+            OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
+        }
+        self.release_after(index);
+        Ok(())
+    }
+
+    fn execute_binding_move(
+        &mut self,
+        index: usize,
+        node: crate::Node,
+        location: SourceLocation,
+    ) -> Result<(), Error> {
+        let edge = *self
+            .edges(node.edges)?
+            .first()
+            .ok_or_else(|| execution_invariant_error(location))?;
+        if edge.ownership != OwnershipMode::InfallibleTransfer {
+            return Err(execution_invariant_error(location));
+        }
+        let producer = edge.producer.0 as usize;
+        let slot = self
+            .slots
+            .get_mut(producer)
+            .and_then(Option::take)
+            .ok_or_else(|| execution_invariant_error(location))?;
         self.put_slot(index, slot)?;
         self.release_after(index);
         Ok(())
@@ -462,6 +520,30 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    fn take_infallible_transfer(
+        &mut self,
+        producer: NodeIndex,
+        location: SourceLocation,
+    ) -> Result<Value, Error> {
+        let index = producer.0 as usize;
+        match self.slots.get_mut(index).and_then(Option::take) {
+            Some(Slot::Owned { value, .. }) => Ok(value),
+            Some(Slot::Alias(alias)) => match slot_value(&self.slots, alias)? {
+                Value::Bool(value) => Ok(Value::Bool(*value)),
+                Value::Int(value) => Ok(Value::Int(*value)),
+                Value::Double(value) => Ok(Value::Double(*value)),
+                _ => Err(execution_invariant_error(location)),
+            },
+            Some(Slot::Borrowed(value)) => match value {
+                Value::Bool(value) => Ok(Value::Bool(*value)),
+                Value::Int(value) => Ok(Value::Int(*value)),
+                Value::Double(value) => Ok(Value::Double(*value)),
+                _ => Err(execution_invariant_error(location)),
+            },
+            None => Err(execution_invariant_error(location)),
+        }
+    }
+
     fn take_output(&mut self, producer: NodeIndex) -> Result<Value, Error> {
         let mut index = producer.0 as usize;
         for _ in 0..=self.slots.len() {
@@ -614,7 +696,9 @@ where
     match edge.access {
         ValueAccess::WholeValue
         | ValueAccess::FanOutOperandBorrow
-        | ValueAccess::ConnectedBindingWhole => Ok(value),
+        | ValueAccess::ConnectedBindingWhole
+        | ValueAccess::BindingBorrowWhole
+        | ValueAccess::BindingMove => Ok(value),
         ValueAccess::TupleElement(element) => {
             let Value::Tuple(values) = value else {
                 return Err(execution_invariant_error(origin_location(raw, edge.origin)));
@@ -628,6 +712,12 @@ where
                 .get(element as usize)
                 .ok_or_else(|| execution_invariant_error(origin_location(raw, edge.origin))),
             _ if element == 0 => Ok(value),
+            _ => Err(execution_invariant_error(origin_location(raw, edge.origin))),
+        },
+        ValueAccess::BindingBorrowElement(element) => match value {
+            Value::Tuple(values) => values
+                .get(element as usize)
+                .ok_or_else(|| execution_invariant_error(origin_location(raw, edge.origin))),
             _ => Err(execution_invariant_error(origin_location(raw, edge.origin))),
         },
     }

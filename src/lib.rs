@@ -27,10 +27,10 @@ mod typed_program;
 mod value;
 
 pub use error::{
-    ArgumentErrorContext, ArgumentErrorReason, ConnectedApplicationErrorContext,
-    ConnectedApplicationErrorReason, DomainErrorContext, DomainErrorReason, Error, ErrorKind,
-    LocatedError, ParameterErrorContext, ParameterErrorReason, ResourceErrorContext,
-    ResourceErrorReason, SourceLocation, SourceSpan,
+    ArgumentErrorContext, ArgumentErrorReason, BindingErrorContext, BindingErrorReason,
+    ConnectedApplicationErrorContext, ConnectedApplicationErrorReason, DomainErrorContext,
+    DomainErrorReason, Error, ErrorKind, LocatedError, ParameterErrorContext, ParameterErrorReason,
+    ResourceErrorContext, ResourceErrorReason, SourceLocation, SourceSpan,
 };
 pub use evaluator::{
     EvaluationConfiguration, ProgramResult, RunnerEvaluationResult, ValueResult,

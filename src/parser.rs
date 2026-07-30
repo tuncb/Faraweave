@@ -1,13 +1,25 @@
 use crate::{
-    ConnectedApplicationErrorContext, ConnectedApplicationErrorReason, Error, ErrorKind,
-    ParameterErrorContext, ParameterErrorReason, ScalarType, SourceLocation, SourceSpan, Value,
+    BindingErrorContext, BindingErrorReason, ConnectedApplicationErrorContext,
+    ConnectedApplicationErrorReason, Error, ErrorKind, ParameterErrorContext, ParameterErrorReason,
+    ScalarType, SourceLocation, SourceSpan, Value,
 };
 
 #[derive(Clone, Debug)]
 pub(crate) struct Program {
     pub parameter_header: Option<SourceSpan>,
     pub parameters: Vec<Parameter>,
+    pub declarations: Vec<Declaration>,
     pub roots: Vec<Expr>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Declaration {
+    pub name: String,
+    pub initializer: Expr,
+    pub before_root: usize,
+    pub span: SourceSpan,
+    pub name_span: SourceSpan,
+    pub initializer_span: SourceSpan,
 }
 
 #[derive(Clone, Debug)]
@@ -59,7 +71,6 @@ pub(crate) enum ExprKind {
         leaf_span: SourceSpan,
         steps: Vec<UnaryStep>,
     },
-    Parameter(usize),
     OperationReference {
         name: String,
         name_span: SourceSpan,
@@ -95,6 +106,7 @@ pub(crate) enum CallSyntax {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TokenKind {
     Name,
+    Let,
     Bool,
     Int,
     Double,
@@ -111,6 +123,7 @@ enum TokenKind {
     IndexedPlaceholder,
     InvalidPlaceholder,
     At,
+    Equal,
     Space,
     Comment,
     Newline,
@@ -316,6 +329,7 @@ fn single_root_unary_program(
     Program {
         parameter_header: None,
         parameters: Vec::new(),
+        declarations: Vec::new(),
         roots: vec![Expr {
             kind: ExprKind::UnaryChain {
                 leaf,
@@ -413,6 +427,7 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
     Some(Ok(Program {
         parameter_header: None,
         parameters: Vec::new(),
+        declarations: Vec::new(),
         roots: vec![Expr {
             kind: ExprKind::DeepTuple { depth, leaf },
             span,
@@ -421,11 +436,37 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
 }
 
 pub(crate) fn program_contains_tuple(program: &Program) -> bool {
-    program.roots.iter().any(expression_contains_tuple)
+    program
+        .declarations
+        .iter()
+        .any(|declaration| expression_contains_tuple(&declaration.initializer))
+        || program.roots.iter().any(expression_contains_tuple)
 }
 
 pub(crate) fn first_tuple_location(program: &Program) -> Option<SourceLocation> {
-    program.roots.iter().find_map(first_tuple_in_expression)
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            if let Some(location) =
+                first_tuple_in_expression(&program.declarations[declaration].initializer)
+            {
+                return Some(location);
+            }
+            declaration += 1;
+        }
+        if let Some(location) = program
+            .roots
+            .get(boundary)
+            .and_then(first_tuple_in_expression)
+        {
+            return Some(location);
+        }
+    }
+    None
 }
 
 fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
@@ -450,7 +491,6 @@ fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
             }),
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. }
         | ExprKind::ConnectedPlaceholder(_)
@@ -475,7 +515,6 @@ fn expression_contains_tuple(expression: &Expr) -> bool {
         }
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. }
         | ExprKind::ConnectedPlaceholder(_)
@@ -546,6 +585,7 @@ fn tokenize(source: &str) -> Vec<Token> {
                 "false" => (TokenKind::Bool, Some(Value::Bool(false))),
                 "inf" => (TokenKind::Double, Some(Value::Double(f64::INFINITY))),
                 "nan" => (TokenKind::Double, Some(Value::Double(f64::NAN))),
+                "let" => (TokenKind::Let, None),
                 _ => (TokenKind::Name, None),
             };
             tokens.push(token(kind, begin, location, spelling, value));
@@ -622,6 +662,7 @@ fn tokenize(source: &str) -> Vec<Token> {
             b'{' => TokenKind::LeftBrace,
             b'}' => TokenKind::RightBrace,
             b'@' => TokenKind::At,
+            b'=' => TokenKind::Equal,
             _ => TokenKind::Invalid,
         };
         advance_ascii(&mut location);
@@ -757,6 +798,7 @@ impl Parser {
         if self.is_name("parameters") {
             parameter_header = Some(self.parse_parameter_header()?);
         }
+        let mut declarations = Vec::new();
         let mut roots: Vec<Expr> = Vec::new();
         loop {
             self.skip_newlines_and_spaces();
@@ -773,7 +815,16 @@ impl Parser {
                 } else {
                     (
                         ParameterErrorReason::ParameterHeaderAfterRoot,
-                        roots.first().map_or(keyword.span, |root| root.span),
+                        roots.first().map_or_else(
+                            || {
+                                declarations
+                                    .first()
+                                    .map_or(keyword.span, |declaration: &Declaration| {
+                                        declaration.span
+                                    })
+                            },
+                            |root| root.span,
+                        ),
                     )
                 };
                 return Err(parameter_syntax_error(
@@ -782,6 +833,11 @@ impl Parser {
                     keyword.span,
                     Some(related),
                 ));
+            }
+            if self.peek_kind() == Some(TokenKind::Let) {
+                let declaration = self.parse_declaration(roots.len())?;
+                declarations.push(declaration);
+                continue;
             }
             let root = self.parse_expr(false)?;
             roots.push(root);
@@ -817,7 +873,113 @@ impl Parser {
         Ok(Program {
             parameter_header,
             parameters: self.parameters,
+            declarations,
             roots,
+        })
+    }
+
+    fn parse_declaration(&mut self, before_root: usize) -> Result<Declaration, Error> {
+        let keyword = self
+            .take_kind(TokenKind::Let)
+            .ok_or_else(|| self.eof_error("expected 'let'"))?;
+        if self.take_kind(TokenKind::Space).is_none() {
+            return Err(binding_syntax_error(
+                self.peek()
+                    .map_or_else(|| self.insertion_span(), |token| token.span),
+                keyword.span,
+                None,
+                None,
+            ));
+        }
+        let Some(name) = self.take() else {
+            return Err(binding_syntax_error(
+                self.insertion_span(),
+                keyword.span,
+                None,
+                None,
+            ));
+        };
+        if name.kind != TokenKind::Name {
+            if matches!(
+                name.kind,
+                TokenKind::BoolType | TokenKind::IntType | TokenKind::DoubleType
+            ) || matches!(
+                name.spelling.as_str(),
+                "true" | "false" | "inf" | "nan" | "let"
+            ) {
+                return Err(binding_reserved_name_error(keyword.span, name.span));
+            }
+            return Err(binding_syntax_error(
+                name.span,
+                SourceSpan {
+                    begin: keyword.span.begin,
+                    end: name.span.end,
+                },
+                Some(name.span),
+                None,
+            ));
+        }
+        if self.take_kind(TokenKind::Space).is_none()
+            || self.take_kind(TokenKind::Equal).is_none()
+            || self.take_kind(TokenKind::Space).is_none()
+        {
+            return Err(binding_syntax_error(
+                self.peek()
+                    .map_or_else(|| self.insertion_span(), |token| token.span),
+                SourceSpan {
+                    begin: keyword.span.begin,
+                    end: name.span.end,
+                },
+                Some(name.span),
+                None,
+            ));
+        }
+        let initializer = self.parse_expr(false).map_err(|mut error| {
+            if error.binding.is_none()
+                && matches!(error.kind, ErrorKind::SyntaxError | ErrorKind::InvalidByte)
+            {
+                error.kind = ErrorKind::BindingError;
+                error.message =
+                    "malformed let declaration; expected 'let name = expression' on one logical line"
+                        .to_owned();
+                error.binding = BindingErrorContext::try_new(
+                    BindingErrorReason::MalformedDeclaration,
+                    Some(SourceSpan {
+                        begin: keyword.span.begin,
+                        end: error.span.map_or(name.span.end, |span| span.end),
+                    }),
+                    Some(name.span),
+                    error.span,
+                    None,
+                    None,
+                );
+            }
+            error
+        })?;
+        self.skip_spaces();
+        if !self.at_end() && !self.take_if(TokenKind::Newline) {
+            return Err(binding_syntax_error(
+                self.peek()
+                    .map_or_else(|| self.insertion_span(), |token| token.span),
+                SourceSpan {
+                    begin: keyword.span.begin,
+                    end: initializer.span.end,
+                },
+                Some(name.span),
+                Some(initializer.span),
+            ));
+        }
+        let span = SourceSpan {
+            begin: keyword.span.begin,
+            end: initializer.span.end,
+        };
+        Ok(Declaration {
+            name: name.spelling,
+            initializer_span: initializer.span,
+            initializer,
+            before_root,
+            span,
+            name_span: name.span,
         })
     }
 
@@ -1297,17 +1459,6 @@ impl Parser {
         if name.spelling == "fanout" {
             return self.parse_fanout(name);
         }
-        if let Some(position) = self
-            .parameters
-            .iter()
-            .position(|parameter| parameter.name == name.spelling)
-            && self.peek_kind() != Some(TokenKind::LeftBracket)
-        {
-            return Ok(Expr {
-                kind: ExprKind::Parameter(position),
-                span: name.span,
-            });
-        }
         if self.peek_kind() == Some(TokenKind::LeftBracket) {
             let _open = self.take().ok_or_else(|| self.eof_error("expected '['"))?;
             let mut arguments = Vec::new();
@@ -1331,7 +1482,9 @@ impl Parser {
                 self.require_sibling_separator_or_close(TokenKind::RightBracket)?;
             }
         }
-        if self.peek_kind() == Some(TokenKind::Space) {
+        if self.peek_kind() == Some(TokenKind::Space)
+            && crate::semantic_registry::primitive_from_name(&name.spelling).is_ok()
+        {
             self.skip_spaces();
             let argument = self.parse_expr(false)?;
             return Ok(Expr {
@@ -1351,6 +1504,7 @@ impl Parser {
             self.peek_kind(),
             None | Some(
                 TokenKind::Comment
+                    | TokenKind::Space
                     | TokenKind::Newline
                     | TokenKind::RightParenthesis
                     | TokenKind::RightBracket
@@ -1666,6 +1820,49 @@ fn is_trivia(kind: TokenKind) -> bool {
     is_horizontal_trivia(kind) || kind == TokenKind::Newline
 }
 
+fn binding_syntax_error(
+    primary_span: SourceSpan,
+    declaration_span: SourceSpan,
+    name_span: Option<SourceSpan>,
+    initializer_span: Option<SourceSpan>,
+) -> Error {
+    let mut error = Error::at_span(
+        ErrorKind::BindingError,
+        primary_span,
+        "malformed let declaration; expected 'let name = expression' on one logical line",
+    );
+    error.binding = BindingErrorContext::try_new(
+        BindingErrorReason::MalformedDeclaration,
+        Some(declaration_span),
+        name_span,
+        initializer_span,
+        None,
+        None,
+    );
+    error
+}
+
+fn binding_reserved_name_error(keyword_span: SourceSpan, name_span: SourceSpan) -> Error {
+    let declaration_span = SourceSpan {
+        begin: keyword_span.begin,
+        end: name_span.end,
+    };
+    let mut error = Error::at_span(
+        ErrorKind::BindingError,
+        name_span,
+        "binding name is reserved",
+    );
+    error.binding = BindingErrorContext::try_new(
+        BindingErrorReason::ReservedName,
+        Some(declaration_span),
+        Some(name_span),
+        None,
+        Some(name_span),
+        Some(name_span),
+    );
+    error
+}
+
 fn parameter_syntax_error(
     reason: ParameterErrorReason,
     primary_span: SourceSpan,
@@ -1741,33 +1938,13 @@ fn syntactic_parameter_name(name: &str) -> bool {
 }
 
 fn reserved_parameter_name(name: &str) -> bool {
+    reserved_syntax_name(name) || crate::semantic_registry::primitive_from_name(name).is_ok()
+}
+
+pub(crate) fn reserved_syntax_name(name: &str) -> bool {
     matches!(
         name,
-        "true"
-            | "false"
-            | "inf"
-            | "nan"
-            | "parameters"
-            | "fanout"
-            | "inc"
-            | "dec"
-            | "neg"
-            | "abs"
-            | "add"
-            | "sub"
-            | "mul"
-            | "equals"
-            | "not_equals"
-            | "not"
-            | "and"
-            | "or"
-            | "odd"
-            | "even"
-            | "is_positive"
-            | "is_negative"
-            | "less_than"
-            | "greater_than"
-            | "iota"
+        "true" | "false" | "inf" | "nan" | "parameters" | "let" | "fanout"
     )
 }
 
@@ -1810,7 +1987,6 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
             | ExprKind::Vector(_, _)
             | ExprKind::DeepTuple { .. }
             | ExprKind::UnaryChain { .. }
-            | ExprKind::Parameter(_)
             | ExprKind::OperationReference { .. }
             | ExprKind::UnresolvedName { .. } => {}
         }
@@ -1962,6 +2138,15 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn first_tuple_location_follows_interleaved_source_order() {
+        let program = parse("[1]\nlet value = [2]\nvalue\n").expect("program");
+        assert_eq!(
+            first_tuple_location(&program).map(|location| location.offset),
+            Some(1)
+        );
     }
 
     #[test]

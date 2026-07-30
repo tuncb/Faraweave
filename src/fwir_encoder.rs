@@ -415,6 +415,12 @@ fn preflight(
         total_size,
         format_minor: if raw
             .features
+            .binary_search(&crate::Feature::ImmutableBindings.numeric())
+            .is_ok()
+        {
+            3
+        } else if raw
+            .features
             .binary_search(&crate::Feature::ConnectedApplicationBindings.numeric())
             .is_ok()
         {
@@ -679,6 +685,9 @@ fn encode_sections(
             ValueAccess::FanOutOperandBorrow => (3, 0),
             ValueAccess::ConnectedBindingWhole => (4, 0),
             ValueAccess::ConnectedBindingElement(index) => (5, index),
+            ValueAccess::BindingBorrowWhole => (6, 0),
+            ValueAccess::BindingBorrowElement(index) => (7, index),
+            ValueAccess::BindingMove => (8, 0),
         };
         let (cardinality, cardinality_length) = cardinality(edge.cardinality);
         put_u8(output, access.0);
@@ -763,6 +772,27 @@ fn encode_sections(
             ),
             NodeKind::PrefixSpreadPrepare => (5, 0, 0, [0; 8]),
             NodeKind::ConnectedBinding => (7, 0, 0, [0; 8]),
+            NodeKind::Binding {
+                declaration_origin,
+                name_origin,
+                initializer_origin,
+            } => (
+                8,
+                0,
+                0,
+                [
+                    declaration_origin.0,
+                    name_origin.0,
+                    initializer_origin.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            NodeKind::BindingMove => (9, 0, 0, [0; 8]),
+            NodeKind::BindingBorrow => (10, 0, 0, [0; 8]),
             NodeKind::FanOut {
                 branches,
                 keyword_origin,

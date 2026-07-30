@@ -43,6 +43,24 @@ fanout[iota[3] {inc[_]} {add[_ 10]}]
 
 This produces `[(2 3 4) (11 12 13)]`.
 
+An immutable declaration names one evaluate-once value for later lines:
+
+```faraweave
+let values = iota[4]
+let doubled = mul[values 2]
+sum[doubled]
+length[values]
+```
+
+This prints `20` and `4`; declaration lines themselves produce no output.
+Names are visible only after their declaration, may not shadow parameters or
+reserved names, and must be used. Ordinary calls, reducers, scans, filters,
+connected applications, and fan-out borrow a binding; returning it directly
+or placing it in an owned tuple moves it exactly once, after its final borrow.
+Invalid forward/self references, unused names, multiple moves, and use after
+move are structured `BindingError`s found before arguments are decoded or any
+root executes.
+
 An incomplete adjacent call can be completed by one connected operand:
 `add[10] 20` is `30`, `add[] [10 20]` is `30`, and
 `add[10] mul[2] 20` associates right-to-left and is `50`. A non-tuple operand,
@@ -199,7 +217,7 @@ and `evaluate_verified_program_with_arguments`. Named compilation retains a
 logical source name inside the artifact so later execution diagnostics do not
 depend on the artifact's filesystem path.
 
-FWIR v1 commits to physical formats 1.0, 1.1, and 1.2 and semantic contract 1.2,
+FWIR v1 commits to physical formats 1.0 through 1.3 and semantic contract 1.3,
 `.fwir`, and the documented API and CLI spellings. The canonical
 semantic/physical-1.0 corpus remains accepted and round-trips byte-for-byte.
 Artifacts that use explicit application plans carry mandatory feature
@@ -208,8 +226,10 @@ stable operation-reference sidecar carry mandatory feature
 `6=OperationReferences` and physical format 1.1; artifacts that use the
 backend-native math identities carry mandatory feature
 `7=BackendNativeMathV1`; explicit connected bindings carry mandatory feature
-`8=ConnectedApplicationBindings` and physical format 1.2. Artifacts without these capabilities need not carry
-the corresponding feature.
+`8=ConnectedApplicationBindings` and physical format 1.2; immutable source
+bindings carry mandatory feature `9=ImmutableBindings` and physical format
+1.3. Artifacts without these capabilities need not carry the corresponding
+feature.
 Unknown class-1 advisory features and explicitly optional, non-identity
 forward-minor sections may be skipped. Unknown mandatory semantics,
 unsupported semantic minors, and other unsupported current-minor extensions

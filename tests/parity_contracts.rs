@@ -4,6 +4,7 @@ use faraweave::{
     Value, evaluate_expression, evaluate_expression_with_configuration, evaluate_source,
     format_type, format_value,
 };
+use std::fmt::Write as _;
 
 fn formatted(source: &str) -> String {
     format_value(&evaluate_expression(source).expect(source).value).expect("format")
@@ -1532,4 +1533,285 @@ fn typed_public_api_parameter_contract() {
         faraweave::evaluate_source_with_arguments(source, &[], EvaluationConfiguration::default())
             .expect_err("missing");
     assert_eq!(missing.kind, ErrorKind::ArgumentError);
+}
+
+#[test]
+fn immutable_bindings_borrow_many_and_evaluate_through_verified_fwir() {
+    let source =
+        "let values = iota[4]\nlet doubled = mul[values 2]\nsum[doubled]\nlength[values]\n";
+    let source_result = evaluate_source(source).expect("source bindings");
+    assert_eq!(source_result.values, vec![Value::Int(20), Value::Int(4)]);
+
+    let bytes = faraweave::compile_source_to_fwir(source, &faraweave::FwirEncodeOptions::default())
+        .expect("binding FWIR");
+    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 1);
+    assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 3);
+    let decoded =
+        faraweave::decode_fwir(&bytes, &faraweave::FwirDecodeLimits::default()).expect("decode");
+    assert_eq!(decoded.as_raw().module.semantic_minor, 3);
+    assert!(
+        decoded
+            .as_raw()
+            .features
+            .contains(&faraweave::Feature::ImmutableBindings.numeric())
+    );
+    let decoded_result = faraweave::evaluate_verified_program(
+        &decoded,
+        &[],
+        faraweave::EvaluationConfiguration::default(),
+    )
+    .expect("decoded bindings");
+    assert_eq!(decoded_result, source_result);
+}
+
+#[test]
+fn immutable_bindings_move_once_into_roots_and_tuples() {
+    let direct = evaluate_source("let value = iota[3]\nvalue\n").expect("direct move");
+    assert_eq!(direct.values, vec![Value::IntVector(vec![1, 2, 3])]);
+
+    let tuple = evaluate_source("let value = iota[3]\n[value 9]\n").expect("tuple move");
+    assert_eq!(
+        tuple.values,
+        vec![Value::Tuple(
+            vec![Value::IntVector(vec![1, 2, 3]), Value::Int(9)].into()
+        )]
+    );
+
+    let parameter = faraweave::evaluate_source_with_arguments(
+        "parameters[n Int]\nlet value = n\n[value]\n",
+        &[Value::Int(7)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("parameter-derived binding");
+    assert_eq!(
+        parameter.values,
+        vec![Value::Tuple(vec![Value::Int(7)].into())]
+    );
+}
+
+#[test]
+fn immutable_binding_uses_cover_prefix_reducers_scan_and_fanout() {
+    let prefix = evaluate_source("let pair = [2 3]\nadd pair\n").expect("prefix spread binding");
+    assert_eq!(prefix.values, vec![Value::Int(5)]);
+
+    let reducers = evaluate_source(
+        "let values = iota[4]\nfoldl[@add 0 values]\nscanl[@add 0 values]\nfanout[values {sum[_]} {length[_]}]\n",
+    )
+    .expect("reducer and fanout bindings");
+    assert_eq!(
+        reducers.values,
+        vec![
+            Value::Int(10),
+            Value::IntVector(vec![0, 1, 3, 6, 10]),
+            Value::Tuple(vec![Value::Int(10), Value::Int(4)].into()),
+        ]
+    );
+
+    let dynamic_source =
+        "parameters[n Int]\nlet values = iota[n]\nfilter[@odd values]\nlength[values]\n";
+    let dynamic_bytes =
+        faraweave::compile_source_to_fwir(dynamic_source, &faraweave::FwirEncodeOptions::default())
+            .expect("dynamic binding FWIR");
+    let dynamic = faraweave::decode_fwir(&dynamic_bytes, &faraweave::FwirDecodeLimits::default())
+        .expect("decode dynamic binding");
+    let dynamic_result = faraweave::evaluate_verified_program(
+        &dynamic,
+        &[Value::Int(5)],
+        EvaluationConfiguration::default(),
+    )
+    .expect("dynamic filter binding");
+    assert_eq!(
+        dynamic_result.values,
+        vec![Value::IntVector(vec![1, 3, 5]), Value::Int(5)]
+    );
+}
+
+#[test]
+fn immutable_binding_rejections_are_structured_and_span_exact() {
+    let cases = [
+        (
+            "let x = 1\nlet x = 2\nx\n",
+            faraweave::BindingErrorReason::DuplicateName,
+            15,
+            Some(5),
+        ),
+        (
+            "let add = 1\nadd\n",
+            faraweave::BindingErrorReason::ReservedName,
+            5,
+            Some(5),
+        ),
+        (
+            "missing\n",
+            faraweave::BindingErrorReason::UnknownName,
+            1,
+            None,
+        ),
+        (
+            "let x = y\nlet y = 1\nx\n",
+            faraweave::BindingErrorReason::ForwardReference,
+            9,
+            Some(15),
+        ),
+        (
+            "let x = x\nx\n",
+            faraweave::BindingErrorReason::SelfReference,
+            9,
+            Some(5),
+        ),
+        (
+            "parameters[x Int]\nlet x = 1\nx\n",
+            faraweave::BindingErrorReason::Shadowing,
+            23,
+            Some(12),
+        ),
+        (
+            "let x = 1\n2\n",
+            faraweave::BindingErrorReason::UnusedBinding,
+            5,
+            Some(5),
+        ),
+        (
+            "let x = 1\n[x x]\n",
+            faraweave::BindingErrorReason::MultipleOwnershipEscape,
+            14,
+            Some(12),
+        ),
+        (
+            "let x = 1\nx\ninc[x]\n",
+            faraweave::BindingErrorReason::UseAfterMove,
+            17,
+            Some(11),
+        ),
+    ];
+    for (source, reason, primary_offset, related_offset) in cases {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::BindingError, "{source}");
+        assert_eq!(
+            error.binding.as_ref().map(|context| context.reason),
+            Some(reason),
+            "{source}"
+        );
+        assert_eq!(
+            error.span.map(|span| span.begin.offset),
+            Some(primary_offset),
+            "{source}"
+        );
+        assert_eq!(
+            error
+                .binding
+                .as_ref()
+                .and_then(|context| context.related_span)
+                .map(|span| span.begin.offset),
+            related_offset,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn malformed_let_syntax_is_full_line_and_structured() {
+    for source in ["let x= 1\n", "let x =\n", "let = 1\n", "let x = 1 2\n"] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::BindingError, "{source}");
+        let context = error.binding.expect("binding context");
+        assert_eq!(
+            context.reason,
+            faraweave::BindingErrorReason::MalformedDeclaration,
+            "{source}"
+        );
+        assert!(context.declaration_span.is_some(), "{source}");
+    }
+
+    for source in [
+        "let let = 1\n",
+        "let true = 1\n",
+        "let false = 1\n",
+        "let inf = 1\n",
+        "let nan = 1\n",
+        "let parameters = 1\n",
+        "let fanout = 1\n",
+        "let Bool = 1\n",
+        "let Int = 1\n",
+        "let Double = 1\n",
+    ] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::BindingError, "{source}");
+        assert_eq!(
+            error.binding.expect("binding context").reason,
+            faraweave::BindingErrorReason::ReservedName,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn immutable_binding_duplicate_precedence_follows_source_order() {
+    let source = "let z = 1\nlet a = 1\nlet z = 2\nlet a = 2\nadd[z a]\n";
+    let error = evaluate_source(source).expect_err("duplicate bindings");
+    assert_eq!(error.kind, ErrorKind::BindingError);
+    let context = error.binding.expect("binding context");
+    assert_eq!(context.reason, faraweave::BindingErrorReason::DuplicateName);
+    assert_eq!(error.span.map(|span| span.begin.offset), Some(25));
+    assert_eq!(context.related_span.map(|span| span.begin.offset), Some(5));
+}
+
+#[test]
+fn binding_static_passes_preserve_interleaved_source_error_order() {
+    for (source, kind, offset) in [
+        (
+            "earlier[1]\nlet value = later[1]\nvalue\n",
+            ErrorKind::UnknownPrimitive,
+            1,
+        ),
+        (
+            "add[1]\nlet value = sub[1]\nvalue\n",
+            ErrorKind::ArityError,
+            1,
+        ),
+        ("@add\nlet value = @sub\nvalue\n", ErrorKind::SyntaxError, 2),
+    ] {
+        let error = evaluate_source(source).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+        assert_eq!(error.location.offset, offset, "{source}");
+    }
+}
+
+#[test]
+fn immutable_binding_static_failures_precede_argument_decoding() {
+    let error = faraweave::evaluate_source_with_arguments(
+        "parameters[n Int]\nlet value = missing\nadd[value n]\n",
+        &[],
+        EvaluationConfiguration::default(),
+    )
+    .expect_err("static binding failure");
+    assert_eq!(error.kind, ErrorKind::BindingError);
+    assert_eq!(
+        error.binding.map(|context| context.reason),
+        Some(faraweave::BindingErrorReason::UnknownName)
+    );
+}
+
+#[test]
+fn immutable_binding_deep_resolution_and_verification_are_iterative() {
+    const DEPTH: usize = 4_000;
+    let mut source = String::new();
+    source
+        .try_reserve(DEPTH * 32)
+        .expect("deep binding source reservation");
+    source.push_str("let value0 = 0\n");
+    for index in 1..DEPTH {
+        writeln!(&mut source, "let value{index} = inc[value{}]", index - 1)
+            .expect("write deep declaration");
+    }
+    writeln!(&mut source, "value{}", DEPTH - 1).expect("write deep root");
+
+    let result = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || evaluate_source(&source).map_err(|_| ()))
+        .expect("spawn reduced-stack binding evaluation")
+        .join()
+        .expect("join reduced-stack binding evaluation")
+        .expect("deep bindings");
+    assert_eq!(result.values, vec![Value::Int((DEPTH - 1) as i64)]);
 }

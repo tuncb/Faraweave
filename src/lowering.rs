@@ -1,7 +1,7 @@
 use crate::parser::parse;
 use crate::parser::{
-    CallSyntax, ConnectedPlaceholder, ConnectedTemplate, Expr, ExprKind, Program,
-    validate_parameter_declarations,
+    CallSyntax, ConnectedPlaceholder, ConnectedTemplate, Declaration, Expr, ExprKind, Program,
+    reserved_syntax_name, validate_parameter_declarations,
 };
 use crate::primitive::resolve_names;
 use crate::semantic_registry::{
@@ -17,8 +17,9 @@ use crate::typed_program::{
     VerifyError,
 };
 use crate::{
-    ConnectedApplicationErrorContext, ConnectedApplicationErrorReason, Error, ErrorKind,
-    ScalarType, SourceLocation, SourceSpan, Type, Value,
+    BindingErrorContext, BindingErrorReason, ConnectedApplicationErrorContext,
+    ConnectedApplicationErrorReason, Error, ErrorKind, ScalarType, SourceLocation, SourceSpan,
+    Type, Value,
 };
 use std::fmt::Write as _;
 
@@ -107,8 +108,12 @@ struct Lowerer {
     needs_operation_references: bool,
     needs_backend_native_math: bool,
     needs_connected_bindings: bool,
+    needs_user_bindings: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
+    binding_resolution: BindingResolution,
+    bindings: Vec<Option<Lowered>>,
+    binding_last_consumers: Vec<Option<NodeIndex>>,
     first_shape_error: Option<Error>,
     diagnostics: DiagnosticReservations,
 }
@@ -147,6 +152,7 @@ struct Lowered {
     value_type: Type,
     tuple_elements: Vec<TupleElement>,
     access: ValueAccess,
+    binding: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -155,6 +161,32 @@ struct TupleElement {
     cardinality: Option<Cardinality>,
     origin: OriginIndex,
     location: SourceLocation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BindingUseMode {
+    Borrow,
+    Move,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedBindingReference {
+    offset: usize,
+    symbol: ResolvedSymbol,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResolvedSymbol {
+    Parameter(usize),
+    Binding {
+        binding: usize,
+        mode: BindingUseMode,
+    },
+}
+
+#[derive(Default)]
+struct BindingResolution {
+    references: Vec<ResolvedBindingReference>,
 }
 
 pub(crate) fn compile_source_with_name(
@@ -178,10 +210,389 @@ pub(crate) fn compile_parsed_source_with_name(
     program: &Program,
 ) -> Result<VerifiedProgram, CompileError> {
     validate_parameter_declarations(program)?;
+    let binding_resolution = analyze_bindings(program)?;
     validate_operation_reference_positions(program)?;
     resolve_names(program)?;
     validate_program_arities(program)?;
-    lower_program(source, diagnostic_name, program)
+    lower_program(source, diagnostic_name, program, binding_resolution)
+}
+
+fn analyze_bindings(program: &Program) -> Result<BindingResolution, LowerError> {
+    let mut declaration_names = Vec::new();
+    declaration_names
+        .try_reserve_exact(program.declarations.len())
+        .map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Node,
+            })
+        })?;
+    declaration_names.extend(0..program.declarations.len());
+    declaration_names.sort_unstable_by(|left, right| {
+        program.declarations[*left]
+            .name
+            .cmp(&program.declarations[*right].name)
+            .then_with(|| left.cmp(right))
+    });
+    let mut duplicate_in_source_order = None;
+    let mut group_start = 0;
+    while group_start < declaration_names.len() {
+        let earliest = declaration_names[group_start];
+        let mut group_end = group_start + 1;
+        while group_end < declaration_names.len()
+            && program.declarations[declaration_names[group_end]].name
+                == program.declarations[earliest].name
+        {
+            let duplicate = declaration_names[group_end];
+            if duplicate_in_source_order.is_none_or(|(current, _)| duplicate < current) {
+                duplicate_in_source_order = Some((duplicate, earliest));
+            }
+            group_end += 1;
+        }
+        group_start = group_end;
+    }
+    if let Some((duplicate, earlier)) = duplicate_in_source_order {
+        let declaration = &program.declarations[duplicate];
+        return Err(binding_error(
+            BindingErrorReason::DuplicateName,
+            declaration,
+            Some(declaration.name_span),
+            Some(program.declarations[earlier].name_span),
+            "duplicate binding declaration",
+        ));
+    }
+    for declaration in &program.declarations {
+        if let Some(parameter) = program
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == declaration.name)
+        {
+            return Err(binding_error(
+                BindingErrorReason::Shadowing,
+                declaration,
+                Some(declaration.name_span),
+                Some(parameter.name_span),
+                "binding name shadows a parameter",
+            ));
+        }
+        if reserved_syntax_name(&declaration.name) || primitive_from_name(&declaration.name).is_ok()
+        {
+            return Err(binding_error(
+                BindingErrorReason::ReservedName,
+                declaration,
+                Some(declaration.name_span),
+                Some(declaration.name_span),
+                "binding name is reserved",
+            ));
+        }
+    }
+
+    let mut resolution = BindingResolution::default();
+    let mut uses: Vec<Vec<(BindingUseMode, SourceSpan)>> = Vec::new();
+    uses.try_reserve_exact(program.declarations.len())
+        .map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Node,
+            })
+        })?;
+    uses.resize_with(program.declarations.len(), Vec::new);
+
+    let mut next_declaration = 0usize;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(next_declaration)
+            .is_some_and(|declaration| declaration.before_root == boundary)
+        {
+            let declaration = &program.declarations[next_declaration];
+            analyze_expression_bindings(
+                program,
+                &declaration.initializer,
+                true,
+                Some(next_declaration),
+                next_declaration,
+                &declaration_names,
+                &mut resolution,
+                &mut uses,
+            )?;
+            next_declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            analyze_expression_bindings(
+                program,
+                root,
+                true,
+                None,
+                next_declaration,
+                &declaration_names,
+                &mut resolution,
+                &mut uses,
+            )?;
+        }
+    }
+
+    for (index, declaration_uses) in uses.iter().enumerate() {
+        let declaration = &program.declarations[index];
+        if declaration_uses.is_empty() {
+            return Err(binding_error(
+                BindingErrorReason::UnusedBinding,
+                declaration,
+                None,
+                Some(declaration.name_span),
+                "binding is never used",
+            ));
+        }
+        let mut moved = None;
+        for (mode, span) in declaration_uses {
+            match (*mode, moved) {
+                (BindingUseMode::Move, Some(previous)) => {
+                    return Err(binding_reference_error(
+                        BindingErrorReason::MultipleOwnershipEscape,
+                        declaration,
+                        *span,
+                        Some(previous),
+                        "binding has more than one ownership escape",
+                    ));
+                }
+                (BindingUseMode::Move, None) => moved = Some(*span),
+                (BindingUseMode::Borrow, Some(previous)) => {
+                    return Err(binding_reference_error(
+                        BindingErrorReason::UseAfterMove,
+                        declaration,
+                        *span,
+                        Some(previous),
+                        "binding is used after its ownership move",
+                    ));
+                }
+                (BindingUseMode::Borrow, None) => {}
+            }
+        }
+    }
+    resolution
+        .references
+        .sort_unstable_by_key(|reference| reference.offset);
+    Ok(resolution)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_expression_bindings(
+    program: &Program,
+    expression: &Expr,
+    owning: bool,
+    current_declaration: Option<usize>,
+    active_declarations: usize,
+    declaration_names: &[usize],
+    resolution: &mut BindingResolution,
+    uses: &mut [Vec<(BindingUseMode, SourceSpan)>],
+) -> Result<(), LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.push((expression, owning));
+    while let Some((current, current_owning)) = pending.pop() {
+        match &current.kind {
+            ExprKind::UnresolvedName { name, name_span } => {
+                let declaration_index = declaration_names
+                    .binary_search_by(|index| {
+                        program.declarations[*index]
+                            .name
+                            .as_str()
+                            .cmp(name.as_str())
+                    })
+                    .ok()
+                    .and_then(|position| declaration_names.get(position))
+                    .copied();
+                let binding = declaration_index.filter(|index| *index < active_declarations);
+                let Some(binding) = binding else {
+                    if let Some(parameter) = program
+                        .parameters
+                        .iter()
+                        .position(|parameter| parameter.name == *name)
+                    {
+                        resolution.references.try_reserve(1).map_err(|_| {
+                            LowerError::Build(BuildError::AllocationUnavailable {
+                                arena: crate::Arena::Node,
+                            })
+                        })?;
+                        resolution.references.push(ResolvedBindingReference {
+                            offset: name_span.begin.offset,
+                            symbol: ResolvedSymbol::Parameter(parameter),
+                        });
+                        continue;
+                    }
+                    let declaration =
+                        current_declaration.and_then(|index| program.declarations.get(index));
+                    if let Some(declaration) = declaration
+                        && declaration.name == *name
+                    {
+                        return Err(binding_reference_error(
+                            BindingErrorReason::SelfReference,
+                            declaration,
+                            *name_span,
+                            Some(declaration.name_span),
+                            "binding initializer references its own name",
+                        ));
+                    }
+                    if let Some(future) = declaration_index
+                        .filter(|index| *index >= active_declarations)
+                        .and_then(|index| program.declarations.get(index))
+                    {
+                        return Err(binding_reference_error(
+                            BindingErrorReason::ForwardReference,
+                            future,
+                            *name_span,
+                            Some(future.name_span),
+                            "binding name is not visible before its declaration",
+                        ));
+                    }
+                    return Err(binding_unknown_reference_error(*name_span));
+                };
+                let mode = if current_owning {
+                    BindingUseMode::Move
+                } else {
+                    BindingUseMode::Borrow
+                };
+                resolution.references.try_reserve(1).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                resolution.references.push(ResolvedBindingReference {
+                    offset: name_span.begin.offset,
+                    symbol: ResolvedSymbol::Binding { binding, mode },
+                });
+                let binding_uses = uses.get_mut(binding).ok_or_else(|| {
+                    LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                binding_uses.try_reserve(1).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                binding_uses.push((mode, *name_span));
+            }
+            ExprKind::Tuple(elements) => {
+                pending.try_reserve(elements.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(elements.iter().rev().map(|element| (element, true)));
+            }
+            ExprKind::Call { arguments, .. } => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev().map(|argument| (argument, false)));
+            }
+            ExprKind::Connected { templates, operand } => {
+                let additional = templates
+                    .iter()
+                    .try_fold(1usize, |count, template| {
+                        count.checked_add(template.arguments.len())
+                    })
+                    .ok_or(LowerError::Build(BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    }))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.push((operand, false));
+                for template in templates.iter().rev() {
+                    pending.extend(
+                        template
+                            .arguments
+                            .iter()
+                            .rev()
+                            .map(|argument| (argument, false)),
+                    );
+                }
+            }
+            ExprKind::Fanout { operand, branches } => {
+                let additional = branches.len().checked_add(1).ok_or(LowerError::Build(
+                    BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    },
+                ))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(branches.iter().rev().map(|branch| (branch, true)));
+                pending.push((operand, false));
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Vector(_, _)
+            | ExprKind::DeepTuple { .. }
+            | ExprKind::UnaryChain { .. }
+            | ExprKind::OperationReference { .. }
+            | ExprKind::ConnectedPlaceholder(_)
+            | ExprKind::Placeholder => {}
+        }
+    }
+    Ok(())
+}
+
+fn binding_error(
+    reason: BindingErrorReason,
+    declaration: &Declaration,
+    reference_span: Option<SourceSpan>,
+    related_span: Option<SourceSpan>,
+    message: &'static str,
+) -> LowerError {
+    let primary = reference_span.unwrap_or(declaration.name_span);
+    let mut error = Error::at_span(ErrorKind::BindingError, primary, message);
+    error.binding = BindingErrorContext::try_new(
+        reason,
+        Some(declaration.span),
+        Some(declaration.name_span),
+        Some(declaration.initializer_span),
+        reference_span,
+        related_span,
+    );
+    LowerError::Source(error)
+}
+
+fn binding_reference_error(
+    reason: BindingErrorReason,
+    declaration: &Declaration,
+    reference_span: SourceSpan,
+    related_span: Option<SourceSpan>,
+    message: &'static str,
+) -> LowerError {
+    binding_error(
+        reason,
+        declaration,
+        Some(reference_span),
+        related_span,
+        message,
+    )
+}
+
+fn binding_unknown_reference_error(reference_span: SourceSpan) -> LowerError {
+    let mut error = Error::at_span(
+        ErrorKind::BindingError,
+        reference_span,
+        "unknown parameter or binding name",
+    );
+    error.binding = BindingErrorContext::try_new(
+        BindingErrorReason::UnknownName,
+        None,
+        None,
+        None,
+        Some(reference_span),
+        None,
+    );
+    LowerError::Source(error)
 }
 
 #[derive(Clone, Copy)]
@@ -191,13 +602,33 @@ enum StructuralValue {
 }
 
 fn validate_operation_reference_positions(program: &Program) -> Result<(), LowerError> {
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            validate_operation_reference_expression(
+                &program.declarations[declaration].initializer,
+            )?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            validate_operation_reference_expression(root)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_reference_expression(expression: &Expr) -> Result<(), LowerError> {
     let mut pending = Vec::new();
-    pending.try_reserve(program.roots.len()).map_err(|_| {
+    pending.try_reserve(1).map_err(|_| {
         LowerError::Build(BuildError::AllocationUnavailable {
             arena: crate::Arena::Node,
         })
     })?;
-    pending.extend(program.roots.iter().rev().map(|root| (root, false)));
+    pending.push((expression, false));
     while let Some((expression, accepted)) = pending.pop() {
         match &expression.kind {
             ExprKind::OperationReference { .. } if accepted => {}
@@ -308,7 +739,6 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
             | ExprKind::Vector(_, _)
             | ExprKind::DeepTuple { .. }
             | ExprKind::UnaryChain { .. }
-            | ExprKind::Parameter(_)
             | ExprKind::UnresolvedName { .. }
             | ExprKind::ConnectedPlaceholder(_)
             | ExprKind::Placeholder => {}
@@ -323,8 +753,23 @@ fn operation_reference_position(consumer: &str, zero_based_argument: usize) -> b
 
 fn validate_program_arities(program: &Program) -> Result<(), LowerError> {
     let mut deferred_connected_error = None;
-    for root in &program.roots {
-        let _ = validate_expr_arities(root, None, &mut deferred_connected_error)?;
+    let mut declaration = 0;
+    for boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(declaration)
+            .is_some_and(|item| item.before_root == boundary)
+        {
+            let _ = validate_expr_arities(
+                &program.declarations[declaration].initializer,
+                None,
+                &mut deferred_connected_error,
+            )?;
+            declaration += 1;
+        }
+        if let Some(root) = program.roots.get(boundary) {
+            let _ = validate_expr_arities(root, None, &mut deferred_connected_error)?;
+        }
     }
     if let Some(error) = deferred_connected_error {
         return Err(LowerError::Source(error));
@@ -384,6 +829,12 @@ fn validate_expr_arities(
             } else {
                 arguments.len()
             };
+            if *syntax == CallSyntax::Prefix
+                && arguments.len() == 1
+                && matches!(arguments[0].kind, ExprKind::UnresolvedName { .. })
+            {
+                return Ok(StructuralValue::NonTuple);
+            }
             validate_arity(name, actual, expression.span.begin)?;
             Ok(StructuralValue::NonTuple)
         }
@@ -558,7 +1009,6 @@ fn validate_expr_arities(
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
         | ExprKind::DeepTuple { .. }
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => Ok(StructuralValue::NonTuple),
     }
@@ -605,7 +1055,6 @@ fn first_unbound_connected_placeholder(
             | ExprKind::Vector(_, _)
             | ExprKind::DeepTuple { .. }
             | ExprKind::UnaryChain { .. }
-            | ExprKind::Parameter(_)
             | ExprKind::OperationReference { .. }
             | ExprKind::UnresolvedName { .. }
             | ExprKind::Placeholder => {}
@@ -890,31 +1339,62 @@ fn lower_program(
     source: &str,
     diagnostic_name: &str,
     program: &Program,
+    resolution: BindingResolution,
 ) -> Result<VerifiedProgram, LowerError> {
     let builder = RawProgramBuilder::new();
-    lower_program_with_builder(source, diagnostic_name, program, builder)
+    lower_program_with_builder_and_resolution(
+        source,
+        diagnostic_name,
+        program,
+        builder,
+        resolution,
+        DiagnosticReservations::default(),
+    )
 }
 
+#[allow(dead_code)]
 fn lower_program_with_builder(
     source: &str,
     diagnostic_name: &str,
     program: &Program,
     builder: RawProgramBuilder,
 ) -> Result<VerifiedProgram, LowerError> {
-    lower_program_with_builder_and_diagnostics(
+    let resolution = analyze_bindings(program)?;
+    lower_program_with_builder_and_resolution(
         source,
         diagnostic_name,
         program,
         builder,
+        resolution,
         DiagnosticReservations::default(),
     )
 }
 
+#[allow(dead_code)]
 fn lower_program_with_builder_and_diagnostics(
     source: &str,
     diagnostic_name: &str,
     program: &Program,
+    builder: RawProgramBuilder,
+    diagnostics: DiagnosticReservations,
+) -> Result<VerifiedProgram, LowerError> {
+    let resolution = analyze_bindings(program)?;
+    lower_program_with_builder_and_resolution(
+        source,
+        diagnostic_name,
+        program,
+        builder,
+        resolution,
+        diagnostics,
+    )
+}
+
+fn lower_program_with_builder_and_resolution(
+    source: &str,
+    diagnostic_name: &str,
+    program: &Program,
     mut builder: RawProgramBuilder,
+    binding_resolution: BindingResolution,
     diagnostics: DiagnosticReservations,
 ) -> Result<VerifiedProgram, LowerError> {
     let byte_length = u32::try_from(source.len()).map_err(|_| {
@@ -939,8 +1419,12 @@ fn lower_program_with_builder_and_diagnostics(
         needs_operation_references: false,
         needs_backend_native_math: false,
         needs_connected_bindings: false,
+        needs_user_bindings: false,
         placeholder: None,
         releases: Vec::new(),
+        binding_resolution,
+        bindings: Vec::new(),
+        binding_last_consumers: Vec::new(),
         first_shape_error: None,
         diagnostics,
     };
@@ -987,9 +1471,47 @@ fn lower_program_with_builder_and_diagnostics(
         lowerer.parameter_scalar_types.push(parameter.scalar_type);
     }
 
-    for (root_index, root) in program.roots.iter().enumerate() {
-        let lowered = lowerer.lower_expr(root)?;
-        let root_index = RootIndex(u32::try_from(root_index).map_err(|_| {
+    lowerer
+        .bindings
+        .try_reserve_exact(program.declarations.len())
+        .map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Node,
+            })
+        })?;
+    lowerer
+        .bindings
+        .resize_with(program.declarations.len(), || None);
+    lowerer
+        .binding_last_consumers
+        .try_reserve_exact(program.declarations.len())
+        .map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Ownership,
+            })
+        })?;
+    lowerer
+        .binding_last_consumers
+        .resize(program.declarations.len(), None);
+
+    let mut next_declaration = 0usize;
+    for root_boundary in 0..=program.roots.len() {
+        while program
+            .declarations
+            .get(next_declaration)
+            .is_some_and(|declaration| declaration.before_root == root_boundary)
+        {
+            lowerer.lower_declaration(next_declaration, &program.declarations[next_declaration])?;
+            next_declaration += 1;
+        }
+        let Some(root) = program.roots.get(root_boundary) else {
+            continue;
+        };
+        let mut lowered = lowerer.lower_expr(root)?;
+        if lowered.binding.is_some() && lowered.access == ValueAccess::BindingMove {
+            lowered = lowerer.materialize_binding_move(lowered)?;
+        }
+        let root_index = RootIndex(u32::try_from(root_boundary).map_err(|_| {
             LowerError::Build(BuildError::CountOverflow {
                 arena: crate::Arena::Root,
             })
@@ -1001,6 +1523,24 @@ fn lower_program_with_builder_and_diagnostics(
             node: lowered.node,
             origin: lowered.origin,
         })?;
+    }
+    for binding in 0..lowerer.bindings.len() {
+        let owner = lowerer
+            .bindings
+            .get(binding)
+            .and_then(Option::as_ref)
+            .map(|lowered| lowered.node)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Ownership,
+            }))?;
+        let consumer = lowerer
+            .binding_last_consumers
+            .get(binding)
+            .and_then(|consumer| *consumer)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Ownership,
+            }))?;
+        lowerer.set_release(owner, ReleaseAfter::Node(consumer))?;
     }
     if let Some(error) = lowerer.first_shape_error {
         return Err(LowerError::Source(error));
@@ -1056,6 +1596,12 @@ fn lower_program_with_builder_and_diagnostics(
         lowerer
             .builder
             .push_feature(Feature::ConnectedApplicationBindings.numeric())?;
+    }
+    if lowerer.needs_user_bindings {
+        lowerer.builder.set_semantic_minor(3);
+        lowerer
+            .builder
+            .push_feature(Feature::ImmutableBindings.numeric())?;
     }
     Ok(lowerer.builder.finish()?.verify()?)
 }
@@ -1113,56 +1659,246 @@ impl Lowerer {
         })
     }
 
-    fn lower_expr(&mut self, expression: &Expr) -> Result<Lowered, LowerError> {
-        let origin = self.push_origin(expression.span)?;
-        match &expression.kind {
-            ExprKind::Literal(value) => self.lower_scalar(value, origin, expression.span.begin),
-            ExprKind::Vector(element_type, values) => {
-                self.lower_vector(*element_type, values, origin, expression.span.begin)
-            }
-            ExprKind::Parameter(index) => {
-                let result_type = self.parameter_types.get(*index).copied().ok_or_else(|| {
+    fn lower_declaration(
+        &mut self,
+        binding: usize,
+        declaration: &Declaration,
+    ) -> Result<(), LowerError> {
+        let initializer = self.lower_expr(&declaration.initializer)?;
+        let declaration_origin = self.push_origin(declaration.span)?;
+        let name_origin = self.push_origin(declaration.name_span)?;
+        let initializer_origin = self.push_origin(declaration.initializer_span)?;
+        let edge_start = self.builder.finish_preview_edges()?;
+        self.builder.push_edge(Edge {
+            producer: initializer.node,
+            argument_position: 1,
+            access: initializer.access,
+            cardinality: initializer.cardinality,
+            conversion: crate::Conversion::Identity,
+            ownership: if initializer.borrowed {
+                OwnershipMode::ImmutableBorrow
+            } else {
+                OwnershipMode::InfallibleTransfer
+            },
+            origin: initializer.origin,
+        })?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::Binding {
+                declaration_origin,
+                name_origin,
+                initializer_origin,
+            },
+            result_type: initializer.result_type,
+            cardinality: initializer.cardinality,
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin: declaration_origin,
+        })?;
+        self.register_node(node)?;
+        if let Some(source_binding) = initializer.binding {
+            self.record_binding_consumer(source_binding, node)?;
+        } else if !initializer.borrowed {
+            self.set_release(initializer.node, ReleaseAfter::Node(node))?;
+        }
+        let stored = Lowered {
+            node,
+            result_type: initializer.result_type,
+            cardinality: initializer.cardinality,
+            origin: declaration_origin,
+            location: declaration.name_span.begin,
+            borrowed: true,
+            value_type: initializer.value_type,
+            tuple_elements: initializer.tuple_elements,
+            access: ValueAccess::BindingBorrowWhole,
+            binding: Some(binding),
+        };
+        let destination =
+            self.bindings
+                .get_mut(binding)
+                .ok_or(LowerError::Build(BuildError::CountOverflow {
+                    arena: crate::Arena::Node,
+                }))?;
+        *destination = Some(stored);
+        self.needs_user_bindings = true;
+        Ok(())
+    }
+
+    fn lower_resolved_reference(
+        &mut self,
+        expression: &Expr,
+        origin: OriginIndex,
+    ) -> Result<Lowered, LowerError> {
+        let reference = self
+            .binding_resolution
+            .references
+            .binary_search_by_key(&expression.span.begin.offset, |reference| reference.offset)
+            .ok()
+            .and_then(|index| self.binding_resolution.references.get(index))
+            .copied()
+            .ok_or_else(|| binding_unknown_reference_error(expression.span))?;
+        let ResolvedSymbol::Binding { binding, mode } = reference.symbol else {
+            let ResolvedSymbol::Parameter(parameter) = reference.symbol else {
+                return Err(binding_unknown_reference_error(expression.span));
+            };
+            let result_type = self
+                .parameter_types
+                .get(parameter)
+                .copied()
+                .ok_or_else(|| {
                     LowerError::Source(Error::at_span(
                         ErrorKind::ParameterError,
                         expression.span,
                         "invalid parameter reference",
                     ))
                 })?;
-                let parameter = crate::ParameterIndex(u32::try_from(*index).map_err(|_| {
+            let parameter_index =
+                crate::ParameterIndex(u32::try_from(parameter).map_err(|_| {
                     LowerError::Build(BuildError::CountOverflow {
                         arena: crate::Arena::Parameter,
                     })
                 })?);
-                let node = self.builder.push_node(Node {
-                    kind: NodeKind::ParameterBorrow { parameter },
-                    result_type,
-                    cardinality: Some(Cardinality::StaticScalar),
-                    edges: IndexRange {
-                        start: self.builder.finish_preview_edges()?,
-                        count: 0,
+            let node = self.builder.push_node(Node {
+                kind: NodeKind::ParameterBorrow {
+                    parameter: parameter_index,
+                },
+                result_type,
+                cardinality: Some(Cardinality::StaticScalar),
+                edges: IndexRange {
+                    start: self.builder.finish_preview_edges()?,
+                    count: 0,
+                },
+                origin,
+            })?;
+            self.register_node(node)?;
+            return Ok(Lowered {
+                node,
+                result_type,
+                cardinality: Some(Cardinality::StaticScalar),
+                origin,
+                location: expression.span.begin,
+                borrowed: true,
+                value_type: Type::Scalar(*self.parameter_scalar_types.get(parameter).ok_or_else(
+                    || {
+                        LowerError::Source(Error::at_span(
+                            ErrorKind::ParameterError,
+                            expression.span,
+                            "invalid parameter reference",
+                        ))
                     },
-                    origin,
-                })?;
-                self.register_node(node)?;
-                Ok(Lowered {
-                    node,
-                    result_type,
-                    cardinality: Some(Cardinality::StaticScalar),
-                    origin,
-                    location: expression.span.begin,
-                    borrowed: true,
-                    value_type: Type::Scalar(*self.parameter_scalar_types.get(*index).ok_or_else(
-                        || {
-                            LowerError::Source(Error::at_span(
-                                ErrorKind::ParameterError,
-                                expression.span,
-                                "invalid parameter reference",
-                            ))
-                        },
-                    )?),
-                    tuple_elements: Vec::new(),
-                    access: ValueAccess::WholeValue,
-                })
+                )?),
+                tuple_elements: Vec::new(),
+                access: ValueAccess::WholeValue,
+                binding: None,
+            });
+        };
+        let mut lowered = self
+            .bindings
+            .get(binding)
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Node,
+            }))?;
+        lowered.origin = origin;
+        lowered.location = expression.span.begin;
+        lowered.borrowed = mode == BindingUseMode::Borrow;
+        lowered.access = match mode {
+            BindingUseMode::Borrow => ValueAccess::BindingBorrowWhole,
+            BindingUseMode::Move => ValueAccess::BindingMove,
+        };
+        Ok(lowered)
+    }
+
+    fn materialize_binding_move(&mut self, binding: Lowered) -> Result<Lowered, LowerError> {
+        let binding_index =
+            binding
+                .binding
+                .ok_or(LowerError::Build(BuildError::CountOverflow {
+                    arena: crate::Arena::Node,
+                }))?;
+        let edge_start = self.builder.finish_preview_edges()?;
+        self.builder.push_edge(Edge {
+            producer: binding.node,
+            argument_position: 1,
+            access: ValueAccess::BindingMove,
+            cardinality: binding.cardinality,
+            conversion: crate::Conversion::Identity,
+            ownership: OwnershipMode::InfallibleTransfer,
+            origin: binding.origin,
+        })?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::BindingMove,
+            result_type: binding.result_type,
+            cardinality: binding.cardinality,
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin: binding.origin,
+        })?;
+        self.register_node(node)?;
+        self.record_binding_consumer(binding_index, node)?;
+        Ok(Lowered {
+            node,
+            binding: None,
+            ..binding
+        })
+    }
+
+    fn materialize_binding_borrow(&mut self, binding: Lowered) -> Result<Lowered, LowerError> {
+        let edge_start = self.builder.finish_preview_edges()?;
+        self.builder.push_edge(Edge {
+            producer: binding.node,
+            argument_position: 1,
+            access: ValueAccess::BindingBorrowWhole,
+            cardinality: binding.cardinality,
+            conversion: crate::Conversion::Identity,
+            ownership: OwnershipMode::ImmutableBorrow,
+            origin: binding.origin,
+        })?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::BindingBorrow,
+            result_type: binding.result_type,
+            cardinality: binding.cardinality,
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin: binding.origin,
+        })?;
+        self.register_node(node)?;
+        Ok(Lowered {
+            node,
+            borrowed: false,
+            access: ValueAccess::WholeValue,
+            binding: None,
+            ..binding
+        })
+    }
+
+    fn record_binding_consumer(
+        &mut self,
+        binding: usize,
+        consumer: NodeIndex,
+    ) -> Result<(), LowerError> {
+        let destination = self
+            .binding_last_consumers
+            .get_mut(binding)
+            .ok_or(LowerError::Build(BuildError::CountOverflow {
+                arena: crate::Arena::Ownership,
+            }))?;
+        *destination = Some(consumer);
+        Ok(())
+    }
+
+    fn lower_expr(&mut self, expression: &Expr) -> Result<Lowered, LowerError> {
+        let origin = self.push_origin(expression.span)?;
+        match &expression.kind {
+            ExprKind::Literal(value) => self.lower_scalar(value, origin, expression.span.begin),
+            ExprKind::Vector(element_type, values) => {
+                self.lower_vector(*element_type, values, origin, expression.span.begin)
             }
             ExprKind::Tuple(elements) => self.lower_tuple(elements, origin, expression.span.begin),
             ExprKind::DeepTuple { depth, leaf } => {
@@ -1229,6 +1965,7 @@ impl Lowerer {
             ExprKind::Fanout { operand, branches } => {
                 self.lower_fan_out(expression, operand, branches, origin)
             }
+            ExprKind::UnresolvedName { .. } => self.lower_resolved_reference(expression, origin),
             _ => Err(LowerError::Source(Error::at_span(
                 ErrorKind::TypeError,
                 expression.span,
@@ -1280,6 +2017,7 @@ impl Lowerer {
             value_type: Type::Scalar(scalar_type),
             tuple_elements: Vec::new(),
             access: ValueAccess::WholeValue,
+            binding: None,
         })
     }
 
@@ -1333,6 +2071,7 @@ impl Lowerer {
             value_type: Type::Vector(element_type),
             tuple_elements: Vec::new(),
             access: ValueAccess::WholeValue,
+            binding: None,
         })
     }
 
@@ -1379,7 +2118,7 @@ impl Lowerer {
             self.builder.push_edge(Edge {
                 producer: element.node,
                 argument_position,
-                access: ValueAccess::WholeValue,
+                access: element.access,
                 cardinality: element.cardinality,
                 conversion: crate::Conversion::Identity,
                 ownership: if element.borrowed {
@@ -1402,7 +2141,9 @@ impl Lowerer {
         })?;
         self.register_node(node)?;
         for element in &lowered {
-            if !element.borrowed {
+            if let Some(binding) = element.binding {
+                self.record_binding_consumer(binding, node)?;
+            } else if !element.borrowed {
                 self.set_release(element.node, ReleaseAfter::Node(node))?;
             }
         }
@@ -1441,6 +2182,7 @@ impl Lowerer {
             value_type,
             tuple_elements,
             access: ValueAccess::WholeValue,
+            binding: None,
         })
     }
 
@@ -1538,6 +2280,7 @@ impl Lowerer {
                 },
                 tuple_elements,
                 access: ValueAccess::WholeValue,
+                binding: None,
             };
         }
         self.needs_tuples |= depth != 0;
@@ -1751,6 +2494,7 @@ impl Lowerer {
             value_type: operand.value_type,
             tuple_elements: operand.tuple_elements,
             access: ValueAccess::WholeValue,
+            binding: operand.binding,
         })
     }
 
@@ -1788,6 +2532,7 @@ impl Lowerer {
                         expanded.push(AuthoredCallOperand::Bound(
                             CallOperand::ConnectedBindingElement {
                                 binding: binding.node,
+                                user_binding: binding.binding,
                                 element: u32::try_from(element).map_err(|_| {
                                     LowerError::Build(BuildError::CountOverflow {
                                         arena: crate::Arena::Edge,
@@ -1842,6 +2587,7 @@ impl Lowerer {
                     expanded.push(AuthoredCallOperand::Bound(
                         CallOperand::ConnectedBindingElement {
                             binding: binding.node,
+                            user_binding: binding.binding,
                             element: zero_based,
                             metadata: try_clone_tuple_element(metadata, origin, location)?,
                         },
@@ -2136,6 +2882,37 @@ impl Lowerer {
         location: SourceLocation,
         tuple: Lowered,
     ) -> Result<Lowered, LowerError> {
+        if let Some(binding) = tuple.binding {
+            let mut operands = Vec::new();
+            operands
+                .try_reserve(tuple.tuple_elements.len())
+                .map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Edge,
+                    })
+                })?;
+            for (element, metadata) in tuple.tuple_elements.into_iter().enumerate() {
+                operands.push(CallOperand::BindingElement {
+                    binding: tuple.node,
+                    binding_index: binding,
+                    element: u32::try_from(element).map_err(|_| {
+                        LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::Edge,
+                        })
+                    })?,
+                    metadata,
+                });
+            }
+            self.needs_spread = true;
+            return self.lower_selected_call(
+                name,
+                primitive_origin,
+                origin,
+                location,
+                operands,
+                None,
+            );
+        }
         let edge_start = self.builder.finish_preview_edges()?;
         self.builder.push_edge(Edge {
             producer: tuple.node,
@@ -2575,10 +3352,25 @@ impl Lowerer {
         })?;
         self.register_node(node)?;
         for operand in operands {
-            if let CallOperand::Whole(lowered) = operand
-                && !lowered.borrowed
-            {
-                self.set_release(lowered.node, ReleaseAfter::Node(node))?;
+            match operand {
+                CallOperand::Whole(lowered) => {
+                    if let Some(binding) = lowered.binding {
+                        self.record_binding_consumer(binding, node)?;
+                    } else if !lowered.borrowed {
+                        self.set_release(lowered.node, ReleaseAfter::Node(node))?;
+                    }
+                }
+                CallOperand::BindingElement { binding_index, .. } => {
+                    self.record_binding_consumer(binding_index, node)?;
+                }
+                CallOperand::ConnectedBindingElement {
+                    user_binding: Some(binding),
+                    ..
+                } => self.record_binding_consumer(binding, node)?,
+                CallOperand::TupleElement { .. }
+                | CallOperand::ConnectedBindingElement {
+                    user_binding: None, ..
+                } => {}
             }
         }
         self.needs_ids = true;
@@ -2594,6 +3386,7 @@ impl Lowerer {
             value_type,
             tuple_elements: Vec::new(),
             access: ValueAccess::WholeValue,
+            binding: None,
         })
     }
 
@@ -2604,7 +3397,11 @@ impl Lowerer {
         branches: &[Expr],
         origin: OriginIndex,
     ) -> Result<Lowered, LowerError> {
-        let operand = self.lower_expr(operand)?;
+        let mut operand = self.lower_expr(operand)?;
+        let source_binding = operand.binding;
+        if source_binding.is_some() {
+            operand = self.materialize_binding_borrow(operand)?;
+        }
         let branch_start = self.builder.finish_preview_branches()?;
         let mut branch_roots = Vec::new();
         let mut result_elements = Vec::new();
@@ -2669,7 +3466,7 @@ impl Lowerer {
         self.builder.push_edge(Edge {
             producer: operand.node,
             argument_position: 1,
-            access: ValueAccess::WholeValue,
+            access: operand.access,
             cardinality: operand.cardinality,
             conversion: crate::Conversion::Identity,
             ownership: if operand.borrowed {
@@ -2697,7 +3494,10 @@ impl Lowerer {
             origin,
         })?;
         self.register_node(node)?;
-        if !operand.borrowed {
+        if let Some(binding) = source_binding {
+            self.record_binding_consumer(binding, node)?;
+            self.set_release(operand.node, ReleaseAfter::Node(node))?;
+        } else if !operand.borrowed {
             self.set_release(operand.node, ReleaseAfter::Node(node))?;
         }
         for root in &branch_roots {
@@ -2738,6 +3538,7 @@ impl Lowerer {
             value_type: Type::Tuple(value_types),
             tuple_elements,
             access: ValueAccess::WholeValue,
+            binding: None,
         })
     }
 }
@@ -2786,6 +3587,13 @@ enum CallOperand {
     },
     ConnectedBindingElement {
         binding: NodeIndex,
+        user_binding: Option<usize>,
+        element: u32,
+        metadata: TupleElement,
+    },
+    BindingElement {
+        binding: NodeIndex,
+        binding_index: usize,
         element: u32,
         metadata: TupleElement,
     },
@@ -2830,9 +3638,24 @@ impl CallOperand {
                 binding,
                 element,
                 metadata,
+                ..
             } => (
                 *binding,
                 ValueAccess::ConnectedBindingElement(*element),
+                &metadata.value_type,
+                metadata.cardinality,
+                metadata.origin,
+                true,
+                metadata.location,
+            ),
+            Self::BindingElement {
+                binding,
+                element,
+                metadata,
+                ..
+            } => (
+                *binding,
+                ValueAccess::BindingBorrowElement(*element),
                 &metadata.value_type,
                 metadata.cardinality,
                 metadata.origin,
@@ -3263,6 +4086,7 @@ fn try_clone_lowered(lowered: &Lowered) -> Result<Lowered, LowerError> {
         value_type: try_clone_type(&lowered.value_type)?,
         tuple_elements,
         access: lowered.access,
+        binding: lowered.binding,
     })
 }
 
@@ -3282,6 +4106,7 @@ fn connected_binding_whole(
         value_type: try_clone_type(&binding.value_type)?,
         tuple_elements: Vec::new(),
         access,
+        binding: binding.binding,
     })
 }
 
@@ -3317,7 +4142,6 @@ fn placeholder_span(expression: &Expr) -> Option<SourceSpan> {
         | ExprKind::Vector(_, _)
         | ExprKind::DeepTuple { .. }
         | ExprKind::UnaryChain { .. }
-        | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => None,
     }
@@ -5027,5 +5851,12 @@ mod tests {
             }
         );
         assert_eq!(mismatch.span, None);
+    }
+
+    #[test]
+    fn immutable_binding_fanout_lowering_is_verified() {
+        let source = "let values = iota[4]\nfoldl[@add 0 values]\nscanl[@add 0 values]\nfanout[values {sum[_]} {length[_]}]\n";
+        let result = compile_source_with_name(source, "binding.faraweave");
+        assert!(result.is_ok(), "{result:?}");
     }
 }
