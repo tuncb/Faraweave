@@ -157,6 +157,7 @@ impl<'a> Interpreter<'a> {
             }
             NodeKind::TupleConstruct => self.execute_tuple(index, node, location),
             NodeKind::PrefixSpreadPrepare => self.execute_spread_prepare(index, node, location),
+            NodeKind::ConnectedBinding => self.execute_binding(index, node, location),
             NodeKind::SelectedApply {
                 implementation_id,
                 application_plan_id,
@@ -209,6 +210,32 @@ impl<'a> Interpreter<'a> {
     }
 
     fn execute_spread_prepare(
+        &mut self,
+        index: usize,
+        node: crate::Node,
+        location: SourceLocation,
+    ) -> Result<(), Error> {
+        let edge = *self
+            .edges(node.edges)?
+            .first()
+            .ok_or_else(|| execution_invariant_error(location))?;
+        let slot = match edge.ownership {
+            OwnershipMode::InfallibleTransfer => {
+                let producer = edge.producer.0 as usize;
+                self.slots
+                    .get_mut(producer)
+                    .and_then(Option::take)
+                    .ok_or_else(|| execution_invariant_error(location))?
+            }
+            OwnershipMode::ImmutableBorrow => Slot::Alias(edge.producer),
+            OwnershipMode::OwnedInput => return Err(execution_invariant_error(location)),
+        };
+        self.put_slot(index, slot)?;
+        self.release_after(index);
+        Ok(())
+    }
+
+    fn execute_binding(
         &mut self,
         index: usize,
         node: crate::Node,
@@ -585,7 +612,9 @@ where
 {
     let value = slot_value(slots, edge.producer)?;
     match edge.access {
-        ValueAccess::WholeValue | ValueAccess::FanOutOperandBorrow => Ok(value),
+        ValueAccess::WholeValue
+        | ValueAccess::FanOutOperandBorrow
+        | ValueAccess::ConnectedBindingWhole => Ok(value),
         ValueAccess::TupleElement(element) => {
             let Value::Tuple(values) = value else {
                 return Err(execution_invariant_error(origin_location(raw, edge.origin)));
@@ -594,6 +623,13 @@ where
                 .get(element as usize)
                 .ok_or_else(|| execution_invariant_error(origin_location(raw, edge.origin)))
         }
+        ValueAccess::ConnectedBindingElement(element) => match value {
+            Value::Tuple(values) => values
+                .get(element as usize)
+                .ok_or_else(|| execution_invariant_error(origin_location(raw, edge.origin))),
+            _ if element == 0 => Ok(value),
+            _ => Err(execution_invariant_error(origin_location(raw, edge.origin))),
+        },
     }
 }
 

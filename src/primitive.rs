@@ -86,6 +86,7 @@ fn validate_names(expression: &Expr) -> Result<(), Error> {
         | ExprKind::Vector(_, _)
         | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
+        | ExprKind::ConnectedPlaceholder(_)
         | ExprKind::Placeholder => {}
     }
     Ok(())

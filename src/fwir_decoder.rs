@@ -1213,11 +1213,14 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
         if reserved != 0 {
             return Err(record_error(features, index, 3, "reserved"));
         }
-        if id <= Feature::BackendNativeMathV1.numeric() {
+        if id <= Feature::ConnectedApplicationBindings.numeric() {
             if class != 0 {
                 return Err(record_error(features, index, 2, "feature_class"));
             }
             if matches!(id, 5 | 6) && plan.format_minor == 0 {
+                return Err(record_error(features, index, 0, "feature_format_minor"));
+            }
+            if id == Feature::ConnectedApplicationBindings.numeric() && plan.format_minor < 2 {
                 return Err(record_error(features, index, 0, "feature_format_minor"));
             }
         } else if class == 0 {
@@ -1261,10 +1264,27 @@ fn has_operation_references_feature(
     Ok(false)
 }
 
+fn has_connected_bindings_feature(
+    bytes: &[u8],
+    plan: &DecodePlan,
+) -> Result<bool, FwirDecodeError> {
+    let Some(features) = section(plan, 2) else {
+        return Ok(false);
+    };
+    for index in 0..features.record_count() {
+        if record_u16(bytes, features, index, 0)? == Feature::ConnectedApplicationBindings.numeric()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeError> {
     validate_features(bytes, plan)?;
     let explicit_application_plans = has_application_plans_feature(bytes, plan)?;
     let explicit_operation_references = has_operation_references_feature(bytes, plan)?;
+    let explicit_connected_bindings = has_connected_bindings_feature(bytes, plan)?;
 
     if let Some(sources) = section(plan, 4) {
         for index in 0..sources.record_count() {
@@ -1339,7 +1359,10 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
             let ownership = record_u8(bytes, edges, index, 11)?;
             let access_index = record_u32(bytes, edges, index, 12)?;
             let cardinality_length = record_u32(bytes, edges, index, 16)?;
-            if !matches!((access, access_index), (1 | 3, 0) | (2, _)) {
+            let valid_access = matches!((access, access_index), (1 | 3, 0) | (2, _))
+                || (explicit_connected_bindings
+                    && matches!((access, access_index), (4, 0) | (5, _)));
+            if !valid_access {
                 return Err(record_error(edges, index, 8, "access"));
             }
             if cardinality_from_parts(cardinality, cardinality_length).is_none() {
@@ -1375,6 +1398,11 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                     }
                 }
                 3 | 5 => {
+                    if lift != 0 || result_element != 0 || arguments.iter().any(|v| *v != 0) {
+                        return Err(record_error(nodes, index, 2, "unused_variant"));
+                    }
+                }
+                7 if explicit_connected_bindings => {
                     if lift != 0 || result_element != 0 || arguments.iter().any(|v| *v != 0) {
                         return Err(record_error(nodes, index, 2, "unused_variant"));
                     }
@@ -1671,6 +1699,7 @@ fn reconstruct_program(
         }
     };
     let explicit_application_plans = has_application_plans_feature(bytes, plan)?;
+    let explicit_connected_bindings = has_connected_bindings_feature(bytes, plan)?;
     let strings = section(plan, 3);
     let mut features = Vec::new();
     let mut source_units = Vec::new();
@@ -1797,7 +1826,7 @@ fn reconstruct_program(
     if let Some(records) = section(plan, 2) {
         for index in 0..records.record_count() {
             let id = record_u16(bytes, records, index, 0)?;
-            if id <= Feature::BackendNativeMathV1.numeric() {
+            if id <= Feature::ConnectedApplicationBindings.numeric() {
                 features.push(id);
             }
         }
@@ -1931,6 +1960,10 @@ fn reconstruct_program(
                 1 => ValueAccess::WholeValue,
                 2 => ValueAccess::TupleElement(record_u32(bytes, records, index, 12)?),
                 3 => ValueAccess::FanOutOperandBorrow,
+                4 if explicit_connected_bindings => ValueAccess::ConnectedBindingWhole,
+                5 if explicit_connected_bindings => {
+                    ValueAccess::ConnectedBindingElement(record_u32(bytes, records, index, 12)?)
+                }
                 _ => return Err(record_error(records, index, 8, "access")),
             };
             let cardinality = cardinality_from_parts(
@@ -2064,6 +2097,7 @@ fn reconstruct_program(
                     },
                     keyword_origin: OriginIndex(record_u32(bytes, records, index, 32)?),
                 },
+                7 if explicit_connected_bindings => NodeKind::ConnectedBinding,
                 _ => return Err(record_error(records, index, 0, "kind")),
             };
             nodes.push(Node {
@@ -2854,6 +2888,97 @@ mod tests {
                 kind: FwirDecodeErrorKind::AllocationUnavailable { site: actual },
                 ..
             }) if actual == site
+        ));
+        let connected_site =
+            FwirDecodeAllocationSite::Verifier(VerifyAllocationSite::ConnectedBindingOwners);
+        assert!(matches!(
+            decode_fwir_with_allocation_failure(
+                &connected_binding_bytes(),
+                &FwirDecodeLimits::default(),
+                FwirDecodeAllocationFailureInjection::at(connected_site)
+            ),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::AllocationUnavailable { site },
+                ..
+            }) if site == connected_site
+        ));
+    }
+
+    fn connected_binding_bytes() -> Vec<u8> {
+        let program = must(crate::lowering::compile_source_with_name(
+            "mul[_1 _1] (2 3)\n",
+            "connected-mutation.faraweave",
+        ));
+        must(encode_fwir(&program, &FwirEncodeOptions::default()))
+    }
+
+    #[test]
+    fn connected_binding_physical_version_feature_node_and_access_mutations_are_rejected() {
+        let bytes = connected_binding_bytes();
+        assert_eq!(test_u16(&bytes, 10), 2);
+
+        let mut old_physical = bytes.clone();
+        put_u16_at(&mut old_physical, 10, 1);
+        let (_, features, _) = test_section(&old_physical, 2);
+        let feature_index = (0..test_section(&old_physical, 2).2 / 4)
+            .find(|index| {
+                test_u16(&old_physical, features + index * 4)
+                    == Feature::ConnectedApplicationBindings.numeric()
+            })
+            .unwrap_or(usize::MAX);
+        assert_ne!(feature_index, usize::MAX);
+        assert_noncanonical_record(
+            &old_physical,
+            "feature_format_minor",
+            features + feature_index * 4,
+            2,
+            u32::try_from(feature_index).ok(),
+        );
+
+        let mut invalid_access = bytes.clone();
+        let (_, edges, edge_length) = test_section(&invalid_access, 11);
+        let access_index = (0..edge_length / 24)
+            .find(|index| matches!(invalid_access[edges + index * 24 + 8], 4 | 5))
+            .unwrap_or(usize::MAX);
+        assert_ne!(access_index, usize::MAX);
+        invalid_access[edges + access_index * 24 + 8] = 6;
+        assert_noncanonical_record(
+            &invalid_access,
+            "access",
+            edges + access_index * 24 + 8,
+            11,
+            u32::try_from(access_index).ok(),
+        );
+
+        let mut invalid_node = bytes.clone();
+        let (_, nodes, node_length) = test_section(&invalid_node, 14);
+        let node_index = (0..node_length / 56)
+            .find(|index| invalid_node[nodes + index * 56] == 7)
+            .unwrap_or(usize::MAX);
+        assert_ne!(node_index, usize::MAX);
+        invalid_node[nodes + node_index * 56] = 9;
+        assert_noncanonical_record(
+            &invalid_node,
+            "kind",
+            nodes + node_index * 56,
+            14,
+            u32::try_from(node_index).ok(),
+        );
+
+        let mut old_semantics = bytes;
+        let (_, module, _) = test_section(&old_semantics, 1);
+        put_u16_at(&mut old_semantics, module + 2, 1);
+        assert!(matches!(
+            decode_fwir(&old_semantics, &FwirDecodeLimits::default()),
+            Err(FwirDecodeError {
+                kind: FwirDecodeErrorKind::MalformedProgram(VerifyError::MalformedProgram(
+                    crate::MalformedProgram {
+                        invariant: crate::Invariant::UnsupportedVersion,
+                        ..
+                    }
+                )),
+                ..
+            })
         ));
     }
 

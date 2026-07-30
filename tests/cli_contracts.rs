@@ -588,7 +588,16 @@ fn cli_connected_completion_success_and_failure_are_transactional() {
     let success = directory.join("success.faraweave");
     fs::write(
         &success,
-        "add[10] 20\nadd[] [10 20]\nadd[10] (20 30)\nadd[10] mul[2] 20\n",
+        "add[10] 20\n\
+         add[] [10 20]\n\
+         add[10] (20 30)\n\
+         add[10] mul[2] 20\n\
+         add[10 _] 20\n\
+         add[_] [10 20]\n\
+         sub[_2 _1] [1 2]\n\
+         mul[_1 _1] (2 3)\n\
+         inc[add[1 _] 2]\n\
+         [add[1 _] 2]\n",
     )
     .expect("success source");
     let output = Command::new(binary())
@@ -597,7 +606,10 @@ fn cli_connected_completion_success_and_failure_are_transactional() {
         .output()
         .expect("run connected success");
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"30\n30\n(30 40)\n50\n");
+    assert_eq!(
+        output.stdout,
+        b"30\n30\n(30 40)\n50\n30\n30\n1\n(4 9)\n4\n[3]\n"
+    );
     assert!(output.stderr.is_empty());
     let artifact = directory.join("success.fwir");
     let compile = Command::new(binary())
@@ -618,6 +630,11 @@ fn cli_connected_completion_success_and_failure_are_transactional() {
     assert!(loaded.status.success());
     assert_eq!(loaded.stdout, output.stdout);
     assert!(loaded.stderr.is_empty());
+    let artifact_bytes = fs::read(&artifact).expect("artifact bytes");
+    assert_eq!(
+        u16::from_le_bytes([artifact_bytes[10], artifact_bytes[11]]),
+        2
+    );
 
     let failure = directory.join("failure.faraweave");
     fs::write(&failure, "1\nadd[] 1\n").expect("failure source");
@@ -636,6 +653,19 @@ fn cli_connected_completion_success_and_failure_are_transactional() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let invalid = directory.join("invalid-placeholder.faraweave");
+    fs::write(&invalid, "add[_01] 1\n").expect("invalid placeholder source");
+    let output = Command::new(binary())
+        .arg("run")
+        .arg(&invalid)
+        .output()
+        .expect("run invalid placeholder");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.ends_with(
+        b":1:5: SyntaxError: connected placeholder must be '_' or a one-based canonical '_n' form\n"
+    ));
     fs::remove_dir_all(directory).expect("cleanup");
 }
 

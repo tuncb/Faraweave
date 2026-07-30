@@ -72,7 +72,7 @@ pub fn compile_source_to_verified_program(
         .map_err(crate::lowering::CompileError::into_evaluation_error)
 }
 
-/// Compiles source and returns canonical FWIR v1.0 bytes.
+/// Compiles source and returns canonical FWIR v1 bytes at its required minor.
 ///
 /// The default logical source name is `<source>`; use
 /// [`compile_source_to_fwir_with_name`] when diagnostics need a stable name.
@@ -150,6 +150,9 @@ pub fn inspect_fwir(program: &VerifiedProgram) -> Result<String, FwirInspectErro
         ),
     )?;
     append_format(&mut output, format_args!("\n"))?;
+    for (index, feature) in raw.features.iter().enumerate() {
+        append_format(&mut output, format_args!("feature[{index}] id={feature}\n"))?;
+    }
     append_format(
         &mut output,
         format_args!(
@@ -191,6 +194,18 @@ pub fn inspect_fwir(program: &VerifiedProgram) -> Result<String, FwirInspectErro
         append_format(
             &mut output,
             format_args!("operation_reference[{index}] {reference:?}\n"),
+        )?;
+    }
+    for (index, node) in raw.nodes.iter().enumerate() {
+        append_format(&mut output, format_args!("node[{index}] {node:?}\n"))?;
+    }
+    for (index, edge) in raw.edges.iter().enumerate() {
+        append_format(&mut output, format_args!("edge[{index}] {edge:?}\n"))?;
+    }
+    for (index, ownership) in raw.ownership.iter().enumerate() {
+        append_format(
+            &mut output,
+            format_args!("ownership[{index}] {ownership:?}\n"),
         )?;
     }
     output.push_str("canonical-hex ")?;

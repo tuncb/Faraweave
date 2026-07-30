@@ -2184,6 +2184,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "compat-advisory-feature",
         "canonical-application-plans",
         "canonical-operation-references",
+        "canonical-connected-bindings",
     ]);
     let behavioral_evidence = BTreeSet::from([
         ("header.section_count", "section-count-limit"),
@@ -2238,6 +2239,11 @@ fn traceability_references_complete_executable_evidence_sets() {
             "oprf.canonical_roundtrip",
             "operation-reference-canonical-roundtrip",
         ),
+        ("binding.feature_required", "connected-binding-feature"),
+        ("binding.format_minor", "connected-binding-format-minor"),
+        ("binding.semantic_minor", "connected-binding-semantic-minor"),
+        ("binding.node_kind", "connected-binding-node-kind"),
+        ("binding.access_kind", "connected-binding-access-kind"),
         ("surfaces.source_memory_decoded", "differential-runtime"),
         (
             "surfaces.resources_faults_cleanup",
@@ -2286,6 +2292,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "node.",
         "appl.",
         "oprf.",
+        "binding.",
         "ownr.",
         "root.",
         "prod.",

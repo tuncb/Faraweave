@@ -174,6 +174,83 @@ fn connected_completion_roundtrips_as_ordinary_existing_fwir() {
 }
 
 #[test]
+fn connected_bindings_are_semantic_and_physical_1_2_and_roundtrip_exactly() {
+    let source = "parameters[x Int]\n\
+                  add[10 _] x\n\
+                  sub[_2 _1] [1 x]\n\
+                  mul[_1 _1] iota[x]\n\
+                  add[_] fanout[1 {add[_ 9]} {add[_ 19]}]\n";
+    let program = compile_source_to_verified_program(source, "connected-bindings.faraweave")
+        .expect("compile");
+    assert_eq!(program.module().semantic_major, 1);
+    assert_eq!(program.module().semantic_minor, 2);
+    assert!(
+        program
+            .as_raw()
+            .features
+            .contains(&Feature::ConnectedApplicationBindings.numeric())
+    );
+    assert_eq!(
+        program
+            .as_raw()
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::ConnectedBinding))
+            .count(),
+        4
+    );
+
+    let bytes = encode_fwir(&program, &FwirEncodeOptions::default()).expect("encode");
+    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 1);
+    assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 2);
+    let decoded = decode_fwir(&bytes, &FwirDecodeLimits::default()).expect("decode");
+    assert_eq!(
+        encode_fwir(&decoded, &FwirEncodeOptions::default()).expect("re-encode"),
+        bytes
+    );
+    let inspection = inspect_fwir(&decoded).expect("inspect bindings");
+    assert!(inspection.contains("feature["));
+    assert!(inspection.contains("id=8"));
+    assert!(inspection.contains("ConnectedBinding"));
+    assert!(inspection.contains("ConnectedBindingElement"));
+
+    let direct = evaluate_verified_program_with_arguments(
+        &program,
+        &["3"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("direct");
+    let loaded = evaluate_verified_program_with_arguments(
+        &decoded,
+        &["3"],
+        EvaluationConfiguration::default(),
+    )
+    .expect("decoded");
+    assert_eq!(direct, loaded);
+    assert_eq!(direct.formatted, ["13", "2", "(1 4 9)", "30"]);
+
+    take_events();
+    let observed_direct = evaluate_verified_program_with_observer(
+        &program,
+        &[Value::Int(3)],
+        EvaluationConfiguration::default(),
+        observe,
+    )
+    .expect("observed direct");
+    let direct_events = take_events();
+    let observed_loaded = evaluate_verified_program_with_observer(
+        &decoded,
+        &[Value::Int(3)],
+        EvaluationConfiguration::default(),
+        observe,
+    )
+    .expect("observed decoded");
+    let loaded_events = take_events();
+    assert_eq!(observed_direct, observed_loaded);
+    assert_eq!(direct_events, loaded_events);
+}
+
+#[test]
 fn line_comments_preserve_source_length_and_interpreter_result() {
     let source = "# prologue 🦀\r\ninc[# argument\n1]# eof";
     let program =

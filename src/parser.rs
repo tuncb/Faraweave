@@ -1,6 +1,6 @@
 use crate::{
-    Error, ErrorKind, ParameterErrorContext, ParameterErrorReason, ScalarType, SourceLocation,
-    SourceSpan, Value,
+    ConnectedApplicationErrorContext, ConnectedApplicationErrorReason, Error, ErrorKind,
+    ParameterErrorContext, ParameterErrorReason, ScalarType, SourceLocation, SourceSpan, Value,
 };
 
 #[derive(Clone, Debug)]
@@ -39,6 +39,12 @@ pub(crate) struct ConnectedTemplate {
     pub span: SourceSpan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectedPlaceholder {
+    Whole,
+    Element(u32),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ExprKind {
     Literal(Value),
@@ -72,6 +78,7 @@ pub(crate) enum ExprKind {
         name: String,
         name_span: SourceSpan,
     },
+    ConnectedPlaceholder(ConnectedPlaceholder),
     Placeholder,
     Fanout {
         operand: Box<Expr>,
@@ -101,6 +108,8 @@ enum TokenKind {
     LeftBrace,
     RightBrace,
     Placeholder,
+    IndexedPlaceholder,
+    InvalidPlaceholder,
     At,
     Space,
     Comment,
@@ -444,6 +453,7 @@ fn first_tuple_in_expression(expression: &Expr) -> Option<SourceLocation> {
         | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. }
+        | ExprKind::ConnectedPlaceholder(_)
         | ExprKind::Placeholder => None,
     }
 }
@@ -468,6 +478,7 @@ fn expression_contains_tuple(expression: &Expr) -> bool {
         | ExprKind::Parameter(_)
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. }
+        | ExprKind::ConnectedPlaceholder(_)
         | ExprKind::Placeholder => false,
     }
 }
@@ -543,7 +554,28 @@ fn tokenize(source: &str) -> Vec<Token> {
         if byte == b'_' {
             advance_ascii(&mut location);
             index += 1;
-            tokens.push(token(TokenKind::Placeholder, begin, location, "_", None));
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                advance_ascii(&mut location);
+                index += 1;
+            }
+            let spelling = &source[begin.offset - 1..location.offset - 1];
+            let kind = if spelling == "_" {
+                TokenKind::Placeholder
+            } else {
+                let digits = &spelling[1..];
+                if !digits.is_empty()
+                    && digits.bytes().all(|digit| digit.is_ascii_digit())
+                    && !digits.starts_with('0')
+                    && digits.parse::<u32>().is_ok()
+                {
+                    TokenKind::IndexedPlaceholder
+                } else {
+                    TokenKind::InvalidPlaceholder
+                }
+            };
+            tokens.push(token(kind, begin, location, spelling, None));
             continue;
         }
         if byte.is_ascii_uppercase() {
@@ -949,7 +981,7 @@ impl Parser {
             self.skip_inside();
         }
         let expression = self.parse_primary_expr()?;
-        if allow_newline {
+        if allow_newline && !has_immediate_connected_placeholder(&expression) {
             Ok(expression)
         } else {
             self.parse_connected_tail(expression)
@@ -1003,10 +1035,33 @@ impl Parser {
                     span: token.span,
                 })
             }
-            TokenKind::Placeholder => Err(Error::at_span(
-                ErrorKind::SyntaxError,
+            TokenKind::Placeholder => {
+                self.index += 1;
+                Ok(Expr {
+                    kind: ExprKind::ConnectedPlaceholder(ConnectedPlaceholder::Whole),
+                    span: token.span,
+                })
+            }
+            TokenKind::IndexedPlaceholder if self.branch_depth == 0 => {
+                self.index += 1;
+                let index = token.spelling[1..].parse::<u32>().map_err(|_| {
+                    connected_placeholder_syntax_error(
+                        token.span,
+                        "connected placeholder index is outside the supported range",
+                    )
+                })?;
+                Ok(Expr {
+                    kind: ExprKind::ConnectedPlaceholder(ConnectedPlaceholder::Element(index)),
+                    span: token.span,
+                })
+            }
+            TokenKind::IndexedPlaceholder => Err(connected_placeholder_syntax_error(
                 token.span,
-                "fanout token is not valid in this position",
+                "indexed placeholders are not valid in fanout branches",
+            )),
+            TokenKind::InvalidPlaceholder => Err(connected_placeholder_syntax_error(
+                token.span,
+                "connected placeholder must be '_' or a one-based canonical '_n' form",
             )),
             TokenKind::Invalid => Err(Error::at_span(
                 ErrorKind::InvalidByte,
@@ -1578,6 +1633,31 @@ fn token_scalar_type(kind: TokenKind) -> Option<ScalarType> {
     }
 }
 
+fn has_immediate_connected_placeholder(expression: &Expr) -> bool {
+    matches!(
+        &expression.kind,
+        ExprKind::Call {
+            syntax: CallSyntax::Direct,
+            arguments,
+            ..
+        } if arguments
+            .iter()
+            .any(|argument| matches!(argument.kind, ExprKind::ConnectedPlaceholder(_)))
+    )
+}
+
+fn connected_placeholder_syntax_error(span: SourceSpan, message: &'static str) -> Error {
+    let mut error = Error::at_span(ErrorKind::SyntaxError, span, message);
+    error.connected_application = Some(ConnectedApplicationErrorContext {
+        reason: ConnectedApplicationErrorReason::InvalidPlaceholder,
+        template_arity: 0,
+        supplied_width: 0,
+        template_span: span,
+        operand_span: span,
+    });
+    error
+}
+
 fn is_horizontal_trivia(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Space | TokenKind::Comment)
 }
@@ -1703,6 +1783,7 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
                 first.get_or_insert(current.span);
                 owned_position |= owned;
             }
+            ExprKind::ConnectedPlaceholder(_) => {}
             ExprKind::Tuple(elements) => {
                 pending.extend(elements.iter().rev().map(|element| (element, true)));
             }
@@ -1846,9 +1927,41 @@ mod tests {
                 .iter()
                 .all(|root| { !matches!(root.kind, ExprKind::Connected { .. }) })
         );
-        let error = parse("add[_] 20").expect_err("placeholder remains fanout-only");
-        assert_eq!(error.kind, ErrorKind::SyntaxError);
-        assert_eq!(error.location.column, 5);
+        let explicit = parse("add[_] 20\ninc[add[1 _] 2]\n[add[1 _] 2]\n")
+            .expect("explicit placeholders disambiguate connected siblings");
+        assert!(matches!(explicit.roots[0].kind, ExprKind::Connected { .. }));
+        let ExprKind::Call { arguments, .. } = &explicit.roots[1].kind else {
+            panic!("outer call");
+        };
+        assert!(matches!(arguments[0].kind, ExprKind::Connected { .. }));
+        let ExprKind::Tuple(elements) = &explicit.roots[2].kind else {
+            panic!("outer tuple");
+        };
+        assert!(matches!(elements[0].kind, ExprKind::Connected { .. }));
+    }
+
+    #[test]
+    fn connected_placeholder_tokens_are_canonical_and_contextual() {
+        let parsed = parse("sub[_2 _1] [1 2]\n").expect("indexed placeholders");
+        let ExprKind::Connected { templates, .. } = &parsed.roots[0].kind else {
+            panic!("connected");
+        };
+        assert!(matches!(
+            templates[0].arguments[0].kind,
+            ExprKind::ConnectedPlaceholder(ConnectedPlaceholder::Element(2))
+        ));
+        for source in ["add[_0] 1", "add[_01] 1", "add[_4294967296] 1", "add[_x] 1"] {
+            let error = parse(source).expect_err(source);
+            assert_eq!(error.kind, ErrorKind::SyntaxError, "{source}");
+            assert_eq!(
+                error
+                    .connected_application
+                    .as_ref()
+                    .map(|context| context.reason),
+                Some(ConnectedApplicationErrorReason::InvalidPlaceholder),
+                "{source}"
+            );
+        }
     }
 
     #[test]

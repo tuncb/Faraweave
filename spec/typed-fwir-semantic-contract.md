@@ -171,6 +171,10 @@ Semantic minor 1 adds mandatory feature `ApplicationPlans` (numeric ID 5) for
 container-wide signatures. Its registry and typed-program rules are normative
 in [the container-wide application-plan contract](container-wide-application-plans.md);
 semantic 1.0 programs retain their previous feature set and behavior.
+Semantic minor 2 adds mandatory feature
+`8=ConnectedApplicationBindings`. It is present exactly when a
+`ConnectedBinding` node or binding-only access is required; older semantic
+minors reject those records and a 1.2 module rejects a superfluous feature 8.
 
 ## 6. Nodes, edges, and evaluation order (`FWIR-SEM-006`)
 
@@ -182,6 +186,7 @@ The abstract node kinds needed by the current language are:
 | ParameterBorrow | Borrow one already bound parameter slot. |
 | TupleConstruct | Evaluate ordered children and construct one structural tuple. |
 | SelectedApply | Apply a lowering-selected primitive signature and implementation to explicit semantic operands, with an optional verified operation-reference link for a declared higher-order consumer. |
+| ConnectedBinding | Consume one connected operand after authored template nodes, retain its type/cardinality/owner once, and expose immutable binding-only accesses to exactly one SelectedApply. |
 | FanOut | Evaluate one operand once, execute ordered branch regions with an explicit operand borrow, and produce one tuple. |
 
 Prefix-spread preparation may be represented as an explicit node or as
@@ -196,6 +201,8 @@ Edges have one of these semantic value accesses:
 WholeValue
 TupleElement(index)
 FanOutOperandBorrow
+ConnectedBindingWhole
+ConnectedBindingElement(index)
 ```
 
 and one of these ownership modes:
@@ -436,6 +443,24 @@ so placeholder-free forms such as `inc[add[1] 2]` and `[add[1] 2]` retain
 their legacy arity interpretation. Completion never produces a callable
 partial value, never recognizes `_` or `_n`, never crosses a root or newline,
 and does not introduce generic sibling-partition search.
+
+### Explicit connected placeholders
+
+If a connected template contains `_` or `_n`, automatic completion is disabled
+and those immediate slots fully describe operand use. `_` borrows a non-tuple
+operand whole or expands exactly one immediate tuple level; `_n` selects a
+one-based immediate tuple element, while `_1` selects a non-tuple whole.
+Indexes may repeat or reorder, but `_0`, leading zeros, overflow, out-of-range
+selection, nested placement, missing operands, and empty tuple operands are
+structured static failures.
+
+All non-placeholder template expressions execute left-to-right before the
+operand. Lowering then emits one `ConnectedBinding`, consumes the operand once,
+and gives the selected call immutable `ConnectedBindingWhole` or
+`ConnectedBindingElement` edges; repeated edges do not clone, recharge,
+reevaluate, or independently release the operand. The verifier iteratively
+requires each binding to have one input, one selected-call owner, one release,
+and no aggregate escape, cross-call edge, cycle, or second owner.
 
 ## 10. Tuple construction and ownership (`FWIR-SEM-010`)
 
@@ -725,6 +750,7 @@ Every current parser expression maps without preserving parser-only variants:
 | Direct Call | `SelectedApply` with one semantic edge per source argument. |
 | Prefix Call | `SelectedApply` with one direct edge or explicit one-level tuple-element borrow edges. |
 | Placeholder-free connected chain | Iteratively expanded ordinary `SelectedApply` nodes with authored immediate-tuple elements inserted as ordinary edges; no connected node survives. |
+| Explicit-placeholder connected chain | One `ConnectedBinding` per placeholder-bearing template plus binding-only whole/element edges into its statically selected `SelectedApply`. |
 | Placeholder | One `FanOutOperandBorrow` edge in its validated branch region. |
 | Fanout | `FanOut` with operand, preadmission, branch regions/roots, transfers, result type, and releases. |
 | UnresolvedName | Source resolution failure; never valid FWIR. |

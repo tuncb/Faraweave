@@ -1,6 +1,7 @@
 use crate::parser::parse;
 use crate::parser::{
-    CallSyntax, ConnectedTemplate, Expr, ExprKind, Program, validate_parameter_declarations,
+    CallSyntax, ConnectedPlaceholder, ConnectedTemplate, Expr, ExprKind, Program,
+    validate_parameter_declarations,
 };
 use crate::primitive::resolve_names;
 use crate::semantic_registry::{
@@ -105,6 +106,7 @@ struct Lowerer {
     needs_application_plans: bool,
     needs_operation_references: bool,
     needs_backend_native_math: bool,
+    needs_connected_bindings: bool,
     placeholder: Option<Lowered>,
     releases: Vec<Option<ReleaseAfter>>,
     first_shape_error: Option<Error>,
@@ -308,6 +310,7 @@ fn validate_operation_reference_positions(program: &Program) -> Result<(), Lower
             | ExprKind::UnaryChain { .. }
             | ExprKind::Parameter(_)
             | ExprKind::UnresolvedName { .. }
+            | ExprKind::ConnectedPlaceholder(_)
             | ExprKind::Placeholder => {}
         }
     }
@@ -341,8 +344,33 @@ fn validate_expr_arities(
             arguments,
             ..
         } => {
+            if let Some(placeholder) = arguments
+                .iter()
+                .find(|argument| matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)))
+            {
+                return Err(connected_placeholder_error(
+                    ConnectedApplicationErrorReason::MissingOperand,
+                    placeholder.span,
+                    expression.span,
+                    placeholder.span,
+                    arguments.len(),
+                    0,
+                    "connected placeholder template requires an adjacent operand",
+                ));
+            }
             let mut spread_width = None;
             for argument in arguments {
+                if let Some(span) = first_unbound_connected_placeholder(argument)? {
+                    return Err(connected_placeholder_error(
+                        ConnectedApplicationErrorReason::NestedPlaceholder,
+                        span,
+                        expression.span,
+                        span,
+                        arguments.len(),
+                        0,
+                        "connected placeholders must be immediate template argument slots",
+                    ));
+                }
                 let value = validate_expr_arities(argument, placeholder, deferred_connected_error)?;
                 if arguments.len() == 1 {
                     spread_width = match value {
@@ -362,12 +390,97 @@ fn validate_expr_arities(
         ExprKind::Connected { templates, operand } => {
             for template in templates {
                 for argument in &template.arguments {
+                    if matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)) {
+                        continue;
+                    }
+                    if let Some(span) = first_unbound_connected_placeholder(argument)? {
+                        return Err(connected_placeholder_error(
+                            ConnectedApplicationErrorReason::NestedPlaceholder,
+                            span,
+                            template.span,
+                            operand.span,
+                            template.arguments.len(),
+                            0,
+                            "connected placeholders must be immediate template argument slots",
+                        ));
+                    }
                     let _ = validate_expr_arities(argument, placeholder, deferred_connected_error)?;
                 }
             }
             let operand_value =
                 validate_expr_arities(operand, placeholder, deferred_connected_error)?;
             for (index, template) in templates.iter().enumerate().rev() {
+                let connected_placeholder_count = template
+                    .arguments
+                    .iter()
+                    .filter(|argument| matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)))
+                    .count();
+                if connected_placeholder_count != 0 {
+                    let selected_operand = if index + 1 == templates.len() {
+                        operand_value
+                    } else {
+                        StructuralValue::NonTuple
+                    };
+                    let width = match selected_operand {
+                        StructuralValue::NonTuple => 1,
+                        StructuralValue::Tuple(width) => width,
+                    };
+                    if width == 0 {
+                        return Err(connected_placeholder_error(
+                            ConnectedApplicationErrorReason::EmptyTupleOperand,
+                            operand.span,
+                            template.span,
+                            operand.span,
+                            template.arguments.len(),
+                            0,
+                            "connected placeholder operand cannot be an empty tuple",
+                        ));
+                    }
+                    let mut effective_arity = template
+                        .arguments
+                        .len()
+                        .checked_sub(connected_placeholder_count)
+                        .ok_or(LowerError::Build(BuildError::CountOverflow {
+                            arena: crate::Arena::Edge,
+                        }))?;
+                    for argument in &template.arguments {
+                        let ExprKind::ConnectedPlaceholder(connected_placeholder) = &argument.kind
+                        else {
+                            continue;
+                        };
+                        let supplied = match *connected_placeholder {
+                            ConnectedPlaceholder::Whole => match selected_operand {
+                                StructuralValue::NonTuple => 1,
+                                StructuralValue::Tuple(tuple_width) => tuple_width,
+                            },
+                            ConnectedPlaceholder::Element(element) => {
+                                if usize::try_from(element)
+                                    .ok()
+                                    .is_none_or(|element| element == 0 || element > width)
+                                {
+                                    return Err(connected_placeholder_error(
+                                        ConnectedApplicationErrorReason::PlaceholderIndexOutOfRange,
+                                        argument.span,
+                                        template.span,
+                                        operand.span,
+                                        template.arguments.len(),
+                                        width,
+                                        "connected placeholder index is outside the operand",
+                                    ));
+                                }
+                                1
+                            }
+                        };
+                        effective_arity =
+                            effective_arity
+                                .checked_add(supplied)
+                                .ok_or(LowerError::Build(BuildError::CountOverflow {
+                                    arena: crate::Arena::Edge,
+                                }))?;
+                    }
+                    validate_arity(&template.name, effective_arity, template.span.begin)?;
+                    continue;
+                }
                 let final_template = index + 1 == templates.len();
                 let (supplied_width, runtime_tuple, operand_span) = if final_template {
                     match &operand.kind {
@@ -433,6 +546,15 @@ fn validate_expr_arities(
                 "placeholder has no fanout operand",
             ))
         }),
+        ExprKind::ConnectedPlaceholder(_) => Err(connected_placeholder_error(
+            ConnectedApplicationErrorReason::PlaceholderOutsideTemplate,
+            expression.span,
+            expression.span,
+            expression.span,
+            0,
+            0,
+            "connected placeholder is not an immediate slot of a connected template",
+        )),
         ExprKind::Literal(_)
         | ExprKind::Vector(_, _)
         | ExprKind::DeepTuple { .. }
@@ -440,6 +562,77 @@ fn validate_expr_arities(
         | ExprKind::OperationReference { .. }
         | ExprKind::UnresolvedName { .. } => Ok(StructuralValue::NonTuple),
     }
+}
+
+fn first_unbound_connected_placeholder(
+    expression: &Expr,
+) -> Result<Option<SourceSpan>, LowerError> {
+    let mut pending = Vec::new();
+    pending.try_reserve(1).map_err(|_| {
+        LowerError::Build(BuildError::AllocationUnavailable {
+            arena: crate::Arena::Node,
+        })
+    })?;
+    pending.push(expression);
+    while let Some(current) = pending.pop() {
+        match &current.kind {
+            ExprKind::ConnectedPlaceholder(_) => return Ok(Some(current.span)),
+            ExprKind::Call { arguments, .. } | ExprKind::Tuple(arguments) => {
+                pending.try_reserve(arguments.len()).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(arguments.iter().rev());
+            }
+            // A nested connected application owns and validates its placeholders.
+            ExprKind::Connected { .. } => {}
+            ExprKind::Fanout { operand, branches } => {
+                let additional = branches.len().checked_add(1).ok_or(LowerError::Build(
+                    BuildError::CountOverflow {
+                        arena: crate::Arena::Node,
+                    },
+                ))?;
+                pending.try_reserve(additional).map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+                pending.extend(branches.iter().rev());
+                pending.push(operand);
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Vector(_, _)
+            | ExprKind::DeepTuple { .. }
+            | ExprKind::UnaryChain { .. }
+            | ExprKind::Parameter(_)
+            | ExprKind::OperationReference { .. }
+            | ExprKind::UnresolvedName { .. }
+            | ExprKind::Placeholder => {}
+        }
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connected_placeholder_error(
+    reason: ConnectedApplicationErrorReason,
+    primary_span: SourceSpan,
+    template_span: SourceSpan,
+    operand_span: SourceSpan,
+    template_arity: usize,
+    supplied_width: usize,
+    message: &'static str,
+) -> LowerError {
+    let mut error = Error::at_span(ErrorKind::SyntaxError, primary_span, message);
+    error.connected_application = Some(ConnectedApplicationErrorContext {
+        reason,
+        template_arity,
+        supplied_width,
+        template_span,
+        operand_span,
+    });
+    LowerError::Source(error)
 }
 
 fn validate_arity(name: &str, actual: usize, location: SourceLocation) -> Result<(), LowerError> {
@@ -745,6 +938,7 @@ fn lower_program_with_builder_and_diagnostics(
         needs_application_plans: false,
         needs_operation_references: false,
         needs_backend_native_math: false,
+        needs_connected_bindings: false,
         placeholder: None,
         releases: Vec::new(),
         first_shape_error: None,
@@ -856,6 +1050,12 @@ fn lower_program_with_builder_and_diagnostics(
         lowerer
             .builder
             .push_feature(Feature::BackendNativeMathV1.numeric())?;
+    }
+    if lowerer.needs_connected_bindings {
+        lowerer.builder.set_semantic_minor(2);
+        lowerer
+            .builder
+            .push_feature(Feature::ConnectedApplicationBindings.numeric())?;
     }
     Ok(lowerer.builder.finish()?.verify()?)
 }
@@ -1408,25 +1608,75 @@ impl Lowerer {
             lowered_templates.push(arguments);
         }
 
-        let supplied_expressions: &[Expr] = match &operand.kind {
-            ExprKind::Tuple(elements) => elements,
-            _ => std::slice::from_ref(operand),
-        };
         let mut supplied = Vec::new();
-        supplied
-            .try_reserve_exact(supplied_expressions.len())
-            .map_err(|_| {
-                LowerError::Build(BuildError::AllocationUnavailable {
-                    arena: crate::Arena::Node,
-                })
-            })?;
-        for supplied_expression in supplied_expressions {
-            supplied.push(self.lower_authored_call_operand(supplied_expression)?);
+        let final_has_placeholders = templates.last().is_some_and(|template| {
+            template
+                .arguments
+                .iter()
+                .any(|argument| matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)))
+        });
+        let mut placeholder_operand = None;
+        if final_has_placeholders {
+            let AuthoredCallOperand::Value(lowered_operand) =
+                self.lower_authored_call_operand(operand)?
+            else {
+                return Err(LowerError::Source(Error::at_span(
+                    ErrorKind::SyntaxError,
+                    operand.span,
+                    "connected operand must produce a value",
+                )));
+            };
+            placeholder_operand = Some(lowered_operand);
+        } else {
+            let supplied_expressions: &[Expr] = match &operand.kind {
+                ExprKind::Tuple(elements) => elements,
+                _ => std::slice::from_ref(operand),
+            };
+            supplied
+                .try_reserve_exact(supplied_expressions.len())
+                .map_err(|_| {
+                    LowerError::Build(BuildError::AllocationUnavailable {
+                        arena: crate::Arena::Node,
+                    })
+                })?;
+            for supplied_expression in supplied_expressions {
+                supplied.push(self.lower_authored_call_operand(supplied_expression)?);
+            }
         }
 
         let mut current = None;
         for index in (0..templates.len()).rev() {
             let mut arguments = std::mem::take(&mut lowered_templates[index]);
+            let has_placeholders = templates[index]
+                .arguments
+                .iter()
+                .any(|argument| matches!(&argument.kind, ExprKind::ConnectedPlaceholder(_)));
+            if has_placeholders {
+                let selected_operand = if index + 1 == templates.len() {
+                    placeholder_operand.take()
+                } else {
+                    current.take()
+                }
+                .ok_or_else(|| {
+                    LowerError::Source(Error::at_span(
+                        ErrorKind::TypeError,
+                        expression.span,
+                        "connected placeholder application has no operand",
+                    ))
+                })?;
+                let binding = self.lower_connected_binding(selected_operand)?;
+                arguments = self.expand_connected_placeholders(arguments, &binding)?;
+                let applied = self.lower_connected_selected_call(
+                    &templates[index].name,
+                    primitive_origins[index],
+                    call_origins[index],
+                    templates[index].span.begin,
+                    arguments,
+                )?;
+                self.set_release(binding.node, ReleaseAfter::Node(applied.node))?;
+                current = Some(applied);
+                continue;
+            }
             if index + 1 == templates.len() {
                 arguments.append(&mut supplied);
             } else {
@@ -1461,10 +1711,158 @@ impl Lowerer {
         })
     }
 
+    fn lower_connected_binding(&mut self, operand: Lowered) -> Result<Lowered, LowerError> {
+        let edge_start = self.builder.finish_preview_edges()?;
+        self.builder.push_edge(Edge {
+            producer: operand.node,
+            argument_position: 1,
+            access: operand.access,
+            cardinality: operand.cardinality,
+            conversion: crate::Conversion::Identity,
+            ownership: if operand.borrowed {
+                OwnershipMode::ImmutableBorrow
+            } else {
+                OwnershipMode::InfallibleTransfer
+            },
+            origin: operand.origin,
+        })?;
+        let node = self.builder.push_node(Node {
+            kind: NodeKind::ConnectedBinding,
+            result_type: operand.result_type,
+            cardinality: operand.cardinality,
+            edges: IndexRange {
+                start: edge_start,
+                count: 1,
+            },
+            origin: operand.origin,
+        })?;
+        self.register_node(node)?;
+        if !operand.borrowed {
+            self.set_release(operand.node, ReleaseAfter::Node(node))?;
+        }
+        self.needs_connected_bindings = true;
+        Ok(Lowered {
+            node,
+            result_type: operand.result_type,
+            cardinality: operand.cardinality,
+            origin: operand.origin,
+            location: operand.location,
+            borrowed: false,
+            value_type: operand.value_type,
+            tuple_elements: operand.tuple_elements,
+            access: ValueAccess::WholeValue,
+        })
+    }
+
+    fn expand_connected_placeholders<'a>(
+        &mut self,
+        arguments: Vec<AuthoredCallOperand<'a>>,
+        binding: &Lowered,
+    ) -> Result<Vec<AuthoredCallOperand<'a>>, LowerError> {
+        let mut expanded = Vec::new();
+        expanded.try_reserve(arguments.len()).map_err(|_| {
+            LowerError::Build(BuildError::AllocationUnavailable {
+                arena: crate::Arena::Edge,
+            })
+        })?;
+        for argument in arguments {
+            let AuthoredCallOperand::Placeholder {
+                placeholder,
+                origin,
+                location,
+            } = argument
+            else {
+                expanded.push(argument);
+                continue;
+            };
+            match placeholder {
+                ConnectedPlaceholder::Whole if !binding.tuple_elements.is_empty() => {
+                    expanded
+                        .try_reserve(binding.tuple_elements.len())
+                        .map_err(|_| {
+                            LowerError::Build(BuildError::AllocationUnavailable {
+                                arena: crate::Arena::Edge,
+                            })
+                        })?;
+                    for (element, metadata) in binding.tuple_elements.iter().enumerate() {
+                        expanded.push(AuthoredCallOperand::Bound(
+                            CallOperand::ConnectedBindingElement {
+                                binding: binding.node,
+                                element: u32::try_from(element).map_err(|_| {
+                                    LowerError::Build(BuildError::CountOverflow {
+                                        arena: crate::Arena::Edge,
+                                    })
+                                })?,
+                                metadata: try_clone_tuple_element(metadata, origin, location)?,
+                            },
+                        ));
+                    }
+                }
+                ConnectedPlaceholder::Whole => {
+                    expanded.push(AuthoredCallOperand::Bound(CallOperand::Whole(
+                        connected_binding_whole(
+                            binding,
+                            ValueAccess::ConnectedBindingWhole,
+                            origin,
+                            location,
+                        )?,
+                    )));
+                }
+                ConnectedPlaceholder::Element(one_based)
+                    if binding.tuple_elements.is_empty() && one_based == 1 =>
+                {
+                    expanded.push(AuthoredCallOperand::Bound(CallOperand::Whole(
+                        connected_binding_whole(
+                            binding,
+                            ValueAccess::ConnectedBindingElement(0),
+                            origin,
+                            location,
+                        )?,
+                    )));
+                }
+                ConnectedPlaceholder::Element(one_based) => {
+                    let zero_based = one_based.checked_sub(1).ok_or_else(|| {
+                        LowerError::Source(Error::new(
+                            ErrorKind::SyntaxError,
+                            location,
+                            "connected placeholder index must be one-based",
+                        ))
+                    })?;
+                    let metadata =
+                        binding
+                            .tuple_elements
+                            .get(zero_based as usize)
+                            .ok_or_else(|| {
+                                LowerError::Source(Error::new(
+                                    ErrorKind::TypeError,
+                                    location,
+                                    "connected placeholder index is outside the operand",
+                                ))
+                            })?;
+                    expanded.push(AuthoredCallOperand::Bound(
+                        CallOperand::ConnectedBindingElement {
+                            binding: binding.node,
+                            element: zero_based,
+                            metadata: try_clone_tuple_element(metadata, origin, location)?,
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(expanded)
+    }
+
     fn lower_authored_call_operand<'a>(
         &mut self,
         expression: &'a Expr,
     ) -> Result<AuthoredCallOperand<'a>, LowerError> {
+        if let ExprKind::ConnectedPlaceholder(placeholder) = &expression.kind {
+            return Ok(AuthoredCallOperand::Placeholder {
+                placeholder: *placeholder,
+                origin: self.push_origin(expression.span)?,
+                location: expression.span.begin,
+            });
+        }
         if let ExprKind::OperationReference { name, name_span } = &expression.kind {
             return Ok(AuthoredCallOperand::OperationReference {
                 name,
@@ -1506,20 +1904,13 @@ impl Lowerer {
                     "connected filter argument 1 must be an operation reference",
                 )));
             };
-            let AuthoredCallOperand::Value(vector) = vector else {
-                return Err(LowerError::Source(Error::new(
-                    ErrorKind::TypeError,
-                    location,
-                    "connected filter vector cannot be an operation reference",
-                )));
-            };
             let mut operands = Vec::new();
             operands.try_reserve_exact(1).map_err(|_| {
                 LowerError::Build(BuildError::AllocationUnavailable {
                     arena: crate::Arena::Edge,
                 })
             })?;
-            operands.push(CallOperand::Whole(vector));
+            operands.push(authored_value_operand(vector, location)?);
             return self.lower_selected_call(
                 name,
                 primitive_origin,
@@ -1555,23 +1946,14 @@ impl Lowerer {
                     "connected reducer argument 1 must be an operation reference",
                 )));
             };
-            let (AuthoredCallOperand::Value(initializer), AuthoredCallOperand::Value(vector)) =
-                (initializer, vector)
-            else {
-                return Err(LowerError::Source(Error::new(
-                    ErrorKind::TypeError,
-                    location,
-                    "connected reducer value arguments cannot be operation references",
-                )));
-            };
             let mut operands = Vec::new();
             operands.try_reserve_exact(2).map_err(|_| {
                 LowerError::Build(BuildError::AllocationUnavailable {
                     arena: crate::Arena::Edge,
                 })
             })?;
-            operands.push(CallOperand::Whole(initializer));
-            operands.push(CallOperand::Whole(vector));
+            operands.push(authored_value_operand(initializer, location)?);
+            operands.push(authored_value_operand(vector, location)?);
             return self.lower_selected_call(
                 name,
                 primitive_origin,
@@ -1589,14 +1971,7 @@ impl Lowerer {
             })
         })?;
         for argument in arguments {
-            let AuthoredCallOperand::Value(value) = argument else {
-                return Err(LowerError::Source(Error::new(
-                    ErrorKind::SyntaxError,
-                    location,
-                    "operation reference is not accepted by this connected application",
-                )));
-            };
-            operands.push(CallOperand::Whole(value));
+            operands.push(authored_value_operand(argument, location)?);
         }
         self.lower_selected_call(name, primitive_origin, origin, location, operands, None)
     }
@@ -2369,6 +2744,12 @@ impl Lowerer {
 
 enum AuthoredCallOperand<'a> {
     Value(Lowered),
+    Bound(CallOperand),
+    Placeholder {
+        placeholder: ConnectedPlaceholder,
+        origin: OriginIndex,
+        location: SourceLocation,
+    },
     OperationReference {
         name: &'a str,
         name_span: SourceSpan,
@@ -2376,10 +2757,35 @@ enum AuthoredCallOperand<'a> {
     },
 }
 
+fn authored_value_operand(
+    argument: AuthoredCallOperand<'_>,
+    location: SourceLocation,
+) -> Result<CallOperand, LowerError> {
+    match argument {
+        AuthoredCallOperand::Value(value) => Ok(CallOperand::Whole(value)),
+        AuthoredCallOperand::Bound(operand) => Ok(operand),
+        AuthoredCallOperand::OperationReference { .. } => Err(LowerError::Source(Error::new(
+            ErrorKind::SyntaxError,
+            location,
+            "operation reference is not accepted by this connected application",
+        ))),
+        AuthoredCallOperand::Placeholder { .. } => Err(LowerError::Source(Error::new(
+            ErrorKind::SyntaxError,
+            location,
+            "connected placeholder was not bound",
+        ))),
+    }
+}
+
 enum CallOperand {
     Whole(Lowered),
     TupleElement {
         prepare: NodeIndex,
+        element: u32,
+        metadata: TupleElement,
+    },
+    ConnectedBindingElement {
+        binding: NodeIndex,
         element: u32,
         metadata: TupleElement,
     },
@@ -2414,6 +2820,19 @@ impl CallOperand {
             } => (
                 *prepare,
                 ValueAccess::TupleElement(*element),
+                &metadata.value_type,
+                metadata.cardinality,
+                metadata.origin,
+                true,
+                metadata.location,
+            ),
+            Self::ConnectedBindingElement {
+                binding,
+                element,
+                metadata,
+            } => (
+                *binding,
+                ValueAccess::ConnectedBindingElement(*element),
                 &metadata.value_type,
                 metadata.cardinality,
                 metadata.origin,
@@ -2847,9 +3266,42 @@ fn try_clone_lowered(lowered: &Lowered) -> Result<Lowered, LowerError> {
     })
 }
 
+fn connected_binding_whole(
+    binding: &Lowered,
+    access: ValueAccess,
+    origin: OriginIndex,
+    location: SourceLocation,
+) -> Result<Lowered, LowerError> {
+    Ok(Lowered {
+        node: binding.node,
+        result_type: binding.result_type,
+        cardinality: binding.cardinality,
+        origin,
+        location,
+        borrowed: true,
+        value_type: try_clone_type(&binding.value_type)?,
+        tuple_elements: Vec::new(),
+        access,
+    })
+}
+
+fn try_clone_tuple_element(
+    metadata: &TupleElement,
+    origin: OriginIndex,
+    location: SourceLocation,
+) -> Result<TupleElement, LowerError> {
+    Ok(TupleElement {
+        value_type: try_clone_type(&metadata.value_type)?,
+        cardinality: metadata.cardinality,
+        origin,
+        location,
+    })
+}
+
 fn placeholder_span(expression: &Expr) -> Option<SourceSpan> {
     match &expression.kind {
         ExprKind::Placeholder => Some(expression.span),
+        ExprKind::ConnectedPlaceholder(_) => None,
         ExprKind::Call { arguments, .. } | ExprKind::Tuple(arguments) => {
             arguments.iter().find_map(placeholder_span)
         }
