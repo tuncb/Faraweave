@@ -871,6 +871,7 @@ fn encode_sections(
             NodeKind::Format {
                 template,
                 template_origin,
+                keyword_origin,
             } => {
                 let template = raw.string_values.get(template.0 as usize).ok_or(
                     FwirEncodeError::CountOverflow {
@@ -884,7 +885,7 @@ fn encode_sections(
                     [
                         string_index(strings, template)?,
                         template_origin.0,
-                        0,
+                        keyword_origin.0,
                         0,
                         0,
                         0,

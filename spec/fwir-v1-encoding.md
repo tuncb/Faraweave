@@ -231,17 +231,17 @@ outside SelectedApply.
   `4=ContainerScalar` and `5=ContainerVector` only under feature 5.
 - FanOut: `a0=branch_start`, `a1=branch_count`,
   `a2=keyword_origin`; `a3` through `a7` are zero.
-- Format: `a0=template_string`, `a1=template_origin`; `a2` through `a7`
-  are zero. The template is a canonical physical `STRS` index, not an
-  in-memory String-value-arena index.
+- Format: `a0=template_string`, `a1=template_origin`, and
+  `a2=keyword_origin`; `a3` through `a7` are zero. The template is a canonical
+  physical `STRS` index, not an in-memory String-value-arena index.
 
 `OWNR` is `owner:u32, release_kind:u8, reserved[3], release_index:u32`.
 Release kind is `1=Node` or `2=Root`. Before physical minor 5, `ROOT` is
 `node:u32, origin:u32` and reconstructs canonical-value presentation. From
 physical minor 5, `ROOT` is `node:u32, origin:u32, presentation:u8,
 reserved[3]`, where presentation is `1=CanonicalValue` or `2=RawString` and
-all reserved bytes are zero. RawString requires a scalar String result and
-feature 11.
+all reserved bytes are zero. RawString requires a scalar String result from a
+Format node and feature 11.
 
 `APPL` is present exactly when feature 5 is present and at least one
 SelectedApply exists. Each record is `node:u32, application_plan_id:u16,

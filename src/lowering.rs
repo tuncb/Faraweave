@@ -2203,9 +2203,11 @@ impl Lowerer {
                 origin,
                 expression.span.begin,
             ),
-            ExprKind::Format { arguments, .. } => {
-                self.lower_format(arguments, origin, expression.span.begin)
-            }
+            ExprKind::Format {
+                arguments,
+                keyword_span,
+                ..
+            } => self.lower_format(arguments, *keyword_span, origin, expression.span.begin),
             ExprKind::Connected { templates, operand } => {
                 self.lower_connected(expression, templates, operand, origin)
             }
@@ -2285,6 +2287,7 @@ impl Lowerer {
     fn lower_format(
         &mut self,
         arguments: &[Expr],
+        keyword_span: SourceSpan,
         origin: OriginIndex,
         location: SourceLocation,
     ) -> Result<Lowered, LowerError> {
@@ -2303,6 +2306,7 @@ impl Lowerer {
             )));
         };
         let template_origin = self.push_origin(template_expression.span)?;
+        let keyword_origin = self.push_origin(keyword_span)?;
         let template = self
             .builder
             .push_string_value(try_clone_string(template, crate::Arena::StringValue)?)?;
@@ -2349,6 +2353,7 @@ impl Lowerer {
             kind: NodeKind::Format {
                 template,
                 template_origin,
+                keyword_origin,
             },
             result_type,
             cardinality: Some(Cardinality::StaticScalar),
@@ -4620,10 +4625,18 @@ mod tests {
         let raw = program.as_raw();
         assert_eq!(raw.module.semantic_minor, 5);
         assert!(raw.features.contains(&Feature::ValueFormatting.numeric()));
-        assert!(matches!(
-            raw.nodes.last().map(|node| node.kind),
-            Some(NodeKind::Format { .. })
-        ));
+        let Some(NodeKind::Format {
+            template_origin,
+            keyword_origin,
+            ..
+        }) = raw.nodes.last().map(|node| node.kind)
+        else {
+            panic!("missing Format node");
+        };
+        assert_eq!(raw.origins[keyword_origin.0 as usize].span.begin.offset, 1);
+        assert_eq!(raw.origins[keyword_origin.0 as usize].span.end.offset, 7);
+        assert_eq!(raw.origins[template_origin.0 as usize].span.begin.offset, 8);
+        assert_eq!(raw.origins[template_origin.0 as usize].span.end.offset, 12);
         assert_eq!(raw.roots[0].presentation, RootPresentation::RawString);
     }
 
@@ -6192,7 +6205,7 @@ mod tests {
              format[\"{}\" x]\n\
              printf[\"{}\" \"raw\"]\n",
         );
-        assert_eq!(debug_digest(&matrix), 11_623_015_216_813_318_305);
+        assert_eq!(debug_digest(&matrix), 7_959_043_191_995_543_726);
 
         let depth = 256;
         let mut deep = String::new();

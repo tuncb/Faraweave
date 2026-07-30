@@ -92,7 +92,8 @@ Roots execute in table order. A successful program returns the complete ordered
 root sequence; a root failure releases the already completed root prefix in
 reverse order and returns no partial program result. A canonical root uses the
 canonical value spelling and a trailing newline; a raw root must be a scalar
-String and contributes its payload bytes without an implicit newline.
+String produced by a `Format` node and contributes its payload bytes without
+an implicit newline.
 Publication happens only after all roots execute and present successfully.
 
 ## 4. Types, values, and cardinality (`FWIR-SEM-004`)
@@ -225,11 +226,14 @@ the same owner, element order, origins, and releases. Fan-out branch regions,
 placeholder sites, and the final result structure must be explicit rather than
 reconstructed from source syntax.
 
-`Format` stores a UTF-8 template and its authored literal origin. Templates
-contain only literal bytes, `{}` placeholders, and the brace escapes `{{` and
-`}}`; malformed braces or a placeholder/input-count mismatch are static source
-errors at the literal. Interpolation inputs execute exactly once from left to
-right. A scalar String input contributes its raw payload, while every other
+`Format` stores a UTF-8 template plus distinct authored keyword and literal
+origins. Templates contain only literal bytes, `{}` placeholders, and the brace
+escapes `{{` and `}}`; malformed braces or a placeholder/input-count mismatch
+are static source errors at the literal. Interpolation inputs execute exactly
+once from left to right. Each edge consumes one whole value through
+`WholeValue`, `BindingBorrowWhole`, `ConnectedBindingWhole`, or
+`FanOutOperandBorrow`; tuple, binding, and connected element accesses are
+invalid. A scalar String input contributes its raw payload, while every other
 value uses the canonical scalar/vector/tuple spelling.
 
 After every input completes, formatting first measures the complete UTF-8
@@ -238,7 +242,8 @@ bytes and work both equal that result length, using producer `format`.
 Rendering performs one fallible result allocation after admission; refusal or
 render failure publishes nothing and releases inputs in reverse ownership
 order. Implementations must measure and render nested values iteratively and
-must produce byte-identical results in both passes.
+must produce byte-identical results in both passes. An empty result makes one
+zero-byte, zero-work admission with no allocation ordinal or live charge.
 
 Edges have one of these semantic value accesses:
 

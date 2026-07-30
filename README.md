@@ -294,7 +294,8 @@ only as a program root. It publishes the resulting bytes without adding a
 newline; ordinary roots, including a root `format[...]`, retain canonical
 value presentation and a trailing newline. All roots execute and format before
 one atomic publication attempt, so a static or dynamic failure publishes
-nothing.
+nothing. The REPL preserves the same raw-versus-canonical presentation for
+each evaluated expression.
 
 ## Errors, transactions, and profiles
 

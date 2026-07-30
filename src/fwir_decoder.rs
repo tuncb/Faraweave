@@ -1470,7 +1470,7 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                 11 if explicit_value_formatting => {
                     if lift != 0
                         || result_element != 0
-                        || arguments[2..].iter().any(|value| *value != 0)
+                        || arguments[3..].iter().any(|value| *value != 0)
                     {
                         return Err(record_error(nodes, index, 2, "unused_variant"));
                     }
@@ -2242,6 +2242,7 @@ fn reconstruct_program(
                 11 if explicit_value_formatting => NodeKind::Format {
                     template: StringValueIndex(record_u32(bytes, records, index, 24)?),
                     template_origin: OriginIndex(record_u32(bytes, records, index, 28)?),
+                    keyword_origin: OriginIndex(record_u32(bytes, records, index, 32)?),
                 },
                 _ => return Err(record_error(records, index, 0, "kind")),
             };

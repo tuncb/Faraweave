@@ -2,9 +2,9 @@ mod repl_terminal;
 
 use faraweave::{
     ArgumentErrorContext, CompileFwirError, Error, ErrorKind, FwirDecodeLimits, FwirEncodeOptions,
-    RootPresentation, VERSION, compile_source_to_fwir_with_name, decode_fwir, evaluate_expression,
-    evaluate_runner_source, evaluate_verified_program_with_arguments, format_value, inspect_fwir,
-    write_internal_registry_diagnostics,
+    RootPresentation, VERSION, Value, compile_source_to_fwir_with_name, decode_fwir,
+    evaluate_expression, evaluate_runner_source, evaluate_verified_program_with_arguments,
+    format_value, inspect_fwir, write_internal_registry_diagnostics,
 };
 use std::env;
 use std::ffi::OsString;
@@ -723,12 +723,21 @@ fn repl() -> Result<(), ()> {
             continue;
         }
         match evaluate_expression(line) {
-            Ok(result) => {
-                let formatted = format_value(&result.value).map_err(|error| {
-                    report_error("<repl>", &error);
-                })?;
-                publish_stdout(format!("{formatted}\n").as_bytes())?;
-            }
+            Ok(result) => match result.presentation {
+                RootPresentation::CanonicalValue => {
+                    let formatted = format_value(&result.value).map_err(|error| {
+                        report_error("<repl>", &error);
+                    })?;
+                    publish_stdout(format!("{formatted}\n").as_bytes())?;
+                }
+                RootPresentation::RawString => {
+                    let Value::String(value) = &result.value else {
+                        eprintln!("error: verified raw String presentation invariant failed");
+                        return Err(());
+                    };
+                    publish_stdout(value.as_bytes())?;
+                }
+            },
             Err(error) => report_error("<repl>", &error),
         }
     }
@@ -1171,6 +1180,30 @@ mod output_tests {
         }
     }
 
+    struct RecordingShortWriter {
+        accepted: usize,
+        flush_ok: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for RecordingShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.accepted == 0 {
+                return Ok(0);
+            }
+            let count = self.accepted.min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..count]);
+            self.accepted -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_ok
+                .then_some(())
+                .ok_or_else(|| io::Error::other("injected flush failure"))
+        }
+    }
+
     #[test]
     fn publication_retains_exact_write_and_flush_positions() {
         let write = publish_to(
@@ -1308,6 +1341,59 @@ mod output_tests {
             ),
             Ok("1\nraw=é\0\"tail\"\n".to_owned())
         );
+    }
+
+    #[test]
+    fn mixed_root_output_failures_report_exact_bytes_and_only_the_accepted_prefix() {
+        let formatted = vec!["1".to_owned(), "raw=é\0".to_owned(), "\"tail\"".to_owned()];
+        let presentations = vec![
+            RootPresentation::CanonicalValue,
+            RootPresentation::RawString,
+            RootPresentation::CanonicalValue,
+        ];
+        let output = build_formatted_runner_output(
+            &formatted,
+            &presentations,
+            FormattedOutputFailureInjection::none(),
+        )
+        .expect("build mixed output");
+        assert_eq!(output.as_bytes(), b"1\nraw=\xc3\xa9\0\"tail\"\n");
+
+        let mut short = RecordingShortWriter {
+            accepted: 9,
+            flush_ok: true,
+            bytes: Vec::new(),
+        };
+        let write_failure =
+            publish_to(&mut short, output.as_bytes()).expect_err("mixed short write");
+        assert_eq!(
+            write_failure,
+            OutputPublicationFailure {
+                reason: OutputFailureReason::WriteFailed,
+                pending_byte_count: 16,
+                accepted_byte_count: 9,
+                output_position: 9,
+            }
+        );
+        assert_eq!(short.bytes, b"1\nraw=\xc3\xa9\0");
+
+        let mut flush = RecordingShortWriter {
+            accepted: usize::MAX,
+            flush_ok: false,
+            bytes: Vec::new(),
+        };
+        let flush_failure =
+            publish_to(&mut flush, output.as_bytes()).expect_err("mixed flush failure");
+        assert_eq!(
+            flush_failure,
+            OutputPublicationFailure {
+                reason: OutputFailureReason::FlushFailed,
+                pending_byte_count: 16,
+                accepted_byte_count: 16,
+                output_position: 16,
+            }
+        );
+        assert_eq!(flush.bytes, output.as_bytes());
     }
 
     #[test]

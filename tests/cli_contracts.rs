@@ -307,6 +307,19 @@ fn cli_repl_transcript_recovers_resets_and_rejects_program_headers() {
     assert!(stderr.contains("invalid parameter header"));
 }
 
+#[test]
+fn cli_repl_preserves_printf_raw_presentation_embedded_nul_and_header_rules() {
+    let result = repl_output(
+        "printf[\"raw={}\\0\" \"é\"]\nformat[\"{}\" 2]\nparameters[x Int]\n".as_bytes(),
+    );
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"> raw=\xc3\xa9\0> \"2\"\n> > ");
+    assert_eq!(
+        result.stderr,
+        b"<repl>:1:1: SyntaxError: invalid parameter header\n"
+    );
+}
+
 fn repl_output(transcript: &[u8]) -> std::process::Output {
     let mut child = Command::new(binary())
         .arg("repl")

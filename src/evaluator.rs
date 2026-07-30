@@ -23,6 +23,7 @@ pub struct EvaluationConfiguration {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValueResult {
     pub value: Value,
+    pub presentation: RootPresentation,
     pub usage: ResourceUsage,
 }
 
@@ -71,6 +72,18 @@ fn evaluate_expression_observed(
     validate_tuple_profile(&parsed, configuration)?;
     let program = compile_parsed_source(source, &parsed)
         .map_err(crate::lowering::CompileError::into_evaluation_error)?;
+    let presentation = program
+        .as_raw()
+        .roots
+        .first()
+        .map(|root| root.presentation)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::EmptyExpression,
+                SourceLocation::start(),
+                "expected an expression",
+            )
+        })?;
     let result = evaluate_compiled(&program, &[], configuration, observer)?;
     Ok(ValueResult {
         value: result.values.into_iter().next().ok_or_else(|| {
@@ -80,6 +93,7 @@ fn evaluate_expression_observed(
                 "expected an expression",
             )
         })?,
+        presentation,
         usage: result.usage,
     })
 }
