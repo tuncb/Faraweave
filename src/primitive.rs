@@ -8,6 +8,11 @@ use crate::strict_float::{self, Binary64Operation};
 use crate::{
     DomainErrorContext, DomainErrorReason, Error, ErrorKind, ScalarType, SourceLocation, Value,
 };
+use std::cell::Cell;
+
+thread_local! {
+    static STRING_COMPARISON_RESULT_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 pub(crate) fn resolve_names(program: &Program) -> Result<(), Error> {
     let mut declaration = 0;
@@ -533,14 +538,14 @@ pub(crate) fn apply_reference_consumer_implementation(
         }
     };
     if write_scan_output(&mut output, 0, &accumulator).is_err() {
-        resources.release(&output);
+        resources.release_owned(output)?;
         return Err(type_runtime_error(producer, location));
     }
     for index in 0..length {
         let element = match vector_element(vector.value, index, producer, location) {
             Ok(element) => element,
             Err(error) => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(error);
             }
         };
@@ -555,12 +560,12 @@ pub(crate) fn apply_reference_consumer_implementation(
         ) {
             Ok(value) => value,
             Err(error) => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(error);
             }
         };
         if write_scan_output(&mut output, index + 1, &accumulator).is_err() {
-            resources.release(&output);
+            resources.release_owned(output)?;
             return Err(type_runtime_error(producer, location));
         }
     }
@@ -659,7 +664,7 @@ fn apply_vector_filter_consumer(
         let element = match vector_element(vector.value, index, producer, location) {
             Ok(element) => element,
             Err(error) => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(error);
             }
         };
@@ -673,20 +678,20 @@ fn apply_vector_filter_consumer(
         ) {
             Ok(result) => result,
             Err(error) => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(error);
             }
         };
         match predicate_result {
             Value::Bool(true) => {
                 if push_filter_output(&mut output, element).is_err() {
-                    resources.release(&output);
+                    resources.release_owned(output)?;
                     return Err(type_runtime_error(producer, location));
                 }
             }
             Value::Bool(false) => {}
             _ => {
-                resources.release(&output);
+                resources.release_owned(output)?;
                 return Err(type_runtime_error(
                     "referenced operation",
                     reference_location,
@@ -898,9 +903,18 @@ fn apply_string_comparison(
         resources.admit_vector_with_work(ScalarType::Bool, count, work, location, producer)?
     } else {
         resources.charge_work(work, location, producer)?;
-        0
+        let left = string_at(left.value, 0)?;
+        let right = string_at(right.value, 0)?;
+        return Ok((
+            Value::Bool(compare_strings(kernel, left, right, producer, location)?),
+            false,
+        ));
     };
     let mut results = Vec::new();
+    if cfg!(test) {
+        STRING_COMPARISON_RESULT_ALLOCATIONS
+            .with(|allocations| allocations.set(allocations.get().saturating_add(1)));
+    }
     if results.try_reserve_exact(count).is_err() {
         resources.refund(admitted);
         return Err(allocation_error(producer, location));
@@ -920,25 +934,31 @@ fn apply_string_comparison(
                 return Err(error);
             }
         };
-        let ordering = left.as_bytes().cmp(right.as_bytes());
-        results.push(match kernel {
-            ScalarKernel::EqualsString => ordering.is_eq(),
-            ScalarKernel::NotEqualsString => !ordering.is_eq(),
-            ScalarKernel::LessThanString => ordering.is_lt(),
-            ScalarKernel::GreaterThanString => ordering.is_gt(),
-            _ => {
+        match compare_strings(kernel, left, right, producer, location) {
+            Ok(value) => results.push(value),
+            Err(error) => {
                 resources.refund(admitted);
-                return Err(type_runtime_error(producer, location));
+                return Err(error);
             }
-        });
+        }
     }
-    if accounted {
-        Ok((Value::BoolVector(results), true))
-    } else {
-        results
-            .pop()
-            .map(|value| (Value::Bool(value), false))
-            .ok_or_else(|| type_runtime_error(producer, location))
+    Ok((Value::BoolVector(results), true))
+}
+
+fn compare_strings(
+    kernel: ScalarKernel,
+    left: &str,
+    right: &str,
+    producer: &str,
+    location: SourceLocation,
+) -> Result<bool, Error> {
+    let ordering = left.as_bytes().cmp(right.as_bytes());
+    match kernel {
+        ScalarKernel::EqualsString => Ok(ordering.is_eq()),
+        ScalarKernel::NotEqualsString => Ok(!ordering.is_eq()),
+        ScalarKernel::LessThanString => Ok(ordering.is_lt()),
+        ScalarKernel::GreaterThanString => Ok(ordering.is_gt()),
+        _ => Err(type_runtime_error(producer, location)),
     }
 }
 
@@ -1621,5 +1641,81 @@ mod tests {
         assert_eq!(context.requested_elements, Some(usize::MAX));
         assert_eq!(resources.usage.work_units, 0);
         assert_eq!(resources.usage.allocation_attempts, 0);
+    }
+
+    #[test]
+    fn string_comparison_allocates_only_for_a_lifted_result() {
+        let plan = application_plan_from_numeric(1).expect("elementwise plan");
+        let left = Value::String("café".to_owned());
+        let right = Value::String("café".to_owned());
+        let scalar_arguments = [
+            SelectedApplicationArgument {
+                value: &left,
+                conversion: Conversion::Identity,
+            },
+            SelectedApplicationArgument {
+                value: &right,
+                conversion: Conversion::Identity,
+            },
+        ];
+        STRING_COMPARISON_RESULT_ALLOCATIONS.with(|count| count.set(0));
+        let mut scalar_resources = context(ResourceLimits {
+            max_work_units: Some(1),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            apply_string_comparison(
+                ScalarKernel::EqualsString,
+                plan,
+                &scalar_arguments,
+                crate::LiftMode::Scalar,
+                ScalarType::Bool,
+                SourceLocation::start(),
+                "equals",
+                &mut scalar_resources,
+            ),
+            Ok((Value::Bool(true), false))
+        );
+        assert_eq!(
+            STRING_COMPARISON_RESULT_ALLOCATIONS.with(Cell::get),
+            0,
+            "scalar comparison must borrow its Strings directly"
+        );
+
+        let vector_left = Value::StringVector(vec!["a".to_owned(), "β".to_owned()]);
+        let vector_right = Value::String("β".to_owned());
+        let vector_arguments = [
+            SelectedApplicationArgument {
+                value: &vector_left,
+                conversion: Conversion::Identity,
+            },
+            SelectedApplicationArgument {
+                value: &vector_right,
+                conversion: Conversion::Identity,
+            },
+        ];
+        let mut vector_resources = context(ResourceLimits {
+            max_vector_bytes: Some(2),
+            max_work_units: Some(2),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            apply_string_comparison(
+                ScalarKernel::EqualsString,
+                plan,
+                &vector_arguments,
+                crate::LiftMode::Vector,
+                ScalarType::Bool,
+                SourceLocation::start(),
+                "equals",
+                &mut vector_resources,
+            ),
+            Ok((Value::BoolVector(vec![false, true]), true))
+        );
+        assert_eq!(
+            STRING_COMPARISON_RESULT_ALLOCATIONS.with(Cell::get),
+            1,
+            "lifted comparison must allocate exactly one result vector"
+        );
     }
 }

@@ -457,20 +457,24 @@ impl ResourceContext {
         Ok(())
     }
 
-    pub(crate) fn release(&mut self, value: &Value) {
-        if let Ok(bytes) = value.canonical_bytes() {
-            self.refund(bytes);
-            self.notify(ResourceEvent {
-                kind: ResourceEventKind::Release,
-                producer: "value_release",
-                requested_elements: None,
-                requested_bytes: Some(bytes),
-                requested_work_units: 0,
-                allocation_ordinal: None,
-                refusal_reason: None,
-                usage: self.usage,
-            });
-        }
+    pub(crate) fn release_owned(&mut self, value: Value) -> Result<(), Error> {
+        let bytes = value.into_canonical_bytes()?;
+        self.release_bytes(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn release_bytes(&mut self, bytes: usize) {
+        self.refund(bytes);
+        self.notify(ResourceEvent {
+            kind: ResourceEventKind::Release,
+            producer: "value_release",
+            requested_elements: None,
+            requested_bytes: Some(bytes),
+            requested_work_units: 0,
+            allocation_ordinal: None,
+            refusal_reason: None,
+            usage: self.usage,
+        });
     }
 
     pub(crate) fn refund(&mut self, bytes: usize) {

@@ -3,6 +3,7 @@ use crate::{
     ConnectedApplicationErrorReason, Error, ErrorKind, ParameterErrorContext, ParameterErrorReason,
     ScalarType, SourceLocation, SourceSpan, Value,
 };
+use std::cell::Cell;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Program {
@@ -134,12 +135,69 @@ enum TokenKind {
     Invalid,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Token {
     kind: TokenKind,
     span: SourceSpan,
     spelling: String,
     value: Option<Value>,
+}
+
+thread_local! {
+    static PARSER_FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    static PARSER_ALLOCATION_ORDINAL: Cell<usize> = const { Cell::new(0) };
+}
+
+fn parser_allocation_attempt(location: SourceLocation) -> Result<(), Error> {
+    if cfg!(test) {
+        let ordinal = PARSER_ALLOCATION_ORDINAL.get();
+        PARSER_ALLOCATION_ORDINAL.set(ordinal.saturating_add(1));
+        if PARSER_FAIL_AT.get() == Some(ordinal) {
+            return Err(parser_allocation_error(location));
+        }
+    }
+    let _ = location;
+    Ok(())
+}
+
+fn parser_copy_string(value: &str, location: SourceLocation) -> Result<String, Error> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    parser_allocation_attempt(location)?;
+    let mut result = String::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| parser_allocation_error(location))?;
+    result.push_str(value);
+    Ok(result)
+}
+
+fn parser_clone_value(value: &Value, location: SourceLocation) -> Result<Value, Error> {
+    match value {
+        Value::Bool(value) => Ok(Value::Bool(*value)),
+        Value::Int(value) => Ok(Value::Int(*value)),
+        Value::Double(value) => Ok(Value::Double(*value)),
+        Value::String(value) => parser_copy_string(value, location).map(Value::String),
+        _ => value
+            .try_clone()
+            .map_err(|()| parser_allocation_error(location)),
+    }
+}
+
+impl Token {
+    fn try_clone(&self) -> Result<Self, Error> {
+        Ok(Self {
+            kind: self.kind,
+            span: self.span,
+            spelling: parser_copy_string(&self.spelling, self.span.begin)?,
+            value: self
+                .value
+                .as_ref()
+                .map(|value| parser_clone_value(value, self.span.begin))
+                .transpose()?,
+        })
+    }
 }
 
 pub(crate) fn parse(source: &str) -> Result<Program, Error> {
@@ -177,16 +235,26 @@ fn parse_prefix_chain(
     while tokens.get(index).map(|token| token.kind) == Some(TokenKind::Name)
         && tokens.get(index + 1).map(|token| token.kind) == Some(TokenKind::Space)
     {
-        names.push(tokens[index].clone());
+        if let Err(error) = parser_allocation_attempt(tokens[index].span.begin).and_then(|()| {
+            names
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(tokens[index].span.begin))
+        }) {
+            return Some(Err(error));
+        }
+        match tokens[index].try_clone() {
+            Ok(token) => names.push(token),
+            Err(error) => return Some(Err(error)),
+        }
         index += 2;
     }
     if names.len() < minimum_depth {
         return None;
     }
     let leaf_token = tokens.get(index)?;
-    let leaf = match leaf_token.value.as_ref()?.try_clone() {
+    let leaf = match parser_clone_value(leaf_token.value.as_ref()?, leaf_token.span.begin) {
         Ok(value) => value,
-        Err(()) => return Some(Err(parser_allocation_error(leaf_token.span.begin))),
+        Err(error) => return Some(Err(error)),
     };
     index += 1;
     while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
@@ -231,7 +299,17 @@ fn parse_bracket_chain(
     while tokens.get(index).map(|token| token.kind) == Some(TokenKind::Name)
         && tokens.get(index + 1).map(|token| token.kind) == Some(TokenKind::LeftBracket)
     {
-        names.push(tokens[index].clone());
+        if let Err(error) = parser_allocation_attempt(tokens[index].span.begin).and_then(|()| {
+            names
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(tokens[index].span.begin))
+        }) {
+            return Some(Err(error));
+        }
+        match tokens[index].try_clone() {
+            Ok(token) => names.push(token),
+            Err(error) => return Some(Err(error)),
+        }
         index += 2;
         while tokens.get(index).is_some_and(|token| is_trivia(token.kind)) {
             index += 1;
@@ -247,9 +325,9 @@ fn parse_bracket_chain(
             "expected an expression",
         )));
     };
-    let leaf = match leaf_token.value.as_ref()?.try_clone() {
+    let leaf = match parser_clone_value(leaf_token.value.as_ref()?, leaf_token.span.begin) {
         Ok(value) => value,
-        Err(()) => return Some(Err(parser_allocation_error(leaf_token.span.begin))),
+        Err(error) => return Some(Err(error)),
     };
     index += 1;
     let mut steps = Vec::new();
@@ -380,9 +458,9 @@ fn parse_deep_singleton_tuple(tokens: &[Token]) -> Option<Result<Program, Error>
             "expected an expression",
         )));
     };
-    let leaf = match leaf_token.value.as_ref()?.try_clone() {
+    let leaf = match parser_clone_value(leaf_token.value.as_ref()?, leaf_token.span.begin) {
         Ok(value) => value,
-        Err(()) => return Some(Err(parser_allocation_error(leaf_token.span.begin))),
+        Err(error) => return Some(Err(error)),
     };
     index += 1;
     let mut closed = 0usize;
@@ -544,10 +622,8 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
         if byte == b'"' {
             let (next_index, next_location, value, valid) =
                 tokenize_string_literal(source, index, location)?;
-            tokens
-                .try_reserve(1)
-                .map_err(|_| parser_allocation_error(begin))?;
-            tokens.push(token(
+            push_token(
+                &mut tokens,
                 if valid {
                     TokenKind::String
                 } else {
@@ -557,7 +633,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                 next_location,
                 "",
                 value.map(Value::String),
-            ));
+            )?;
             index = next_index;
             location = next_location;
             continue;
@@ -567,13 +643,14 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                 advance_ascii(&mut location);
                 index += 1;
             }
-            tokens.push(token(
+            push_token(
+                &mut tokens,
                 TokenKind::Space,
                 begin,
                 location,
                 &source[begin.offset - 1..location.offset - 1],
                 None,
-            ));
+            )?;
             continue;
         }
         if byte == b'#' {
@@ -586,7 +663,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                 advance_ascii(&mut location);
                 index += 1;
             }
-            tokens.push(token(TokenKind::Comment, begin, location, "", None));
+            push_token(&mut tokens, TokenKind::Comment, begin, location, "", None)?;
             continue;
         }
         if byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) == Some(&b'\n')) {
@@ -599,7 +676,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
             }
             location.line += 1;
             location.column = 1;
-            tokens.push(token(TokenKind::Newline, begin, location, "", None));
+            push_token(&mut tokens, TokenKind::Newline, begin, location, "", None)?;
             continue;
         }
         if byte.is_ascii_lowercase() {
@@ -620,7 +697,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                 "let" => (TokenKind::Let, None),
                 _ => (TokenKind::Name, None),
             };
-            tokens.push(token(kind, begin, location, spelling, value));
+            push_token(&mut tokens, kind, begin, location, spelling, value)?;
             continue;
         }
         if byte == b'_' {
@@ -647,7 +724,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                     TokenKind::InvalidPlaceholder
                 }
             };
-            tokens.push(token(kind, begin, location, spelling, None));
+            push_token(&mut tokens, kind, begin, location, spelling, None)?;
             continue;
         }
         if byte.is_ascii_uppercase() {
@@ -665,7 +742,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                 "String" => TokenKind::StringType,
                 _ => TokenKind::Invalid,
             };
-            tokens.push(token(kind, begin, location, spelling, None));
+            push_token(&mut tokens, kind, begin, location, spelling, None)?;
             continue;
         }
         if byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.') {
@@ -678,13 +755,13 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
             }
             let spelling = &source[begin.offset - 1..location.offset - 1];
             let (kind, value) = parse_numeric(spelling);
-            tokens.push(token(kind, begin, location, spelling, value));
+            push_token(&mut tokens, kind, begin, location, spelling, value)?;
             continue;
         }
         if !byte.is_ascii() {
             advance_ascii(&mut location);
             index += 1;
-            tokens.push(token(TokenKind::Invalid, begin, location, "", None));
+            push_token(&mut tokens, TokenKind::Invalid, begin, location, "", None)?;
             continue;
         }
         let kind = match byte {
@@ -701,7 +778,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
         advance_ascii(&mut location);
         index += 1;
         let spelling = &source[begin.offset - 1..location.offset - 1];
-        tokens.push(token(kind, begin, location, spelling, None));
+        push_token(&mut tokens, kind, begin, location, spelling, None)?;
     }
     Ok(tokens)
 }
@@ -727,6 +804,7 @@ fn tokenize_string_literal(
             let Some(character) = source[index..].chars().next() else {
                 return Ok((index, location, None, false));
             };
+            parser_allocation_attempt(location)?;
             output
                 .try_reserve(character.len_utf8())
                 .map_err(|_| parser_allocation_error(location))?;
@@ -777,6 +855,7 @@ fn tokenize_string_literal(
                 };
                 advance_ascii(&mut location);
                 index += 1;
+                parser_allocation_attempt(location)?;
                 output
                     .try_reserve(character.len_utf8())
                     .map_err(|_| parser_allocation_error(location))?;
@@ -785,6 +864,7 @@ fn tokenize_string_literal(
             }
             _ => return Ok((index, location, None, false)),
         };
+        parser_allocation_attempt(location)?;
         output
             .try_reserve(character.len_utf8())
             .map_err(|_| parser_allocation_error(location))?;
@@ -800,19 +880,26 @@ fn advance_ascii(location: &mut SourceLocation) {
     location.column += 1;
 }
 
-fn token(
+fn push_token(
+    tokens: &mut Vec<Token>,
     kind: TokenKind,
     begin: SourceLocation,
     end: SourceLocation,
     spelling: &str,
     value: Option<Value>,
-) -> Token {
-    Token {
+) -> Result<(), Error> {
+    parser_allocation_attempt(begin)?;
+    tokens
+        .try_reserve(1)
+        .map_err(|_| parser_allocation_error(begin))?;
+    let token = Token {
         kind,
         span: SourceSpan { begin, end },
-        spelling: spelling.to_owned(),
+        spelling: parser_copy_string(spelling, begin)?,
         value,
-    }
+    };
+    tokens.push(token);
+    Ok(())
 }
 
 fn parse_numeric(spelling: &str) -> (TokenKind, Option<Value>) {
@@ -930,7 +1017,8 @@ impl Parser {
             if self.is_name("parameters") {
                 let keyword = self
                     .peek()
-                    .cloned()
+                    .map(Token::try_clone)
+                    .transpose()?
                     .ok_or_else(|| self.eof_error("expected an expression"))?;
                 let (reason, related) = if let Some(header) = parameter_header {
                     (ParameterErrorReason::SecondParameterHeader, header)
@@ -1278,7 +1366,8 @@ impl Parser {
     fn parse_primary_expr(&mut self) -> Result<Expr, Error> {
         let token = self
             .peek()
-            .cloned()
+            .map(Token::try_clone)
+            .transpose()?
             .ok_or_else(|| self.eof_error("expected an expression"))?;
         match token.kind {
             TokenKind::Bool | TokenKind::Int | TokenKind::Double | TokenKind::String => {
@@ -1554,6 +1643,10 @@ impl Parser {
                 ));
             }
             scalar_type = Some(element_type);
+            parser_allocation_attempt(token.span.begin)?;
+            values
+                .try_reserve(1)
+                .map_err(|_| parser_allocation_error(token.span.begin))?;
             values.push(value);
             self.require_sibling_separator_or_close(TokenKind::RightParenthesis)?;
         }
@@ -1792,7 +1885,14 @@ impl Parser {
     }
 
     fn take(&mut self) -> Option<Token> {
-        let token = self.tokens.get(self.index).cloned()?;
+        let token = self.tokens.get_mut(self.index)?;
+        let empty = Token {
+            kind: TokenKind::Invalid,
+            span: token.span,
+            spelling: String::new(),
+            value: None,
+        };
+        let token = std::mem::replace(token, empty);
         self.index += 1;
         Some(token)
     }
@@ -2124,6 +2224,58 @@ fn inspect_branch_placeholders(expression: &Expr) -> (usize, Option<SourceSpan>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_with_failure(source: &str, fail_at: Option<usize>) -> (Result<Program, Error>, usize) {
+        PARSER_ALLOCATION_ORDINAL.set(0);
+        PARSER_FAIL_AT.set(fail_at);
+        let result = parse(source);
+        let attempts = PARSER_ALLOCATION_ORDINAL.get();
+        PARSER_FAIL_AT.set(None);
+        PARSER_ALLOCATION_ORDINAL.set(0);
+        (result, attempts)
+    }
+
+    #[test]
+    fn parser_reports_initial_and_later_allocation_refusals() {
+        let source = "[\"héllo\" (\"世界\" \"🦀\")]\n";
+        let (success, attempts) = parse_with_failure(source, None);
+        assert!(success.is_ok());
+        assert!(
+            attempts > 4,
+            "fixture must exercise several allocation sites"
+        );
+        for ordinal in [0, 1, attempts - 1] {
+            let (result, _) = parse_with_failure(source, Some(ordinal));
+            let error = result.expect_err("parser allocation refusal");
+            assert_eq!(error.kind, ErrorKind::ResourceError);
+            assert!(error.message.contains("allocation_unavailable"));
+        }
+    }
+
+    #[test]
+    fn token_clone_copies_string_payload_fallibly() {
+        let token = Token {
+            kind: TokenKind::String,
+            span: SourceSpan {
+                begin: SourceLocation::start(),
+                end: SourceLocation::start(),
+            },
+            spelling: "\"héllo\"".to_owned(),
+            value: Some(Value::String("héllo".to_owned())),
+        };
+        for ordinal in [0, 1] {
+            PARSER_ALLOCATION_ORDINAL.set(0);
+            PARSER_FAIL_AT.set(Some(ordinal));
+            let error = token.try_clone().expect_err("clone allocation refusal");
+            assert_eq!(error.kind, ErrorKind::ResourceError);
+        }
+        PARSER_ALLOCATION_ORDINAL.set(0);
+        PARSER_FAIL_AT.set(None);
+        let clone = token.try_clone().expect("fallible token clone");
+        assert_eq!(clone.spelling, token.spelling);
+        assert_eq!(clone.value, token.value);
+        PARSER_ALLOCATION_ORDINAL.set(0);
+    }
 
     fn quoted_fields(line: &str) -> Vec<String> {
         let mut fields = Vec::new();
