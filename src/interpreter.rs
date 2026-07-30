@@ -232,6 +232,9 @@ impl<'a> Interpreter<'a> {
             NodeKind::Binding { .. } => self.execute_user_binding(index, node, location),
             NodeKind::BindingMove => self.execute_binding_move(index, node, location),
             NodeKind::BindingBorrow => self.execute_binding(index, node, location),
+            NodeKind::Format { template, .. } => {
+                self.execute_format(index, node, template, location)
+            }
             NodeKind::SelectedApply {
                 implementation_id,
                 application_plan_id,
@@ -302,6 +305,55 @@ impl<'a> Interpreter<'a> {
         self.put_owned(index, value, !edges.is_empty())?;
         self.release_after(index)?;
         Ok(())
+    }
+
+    fn execute_format(
+        &mut self,
+        index: usize,
+        node: crate::Node,
+        template: crate::StringValueIndex,
+        location: SourceLocation,
+    ) -> Result<(), Error> {
+        let edges = self.copy_edges(node.edges, location)?;
+        let template = self
+            .raw
+            .string_values
+            .get(template.0 as usize)
+            .ok_or_else(|| execution_invariant_error(location))?;
+        let required = {
+            let mut arguments = Vec::new();
+            arguments
+                .try_reserve_exact(edges.len())
+                .map_err(|_| execution_allocation_error(location, "format"))?;
+            for edge in &edges {
+                arguments.push(self.edge_value(*edge)?);
+            }
+            crate::value::measure_interpolation(template, &arguments)?
+        };
+        let admitted = self
+            .resources
+            .admit_string(required, required, location, "format")?;
+        let mut output = String::new();
+        if required != 0 && output.try_reserve_exact(required).is_err() {
+            self.resources.refund(admitted);
+            return Err(execution_allocation_error(location, "format"));
+        }
+        let rendered = (|| {
+            let mut arguments = Vec::new();
+            arguments
+                .try_reserve_exact(edges.len())
+                .map_err(|_| execution_allocation_error(location, "format"))?;
+            for edge in &edges {
+                arguments.push(self.edge_value(*edge)?);
+            }
+            crate::value::render_interpolation(template, &arguments, &mut output)
+        })();
+        if let Err(error) = rendered {
+            self.resources.refund(admitted);
+            return Err(error);
+        }
+        self.put_owned(index, Value::String(output), required != 0)?;
+        self.release_after(index)
     }
 
     fn execute_spread_prepare(

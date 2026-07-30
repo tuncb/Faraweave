@@ -750,7 +750,7 @@ fn canonical_string_1_4_artifact_and_mutations_are_conformant() {
         .position(|record| read_u16(record, 0) == Feature::Strings.numeric())
         .expect("feature 10");
     let mut missing_feature = bytes.clone();
-    put_u16(&mut missing_feature, features + feature * 4, 11);
+    put_u16(&mut missing_feature, features + feature * 4, 12);
     missing_feature[features + feature * 4 + 2] = 1;
     assert!(matches!(
         decode_fwir(&missing_feature, &FwirDecodeLimits::default()),
@@ -2465,6 +2465,7 @@ fn traceability_references_complete_executable_evidence_sets() {
         "canonical-connected-bindings",
         "canonical-immutable-bindings",
         "canonical-strings",
+        "value-formatting",
     ]);
     let behavioral_evidence = BTreeSet::from([
         ("header.section_count", "section-count-limit"),
@@ -2494,6 +2495,16 @@ fn traceability_references_complete_executable_evidence_sets() {
         ("decoder.no_backend_before_verify", "public-backend-gate"),
         ("canonical.byte_identity", "corpus-hash"),
         ("canonical.host_neutral", "corpus-host-neutral"),
+        (
+            "formatting.feature_version",
+            "value-formatting-feature-version",
+        ),
+        ("formatting.node_template", "value-formatting-node-template"),
+        (
+            "formatting.root_presentation",
+            "value-formatting-root-presentation",
+        ),
+        ("formatting.roundtrip", "value-formatting-roundtrip"),
         (
             "appl.feature_required",
             "application-plan-section-without-feature",

@@ -222,7 +222,7 @@ and `evaluate_verified_program_with_arguments`. Named compilation retains a
 logical source name inside the artifact so later execution diagnostics do not
 depend on the artifact's filesystem path.
 
-FWIR v1 commits to physical formats 1.0 through 1.4 and semantic contract 1.4,
+FWIR v1 commits to physical formats 1.0 through 1.5 and semantic contract 1.5,
 `.fwir`, and the documented API and CLI spellings. The canonical
 semantic/physical-1.0 corpus remains accepted and round-trips byte-for-byte.
 Artifacts that use explicit application plans carry mandatory feature
@@ -234,8 +234,9 @@ backend-native math identities carry mandatory feature
 `8=ConnectedApplicationBindings` and physical format 1.2; immutable source
 bindings carry mandatory feature `9=ImmutableBindings` and physical format
 1.3; String values carry mandatory feature `10=Strings` and physical format
-1.4. Artifacts without these capabilities need not carry the corresponding
-feature.
+1.4; value-formatting nodes and raw root presentation carry mandatory feature
+`11=ValueFormatting` and physical format 1.5. Artifacts without these
+capabilities need not carry the corresponding feature.
 Unknown class-1 advisory features and explicitly optional, non-identity
 forward-minor sections may be skipped. Unknown mandatory semantics,
 unsupported semantic minors, and other unsupported current-minor extensions
@@ -278,6 +279,23 @@ exactly `inf`, `-inf`, or `nan`. Count errors precede decoding, static source
 errors precede binding, and all decoding precedes execution. String arguments
 are exact command-line UTF-8 values: source escapes are not interpreted, empty
 strings are valid, and invalid host Unicode is rejected before execution.
+
+## Value formatting
+
+`format["template" values...]` is a typed expression that returns a String.
+Templates accept `{}` placeholders, `{{` for `{`, and `}}` for `}`; their
+placeholder count must exactly match the remaining arguments. A directly
+interpolated String contributes its raw UTF-8 payload, while every other
+scalar, vector, tuple, and nested value uses Faraweave's canonical value
+spelling.
+
+`printf["template" values...]` has the same formatting semantics but is valid
+only as a program root. It publishes the resulting bytes without adding a
+newline; ordinary roots, including a root `format[...]`, retain canonical
+value presentation and a trailing newline. All roots execute and format before
+one atomic publication attempt, so a static or dynamic failure publishes
+nothing. The REPL preserves the same raw-versus-canonical presentation for
+each evaluated expression.
 
 ## Errors, transactions, and profiles
 

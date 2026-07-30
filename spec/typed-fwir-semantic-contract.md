@@ -53,7 +53,7 @@ FWIR is a closed, finite, plain-data program. Its abstract records are:
 | Constant | Canonical scalar or homogeneous vector payload; tuple values are constructed by nodes. |
 | Node | Node kind, complete result type, leaf cardinality when applicable, ordered edge range, origin, and kind-specific decisions. |
 | Edge | Producer, semantic argument position, value access, conversion, ownership mode, and argument origin. |
-| Root | Source-order result node and root origin. |
+| Root | Source-order result node, root origin, and canonical-value or raw-String presentation. |
 | Origin | Source unit and one-based, half-open byte span, with the derived line and column data needed by current diagnostics. |
 | OperationReference | Stable primitive, signature, and implementation identities plus the source origin of one closed registered built-in selected by a higher-order consumer. |
 | Feature | A mandatory semantic capability used by the module. |
@@ -90,9 +90,11 @@ charge is released after outputs are complete or during failure cleanup.
 
 Roots execute in table order. A successful program returns the complete ordered
 root sequence; a root failure releases the already completed root prefix in
-reverse order and returns no partial program result. Formatting and external
-publication happen only after all roots execute successfully and remain
-outside the FWIR node graph.
+reverse order and returns no partial program result. A canonical root uses the
+canonical value spelling and a trailing newline; a raw root must be a scalar
+String produced by a `Format` node and contributes its payload bytes without
+an implicit newline.
+Publication happens only after all roots execute and present successfully.
 
 ## 4. Types, values, and cardinality (`FWIR-SEM-004`)
 
@@ -196,6 +198,10 @@ Semantic minor 4 adds mandatory feature `10=Strings`. It is present exactly
 when a String parameter, type, constant, or selected String operation is
 required; older semantic minors reject String records and a 1.4 module rejects
 a superfluous feature 10.
+Semantic minor 5 adds mandatory feature `11=ValueFormatting`. It is present
+exactly when a `Format` node or raw root presentation is required; older
+semantic minors reject those records and a 1.5 module rejects a superfluous
+feature 11.
 
 ## 6. Nodes, edges, and evaluation order (`FWIR-SEM-006`)
 
@@ -212,12 +218,32 @@ The abstract node kinds needed by the current language are:
 | BindingBorrow | Carry one immutable whole-binding borrow to a region such as fan-out without copying its value. |
 | BindingMove | Transfer the complete bound value into its one ownership-escaping consumer. |
 | FanOut | Evaluate one operand once, execute ordered branch regions with an explicit operand borrow, and produce one tuple. |
+| Format | Interpolate ordered input values into one literal template and produce a scalar String. |
 
 Prefix-spread preparation may be represented as an explicit node or as
 tuple-element access edges on `SelectedApply`; either representation must carry
 the same owner, element order, origins, and releases. Fan-out branch regions,
 placeholder sites, and the final result structure must be explicit rather than
 reconstructed from source syntax.
+
+`Format` stores a UTF-8 template plus distinct authored keyword and literal
+origins. Templates contain only literal bytes, `{}` placeholders, and the brace
+escapes `{{` and `}}`; malformed braces or a placeholder/input-count mismatch
+are static source errors at the literal. Interpolation inputs execute exactly
+once from left to right. Each edge consumes one whole value through
+`WholeValue`, `BindingBorrowWhole`, `ConnectedBindingWhole`, or
+`FanOutOperandBorrow`; tuple, binding, and connected element accesses are
+invalid. A scalar String input contributes its raw payload, while every other
+value uses the canonical scalar/vector/tuple spelling.
+
+After every input completes, formatting first measures the complete UTF-8
+result with checked arithmetic, then makes exactly one String admission whose
+bytes and work both equal that result length, using producer `format`.
+Rendering performs one fallible result allocation after admission; refusal or
+render failure publishes nothing and releases inputs in reverse ownership
+order. Implementations must measure and render nested values iteratively and
+must produce byte-identical results in both passes. An empty result makes one
+zero-byte, zero-work admission with no allocation ordinal or live charge.
 
 Edges have one of these semantic value accesses:
 
@@ -684,7 +710,9 @@ fuse passes only if this exact winner is preserved.
 
 Static analysis never executes a primitive or uses runtime arguments.
 Value-predictable `iota` length, profile refusal, allocation failure, dynamic
-shape mismatch, integer overflow, formatting, and output remain dynamic.
+shape mismatch, integer overflow, formatting result admission, and output
+remain dynamic. Formatting keyword position, literal-template type, brace
+grammar, and exact placeholder arity are static and source ordered.
 
 ## 14. Dynamic failure precedence and releases (`FWIR-SEM-014`)
 
@@ -825,6 +853,7 @@ Every current parser expression maps without preserving parser-only variants:
 | UnaryChain | Ordered ordinary `SelectedApply` nodes; no interpreter-only chain opcode is required. |
 | Parameter(index) | `ParameterBorrow` with checked slot. |
 | Direct Call | `SelectedApply` with one semantic edge per source argument. |
+| `format[...]` / root-only `printf[...]` | `Format` with a literal template, one ordered edge per interpolation input, and canonical/raw root presentation respectively. |
 | Prefix Call | `SelectedApply` with one direct edge or explicit one-level tuple-element borrow edges. |
 | Placeholder-free connected chain | Iteratively expanded ordinary `SelectedApply` nodes with authored immediate-tuple elements inserted as ordinary edges; no connected node survives. |
 | Explicit-placeholder connected chain | One `ConnectedBinding` per placeholder-bearing template plus binding-only whole/element edges into its statically selected `SelectedApply`. |
@@ -889,6 +918,8 @@ and semantic/physical 1.0 bytes remain unchanged.
 Issue #87 adds feature 10 and appends String signatures/implementations 67
 through 73 to existing primitives 8, 9, 17, 18, 21, and 22; no primitive or
 application-plan identity is renumbered.
+Issue #89 adds feature 11, the `Format` node, and explicit root presentation;
+it adds no primitive, signature, implementation, or application-plan identity.
 
 ## 18. Compatibility without a physical encoding (`FWIR-SEM-018`)
 
@@ -920,10 +951,10 @@ maps every wire field and invariant in
 | --- | --- |
 | `FWIR-SEM-001` | `python:tools/validation/contracts.py::validate_product_cutover`<br>`rust:tests/fwir_public_contracts.rs::public_source_and_decoded_artifact_execution_and_resource_traces_match` |
 | `FWIR-SEM-002` | `rust:src/typed_program.rs::valid_fixtures_cover_every_node_and_edge_family`<br>`rust:src/typed_program.rs::verifier_category_winners_follow_the_normative_order` |
-| `FWIR-SEM-003` | `rust:tests/parity_contracts.rs::typed_public_api_parameter_contract`<br>`rust:tests/parity_contracts.rs::utf8_string_parameters_are_raw_exact_and_typed_api_matches_source`<br>`rust:tests/cli_contracts.rs::cli_parameters_and_diagnostics_contract`<br>`rust:tests/cli_contracts.rs::cli_string_arguments_are_raw_exact_for_source_and_verified_fwir` |
+| `FWIR-SEM-003` | `rust:tests/parity_contracts.rs::typed_public_api_parameter_contract`<br>`rust:tests/parity_contracts.rs::utf8_string_parameters_are_raw_exact_and_typed_api_matches_source`<br>`rust:tests/cli_contracts.rs::cli_parameters_and_diagnostics_contract`<br>`rust:tests/cli_contracts.rs::cli_string_arguments_are_raw_exact_for_source_and_verified_fwir`<br>`rust:tests/cli_contracts.rs::cli_format_and_printf_bytes_match_for_source_and_verified_fwir` |
 | `FWIR-SEM-004` | `rust:tests/parity_contracts.rs::s16_empty_singleton_promotion_and_shape_contracts`<br>`rust:tests/parity_contracts.rs::utf8_strings_literals_vectors_operations_and_diagnostics_are_exact`<br>`rust:tests/parity_contracts.rs::deep_structural_values_and_types_format_and_drop_iteratively` |
 | `FWIR-SEM-005` | `rust:tests/parity_contracts.rs::canonical_binary64_format_boundaries`<br>`rust:tests/resource_contracts.rs::typed_api_rejects_noncanonical_nan_without_normalizing_it`<br>`rust:tests/resource_contracts.rs::string_payload_and_descriptor_accounting_is_checked_and_cleanup_exact`<br>`rust:tests/resource_contracts.rs::resource_observer_reports_commit_refusal_and_cleanup_order` |
-| `FWIR-SEM-006` | `rust:src/parser.rs::parses_literals_calls_tuples_parameters_and_fanout`<br>`rust:src/parser.rs::connected_applications_are_flat_right_associated_and_stop_at_list_boundaries`<br>`rust:tests/parity_contracts.rs::deep_unary_programs_use_iterative_parse_analysis_and_evaluation` |
+| `FWIR-SEM-006` | `rust:src/parser.rs::parses_literals_calls_tuples_parameters_and_fanout`<br>`rust:src/parser.rs::connected_applications_are_flat_right_associated_and_stop_at_list_boundaries`<br>`rust:tests/parity_contracts.rs::deep_unary_programs_use_iterative_parse_analysis_and_evaluation`<br>`rust:src/lowering.rs::value_formatting_lowering_records_typed_template_edges_and_root_presentation`<br>`rust:src/evaluator.rs::format_composes_with_bindings_fanout_and_connected_completion` |
 | `FWIR-SEM-007` | `rust:src/semantic_registry.rs::production_registry_is_complete_and_numeric_lookups_are_checked`<br>`rust:src/interpreter.rs::every_selected_implementation_executes_by_stable_id` |
 | `FWIR-SEM-008` | `rust:tests/parity_contracts.rs::checked_arithmetic_has_no_partial_result`<br>`rust:tests/parity_contracts.rs::div_integer_faults_and_strict_binary64_are_exact`<br>`rust:tests/parity_contracts.rs::length_accepts_all_vector_types_empty_and_dynamic_cardinalities`<br>`rust:tests/parity_contracts.rs::sort_covers_exhaustive_small_bools_integer_edges_and_total_double_order`<br>`rust:tests/parity_contracts.rs::sum_int_overflow_reports_the_first_reduction_step_and_operands`<br>`rust:tests/parity_contracts.rs::sum_double_is_left_to_right_strict_and_preserves_special_value_bits`<br>`rust:tests/parity_contracts.rs::all_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_false_position`<br>`rust:tests/parity_contracts.rs::any_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`<br>`rust:tests/parity_contracts.rs::none_of_accepts_empty_static_and_dynamic_bool_vectors_and_every_true_position`<br>`rust:tests/parity_contracts.rs::filter_is_stable_typed_and_exact_for_every_allowed_predicate`<br>`rust:tests/parity_contracts.rs::foldl_accepts_bool_int_double_empty_dynamic_and_non_associative_reducers`<br>`rust:tests/parity_contracts.rs::foldl_reports_the_leftmost_reducer_fault_with_step_operands_and_reference_origin`<br>`rust:tests/parity_contracts.rs::scanl_is_seed_inclusive_for_all_types_empty_dynamic_and_non_associative_inputs`<br>`rust:tests/parity_contracts.rs::scanl_reports_the_leftmost_reducer_fault_and_initialized_prefix`<br>`rust:tests/resource_contracts.rs::vector_tuple_and_work_limits_cover_zero_exact_and_one_past`<br>`rust:tests/resource_contracts.rs::div_admission_precedes_domain_and_failure_cleanup_is_exact`<br>`rust:tests/resource_contracts.rs::length_charges_constant_work_borrows_input_and_has_no_result_allocation`<br>`rust:tests/resource_contracts.rs::sort_admits_owned_output_with_input_live_and_cleans_up_refused_output`<br>`rust:tests/resource_contracts.rs::sum_charges_full_work_before_reduction_and_allocates_no_result`<br>`rust:tests/resource_contracts.rs::all_of_work_and_observer_trace_are_independent_of_the_decisive_position`<br>`rust:tests/resource_contracts.rs::any_of_work_and_observer_trace_are_independent_of_the_decisive_position`<br>`rust:tests/resource_contracts.rs::none_of_work_and_observer_trace_use_its_identity_at_every_decisive_position`<br>`rust:tests/resource_contracts.rs::filter_splits_work_and_exact_result_admission_with_input_live`<br>`rust:tests/resource_contracts.rs::filter_refusals_preserve_phase_order_committed_work_and_cleanup`<br>`rust:tests/resource_contracts.rs::foldl_charges_full_work_before_reducer_steps_and_cleans_up_faults_exactly`<br>`rust:tests/resource_contracts.rs::scanl_admits_n_plus_one_output_before_population_with_input_live`<br>`rust:tests/resource_contracts.rs::scanl_fault_releases_output_before_input_and_retains_full_work`<br>`rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_rust_reference_vectors_meet_policy`<br>`rust:tests/backend_native_math_policy.rs::backend_native_math_special_values_and_rounding_are_exact` |
 | `FWIR-SEM-009` | `rust:tests/parity_contracts.rs::tup_structural_format_spread_and_direct_preservation`<br>`rust:tests/parity_contracts.rs::connected_completion_scalar_vector_tuple_chain_and_boundaries_are_exact`<br>`rust:src/lowering.rs::connected_completion_erases_to_existing_selected_calls_in_authored_order`<br>`rust:src/evaluator.rs::lifting_and_tuples_are_canonical` |
@@ -931,11 +962,11 @@ maps every wire field and invariant in
 | `FWIR-SEM-011` | `rust:tests/parity_contracts.rs::fan_stable_id_matrix`<br>`rust:src/lowering.rs::fan_out_prefix_placeholder_borrows_prepare_and_preserves_elements` |
 | `FWIR-SEM-012` | `rust:tests/resource_contracts.rs::parameter_header_reason_and_span_contract_is_structured`<br>`rust:src/lowering.rs::connected_completion_diagnostics_are_structured_and_deterministic`<br>`rust:tests/golden_corpus.rs::authored_section_15_and_16_failure_golden_corpus`<br>`rust:tests/cli_contracts.rs::cli_parameters_and_diagnostics_contract` |
 | `FWIR-SEM-013` | `rust:tests/resource_contracts.rs::profile_configuration_precedes_source_analysis_and_interpreter_execution`<br>`rust:src/lowering.rs::whole_program_static_precedence_is_arity_then_type_then_shape`<br>`rust:tests/parity_contracts.rs::connected_completion_negative_contract_is_structured` |
-| `FWIR-SEM-014` | `rust:tests/resource_contracts.rs::refusal_precedence_is_vector_then_live_then_work_then_allocation`<br>`rust:tests/resource_contracts.rs::failure_usage_is_post_cleanup_and_work_remains_monotonic`<br>`rust:tests/resource_contracts.rs::string_parameters_and_borrowed_copies_are_admitted_and_cleanup_exactly`<br>`rust:tests/resource_contracts.rs::connected_completion_preserves_template_first_operand_once_resource_order`<br>`rust:tests/fwir_public_contracts.rs::public_source_and_decoded_artifact_execution_and_resource_traces_match` |
+| `FWIR-SEM-014` | `rust:tests/resource_contracts.rs::refusal_precedence_is_vector_then_live_then_work_then_allocation`<br>`rust:tests/resource_contracts.rs::failure_usage_is_post_cleanup_and_work_remains_monotonic`<br>`rust:tests/resource_contracts.rs::string_parameters_and_borrowed_copies_are_admitted_and_cleanup_exactly`<br>`rust:tests/resource_contracts.rs::connected_completion_preserves_template_first_operand_once_resource_order`<br>`rust:tests/fwir_public_contracts.rs::formatting_admits_one_complete_result_and_fault_cleanup_is_deterministic`<br>`rust:tests/fwir_public_contracts.rs::public_source_and_decoded_artifact_execution_and_resource_traces_match` |
 | `FWIR-SEM-015` | `rust:tests/parity_contracts.rs::resource_profiles_limits_and_ordinals`<br>`rust:src/interpreter.rs::every_selected_implementation_executes_by_stable_id` |
 | `FWIR-SEM-016` | `rust:src/typed_program.rs::identity_result_root_and_feature_invariants_are_rejected`<br>`rust:src/typed_program.rs::string_feature_and_value_arena_invariants_are_rejected`<br>`rust:tests/fwir_conformance.rs::deterministic_mutation_corpus_is_rejected_without_panic_or_partial_program` |
-| `FWIR-SEM-017` | `rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:src/lowering.rs::connected_completion_erases_to_existing_selected_calls_in_authored_order`<br>`rust:src/evaluator.rs::evaluates_complete_primitive_surface`<br>`rust:tests/fwir_public_contracts.rs::utf8_strings_are_semantic_and_physical_1_4_and_roundtrip_exactly`<br>`rust:tests/fwir_public_contracts.rs::connected_completion_roundtrips_as_ordinary_existing_fwir`<br>`rust:tests/fwir_public_contracts.rs::filter_roundtrips_predicate_links_dynamic_subset_metadata_and_direct_dispatch`<br>`rust:tests/fwir_conformance.rs::filter_fwir_rejects_non_predicate_reference_identity_after_physical_decode`<br>`rust:tests/fwir_public_contracts.rs::foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities`<br>`rust:tests/fwir_public_contracts.rs::scanl_roundtrips_reducer_links_plus_one_shape_and_direct_dispatch` |
-| `FWIR-SEM-018` | `rust:tests/fwir_public_contracts.rs::utf8_strings_are_semantic_and_physical_1_4_and_roundtrip_exactly`<br>`rust:tests/fwir_conformance.rs::same_major_optional_compatibility_and_mandatory_rejection_are_exact`<br>`rust:tests/fwir_conformance.rs::canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral` |
+| `FWIR-SEM-017` | `rust:src/lowering.rs::exact_ir_golden_digests_cover_every_source_construct`<br>`rust:src/lowering.rs::connected_completion_erases_to_existing_selected_calls_in_authored_order`<br>`rust:src/evaluator.rs::evaluates_complete_primitive_surface`<br>`rust:tests/fwir_public_contracts.rs::utf8_strings_are_semantic_and_physical_1_4_and_roundtrip_exactly`<br>`rust:tests/fwir_public_contracts.rs::value_formatting_is_semantic_and_physical_1_5_and_roundtrips_root_presentation`<br>`rust:tests/fwir_public_contracts.rs::connected_completion_roundtrips_as_ordinary_existing_fwir`<br>`rust:tests/fwir_public_contracts.rs::filter_roundtrips_predicate_links_dynamic_subset_metadata_and_direct_dispatch`<br>`rust:tests/fwir_conformance.rs::filter_fwir_rejects_non_predicate_reference_identity_after_physical_decode`<br>`rust:tests/fwir_public_contracts.rs::foldl_roundtrips_reducer_links_and_dispatches_only_verified_identities`<br>`rust:tests/fwir_public_contracts.rs::scanl_roundtrips_reducer_links_plus_one_shape_and_direct_dispatch` |
+| `FWIR-SEM-018` | `rust:tests/fwir_public_contracts.rs::utf8_strings_are_semantic_and_physical_1_4_and_roundtrip_exactly`<br>`rust:tests/fwir_public_contracts.rs::value_formatting_is_semantic_and_physical_1_5_and_roundtrips_root_presentation`<br>`rust:tests/fwir_conformance.rs::same_major_optional_compatibility_and_mandatory_rejection_are_exact`<br>`rust:tests/fwir_conformance.rs::canonical_corpus_manifest_is_exact_roundtrippable_and_host_neutral` |
 | `FWIR-SEM-019` | `python:tools/validation/contracts.py::validate_product_cutover`<br>`rust:tests/fwir_conformance.rs::traceability_references_complete_executable_evidence_sets` |
 | `FWIR-SEM-020` | `python:tools/validation/contracts.py::validate_product_cutover`<br>`command:contracts-review` |
 

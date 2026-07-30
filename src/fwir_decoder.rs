@@ -990,7 +990,12 @@ fn preflight(bytes: &[u8], limits: &FwirDecodeLimits) -> Result<DecodePlan, Fwir
         }
         expected_payload = payload_end;
 
-        if let Some((slot, expected_flags, expected_record_size)) = known_section(id) {
+        if let Some((slot, expected_flags, base_record_size)) = known_section(id) {
+            let expected_record_size = if id == 16 && minor >= 5 {
+                12
+            } else {
+                base_record_size
+            };
             if flags != expected_flags {
                 return Err(error(
                     FwirDecodeErrorKind::NonCanonicalDirectory { field: "flags" },
@@ -1217,7 +1222,7 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
         if reserved != 0 {
             return Err(record_error(features, index, 3, "reserved"));
         }
-        if id <= Feature::Strings.numeric() {
+        if id <= Feature::ValueFormatting.numeric() {
             if class != 0 {
                 return Err(record_error(features, index, 2, "feature_class"));
             }
@@ -1231,6 +1236,9 @@ fn validate_features(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeEr
                 return Err(record_error(features, index, 0, "feature_format_minor"));
             }
             if id == Feature::Strings.numeric() && plan.format_minor < 4 {
+                return Err(record_error(features, index, 0, "feature_format_minor"));
+            }
+            if id == Feature::ValueFormatting.numeric() && plan.format_minor < 5 {
                 return Err(record_error(features, index, 0, "feature_format_minor"));
             }
         } else if class == 0 {
@@ -1302,12 +1310,25 @@ fn has_user_bindings_feature(bytes: &[u8], plan: &DecodePlan) -> Result<bool, Fw
     Ok(false)
 }
 
+fn has_value_formatting_feature(bytes: &[u8], plan: &DecodePlan) -> Result<bool, FwirDecodeError> {
+    let Some(features) = section(plan, 2) else {
+        return Ok(false);
+    };
+    for index in 0..features.record_count() {
+        if record_u16(bytes, features, index, 0)? == Feature::ValueFormatting.numeric() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), FwirDecodeError> {
     validate_features(bytes, plan)?;
     let explicit_application_plans = has_application_plans_feature(bytes, plan)?;
     let explicit_operation_references = has_operation_references_feature(bytes, plan)?;
     let explicit_connected_bindings = has_connected_bindings_feature(bytes, plan)?;
     let explicit_user_bindings = has_user_bindings_feature(bytes, plan)?;
+    let explicit_value_formatting = has_value_formatting_feature(bytes, plan)?;
 
     if let Some(sources) = section(plan, 4) {
         for index in 0..sources.record_count() {
@@ -1442,6 +1463,14 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
                 }
                 9 | 10 if explicit_user_bindings => {
                     if lift != 0 || result_element != 0 || arguments.iter().any(|value| *value != 0)
+                    {
+                        return Err(record_error(nodes, index, 2, "unused_variant"));
+                    }
+                }
+                11 if explicit_value_formatting => {
+                    if lift != 0
+                        || result_element != 0
+                        || arguments[3..].iter().any(|value| *value != 0)
                     {
                         return Err(record_error(nodes, index, 2, "unused_variant"));
                     }
@@ -1581,6 +1610,16 @@ fn validate_record_canonicality(bytes: &[u8], plan: &DecodePlan) -> Result<(), F
             zero_bytes(bytes, ownership, index, 5, 3, "reserved")?;
         }
     }
+    if let Some(roots) = section(plan, 16) {
+        for index in 0..roots.record_count() {
+            if plan.format_minor >= 5 {
+                if !matches!(record_u8(bytes, roots, index, 8)?, 1 | 2) {
+                    return Err(record_error(roots, index, 8, "presentation"));
+                }
+                zero_bytes(bytes, roots, index, 9, 3, "reserved")?;
+            }
+        }
+    }
     if let Some(references) = section(plan, 18) {
         for index in 0..references.record_count() {
             zero_bytes(bytes, references, index, 6, 2, "reserved")?;
@@ -1658,6 +1697,17 @@ fn validate_string_use(
                     };
                     *value = true;
                 }
+            }
+        }
+    }
+    if let Some(records) = section(plan, 14) {
+        for index in 0..records.record_count() {
+            if record_u8(bytes, records, index, 0)? == 11 {
+                let string = record_usize(bytes, records, index, 24, "string_index")?;
+                let Some(value) = used.get_mut(string) else {
+                    return Err(record_error(records, index, 24, "string_index"));
+                };
+                *value = true;
             }
         }
     }
@@ -1757,6 +1807,7 @@ fn reconstruct_program(
     let explicit_application_plans = has_application_plans_feature(bytes, plan)?;
     let explicit_connected_bindings = has_connected_bindings_feature(bytes, plan)?;
     let explicit_user_bindings = has_user_bindings_feature(bytes, plan)?;
+    let explicit_value_formatting = has_value_formatting_feature(bytes, plan)?;
     let strings = section(plan, 3);
     let mut features = Vec::new();
     let mut source_units = Vec::new();
@@ -1904,7 +1955,7 @@ fn reconstruct_program(
     if let Some(records) = section(plan, 2) {
         for index in 0..records.record_count() {
             let id = record_u16(bytes, records, index, 0)?;
-            if id <= Feature::Strings.numeric() {
+            if id <= Feature::ValueFormatting.numeric() {
                 features.push(id);
             }
         }
@@ -2188,6 +2239,11 @@ fn reconstruct_program(
                 },
                 9 if explicit_user_bindings => NodeKind::BindingMove,
                 10 if explicit_user_bindings => NodeKind::BindingBorrow,
+                11 if explicit_value_formatting => NodeKind::Format {
+                    template: StringValueIndex(record_u32(bytes, records, index, 24)?),
+                    template_origin: OriginIndex(record_u32(bytes, records, index, 28)?),
+                    keyword_origin: OriginIndex(record_u32(bytes, records, index, 32)?),
+                },
                 _ => return Err(record_error(records, index, 0, "kind")),
             };
             nodes.push(Node {
@@ -2225,6 +2281,15 @@ fn reconstruct_program(
             roots.push(Root {
                 node: NodeIndex(record_u32(bytes, records, index, 0)?),
                 origin: OriginIndex(record_u32(bytes, records, index, 4)?),
+                presentation: if plan.format_minor >= 5 {
+                    match record_u8(bytes, records, index, 8)? {
+                        1 => crate::RootPresentation::CanonicalValue,
+                        2 => crate::RootPresentation::RawString,
+                        _ => return Err(record_error(records, index, 8, "presentation")),
+                    }
+                } else {
+                    crate::RootPresentation::CanonicalValue
+                },
             });
         }
     }
@@ -3268,7 +3333,7 @@ mod tests {
             .map(|index| features + index * 4)
             .unwrap_or(features);
         let mut missing_feature = scalar.clone();
-        put_u16_at(&mut missing_feature, string_feature, 11);
+        put_u16_at(&mut missing_feature, string_feature, 12);
         missing_feature[string_feature + 2] = 1;
         assert!(matches!(
             decode_fwir(&missing_feature, &FwirDecodeLimits::default()),
@@ -3464,6 +3529,7 @@ mod tests {
         must(builder.push_root(Root {
             node: current,
             origin,
+            presentation: crate::RootPresentation::CanonicalValue,
         }));
         let mut raw = must(builder.finish());
         if explicit_application_plans || operation_references || backend_native_math {

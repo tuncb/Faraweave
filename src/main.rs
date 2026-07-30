@@ -2,9 +2,9 @@ mod repl_terminal;
 
 use faraweave::{
     ArgumentErrorContext, CompileFwirError, Error, ErrorKind, FwirDecodeLimits, FwirEncodeOptions,
-    VERSION, compile_source_to_fwir_with_name, decode_fwir, evaluate_expression,
-    evaluate_runner_source, evaluate_verified_program_with_arguments, format_value, inspect_fwir,
-    write_internal_registry_diagnostics,
+    RootPresentation, VERSION, Value, compile_source_to_fwir_with_name, decode_fwir,
+    evaluate_expression, evaluate_runner_source, evaluate_verified_program_with_arguments,
+    format_value, inspect_fwir, write_internal_registry_diagnostics,
 };
 use std::env;
 use std::ffi::OsString;
@@ -156,6 +156,7 @@ fn run_ir_command(
     ) {
         Ok(result) => publish_formatted_runner_output(
             &result.formatted,
+            &result.presentations,
             injection.formatted_output,
             publish_runner_output,
         ),
@@ -299,6 +300,7 @@ fn collect_command_line_arguments(
     Ok(decoded)
 }
 
+#[cfg(test)]
 fn checked_formatted_output_length(
     formatted_lengths: impl IntoIterator<Item = usize>,
 ) -> Result<usize, FormattedOutputFailure> {
@@ -314,26 +316,48 @@ fn checked_formatted_output_length(
 
 fn build_formatted_runner_output(
     formatted: &[String],
+    presentations: &[RootPresentation],
     injection: FormattedOutputFailureInjection,
 ) -> Result<String, FormattedOutputFailure> {
-    let output_length = checked_formatted_output_length(formatted.iter().map(String::len))?;
+    if formatted.len() != presentations.len() {
+        return Err(FormattedOutputFailure::SizeOverflow);
+    }
+    let output_length =
+        formatted
+            .iter()
+            .zip(presentations)
+            .try_fold(0usize, |total, (value, presentation)| {
+                total
+                    .checked_add(value.len())
+                    .and_then(|length| {
+                        if *presentation == RootPresentation::CanonicalValue {
+                            length.checked_add(1)
+                        } else {
+                            Some(length)
+                        }
+                    })
+                    .ok_or(FormattedOutputFailure::SizeOverflow)
+            })?;
     let mut output = String::new();
     if injection.refuse_reservation || output.try_reserve_exact(output_length).is_err() {
         return Err(FormattedOutputFailure::AllocationUnavailable);
     }
-    for value in formatted {
+    for (value, presentation) in formatted.iter().zip(presentations) {
         output.push_str(value);
-        output.push('\n');
+        if *presentation == RootPresentation::CanonicalValue {
+            output.push('\n');
+        }
     }
     Ok(output)
 }
 
 fn publish_formatted_runner_output(
     formatted: &[String],
+    presentations: &[RootPresentation],
     injection: FormattedOutputFailureInjection,
     publish_runner_output: impl FnOnce(&[u8]) -> Result<(), ()>,
 ) -> Result<(), RunnerCommandFailure> {
-    let output = build_formatted_runner_output(formatted, injection)
+    let output = build_formatted_runner_output(formatted, presentations, injection)
         .map_err(RunnerCommandFailure::FormattedOutput)?;
     publish_runner_output(output.as_bytes()).map_err(|()| RunnerCommandFailure::Reported)
 }
@@ -359,6 +383,7 @@ fn run_command(
     match evaluate_runner_source(&source, &argument_strings) {
         Ok(result) => publish_formatted_runner_output(
             &result.formatted,
+            &result.presentations,
             injection.formatted_output,
             publish_runner_output,
         ),
@@ -698,12 +723,21 @@ fn repl() -> Result<(), ()> {
             continue;
         }
         match evaluate_expression(line) {
-            Ok(result) => {
-                let formatted = format_value(&result.value).map_err(|error| {
-                    report_error("<repl>", &error);
-                })?;
-                publish_stdout(format!("{formatted}\n").as_bytes())?;
-            }
+            Ok(result) => match result.presentation {
+                RootPresentation::CanonicalValue => {
+                    let formatted = format_value(&result.value).map_err(|error| {
+                        report_error("<repl>", &error);
+                    })?;
+                    publish_stdout(format!("{formatted}\n").as_bytes())?;
+                }
+                RootPresentation::RawString => {
+                    let Value::String(value) = &result.value else {
+                        eprintln!("error: verified raw String presentation invariant failed");
+                        return Err(());
+                    };
+                    publish_stdout(value.as_bytes())?;
+                }
+            },
             Err(error) => report_error("<repl>", &error),
         }
     }
@@ -1060,7 +1094,7 @@ mod output_tests {
         checked_formatted_output_length, collect_command_line_arguments,
         compile_source_to_fwir_with_name, publish_to, repl_command, run_cli_with_runner_support,
     };
-    use faraweave::FwirEncodeOptions;
+    use faraweave::{FwirEncodeOptions, RootPresentation};
     use std::cell::Cell;
     use std::ffi::OsString;
     use std::fs;
@@ -1135,6 +1169,30 @@ mod output_tests {
                 return Ok(0);
             }
             let count = self.accepted.min(bytes.len());
+            self.accepted -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_ok
+                .then_some(())
+                .ok_or_else(|| io::Error::other("injected flush failure"))
+        }
+    }
+
+    struct RecordingShortWriter {
+        accepted: usize,
+        flush_ok: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for RecordingShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.accepted == 0 {
+                return Ok(0);
+            }
+            let count = self.accepted.min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..count]);
             self.accepted -= count;
             Ok(count)
         }
@@ -1242,8 +1300,13 @@ mod output_tests {
     #[test]
     fn formatted_output_reservation_refusal_is_explicit_and_transactional() {
         let formatted = vec!["first".to_owned(), "é".to_owned()];
+        let presentations = vec![
+            RootPresentation::CanonicalValue,
+            RootPresentation::CanonicalValue,
+        ];
         let failure = build_formatted_runner_output(
             &formatted,
+            &presentations,
             FormattedOutputFailureInjection::refuse_reservation(),
         )
         .expect_err("injected formatted output reservation refusal");
@@ -1253,9 +1316,84 @@ mod output_tests {
             "error: unable to allocate formatted output"
         );
         assert_eq!(
-            build_formatted_runner_output(&formatted, FormattedOutputFailureInjection::none()),
+            build_formatted_runner_output(
+                &formatted,
+                &presentations,
+                FormattedOutputFailureInjection::none()
+            ),
             Ok("first\né\n".to_owned())
         );
+    }
+
+    #[test]
+    fn raw_and_canonical_roots_publish_in_source_order_without_implicit_raw_newline() {
+        let formatted = vec!["1".to_owned(), "raw=é\0".to_owned(), "\"tail\"".to_owned()];
+        let presentations = vec![
+            RootPresentation::CanonicalValue,
+            RootPresentation::RawString,
+            RootPresentation::CanonicalValue,
+        ];
+        assert_eq!(
+            build_formatted_runner_output(
+                &formatted,
+                &presentations,
+                FormattedOutputFailureInjection::none(),
+            ),
+            Ok("1\nraw=é\0\"tail\"\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn mixed_root_output_failures_report_exact_bytes_and_only_the_accepted_prefix() {
+        let formatted = vec!["1".to_owned(), "raw=é\0".to_owned(), "\"tail\"".to_owned()];
+        let presentations = vec![
+            RootPresentation::CanonicalValue,
+            RootPresentation::RawString,
+            RootPresentation::CanonicalValue,
+        ];
+        let output = build_formatted_runner_output(
+            &formatted,
+            &presentations,
+            FormattedOutputFailureInjection::none(),
+        )
+        .expect("build mixed output");
+        assert_eq!(output.as_bytes(), b"1\nraw=\xc3\xa9\0\"tail\"\n");
+
+        let mut short = RecordingShortWriter {
+            accepted: 9,
+            flush_ok: true,
+            bytes: Vec::new(),
+        };
+        let write_failure =
+            publish_to(&mut short, output.as_bytes()).expect_err("mixed short write");
+        assert_eq!(
+            write_failure,
+            OutputPublicationFailure {
+                reason: OutputFailureReason::WriteFailed,
+                pending_byte_count: 16,
+                accepted_byte_count: 9,
+                output_position: 9,
+            }
+        );
+        assert_eq!(short.bytes, b"1\nraw=\xc3\xa9\0");
+
+        let mut flush = RecordingShortWriter {
+            accepted: usize::MAX,
+            flush_ok: false,
+            bytes: Vec::new(),
+        };
+        let flush_failure =
+            publish_to(&mut flush, output.as_bytes()).expect_err("mixed flush failure");
+        assert_eq!(
+            flush_failure,
+            OutputPublicationFailure {
+                reason: OutputFailureReason::FlushFailed,
+                pending_byte_count: 16,
+                accepted_byte_count: 16,
+                output_position: 16,
+            }
+        );
+        assert_eq!(flush.bytes, output.as_bytes());
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::ScalarType;
 use std::collections::TryReserveError;
 
 pub const SUPPORTED_SEMANTIC_MAJOR: u16 = 1;
-pub const SUPPORTED_SEMANTIC_MINOR: u16 = 4;
+pub const SUPPORTED_SEMANTIC_MINOR: u16 = 5;
 
 macro_rules! index_type {
     ($name:ident) => {
@@ -74,6 +74,7 @@ pub enum Feature {
     ConnectedApplicationBindings = 8,
     ImmutableBindings = 9,
     Strings = 10,
+    ValueFormatting = 11,
 }
 
 impl Feature {
@@ -237,6 +238,11 @@ pub enum NodeKind {
     },
     BindingMove,
     BindingBorrow,
+    Format {
+        template: StringValueIndex,
+        template_origin: OriginIndex,
+        keyword_origin: OriginIndex,
+    },
     FanOut {
         branches: IndexRange,
         keyword_origin: OriginIndex,
@@ -276,6 +282,13 @@ pub struct Ownership {
 pub struct Root {
     pub node: NodeIndex,
     pub origin: OriginIndex,
+    pub presentation: RootPresentation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootPresentation {
+    CanonicalValue,
+    RawString,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -727,6 +740,7 @@ fn verify_program(
             Feature::ConnectedApplicationBindings.numeric(),
             Feature::ImmutableBindings.numeric(),
             Feature::Strings.numeric(),
+            Feature::ValueFormatting.numeric(),
         ]
         .contains(&feature)
         {
@@ -827,7 +841,7 @@ fn verify_program(
                 NodeKind::SelectedApply {
                     result_element_type: ScalarType::String,
                     ..
-                }
+                } | NodeKind::Format { .. }
             )
         });
     if program.module.semantic_minor < 4 && (has_strings || uses_strings) {
@@ -836,6 +850,23 @@ fn verify_program(
             RecordKind::Module,
             None,
             "strings_version",
+        ));
+    }
+    let has_value_formatting = has_feature(program, Feature::ValueFormatting);
+    let uses_value_formatting = program
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::Format { .. }))
+        || program
+            .roots
+            .iter()
+            .any(|root| root.presentation == RootPresentation::RawString);
+    if program.module.semantic_minor < 5 && (has_value_formatting || uses_value_formatting) {
+        return Err(malformed(
+            Invariant::UnsupportedVersion,
+            RecordKind::Module,
+            None,
+            "value_formatting_version",
         ));
     }
     if program.module.semantic_minor == 0
@@ -1306,7 +1337,13 @@ fn verify_string_values(program: &RawProgram) -> Result<(), VerifyError> {
                 ScalarConstant::String(value_index) if value_index.0 as usize == index
             )
         });
-        if !used_by_name && !used_by_constant {
+        let used_by_format = program.nodes.iter().any(|node| {
+            matches!(
+                node.kind,
+                NodeKind::Format { template, .. } if template.0 as usize == index
+            )
+        });
+        if !used_by_name && !used_by_constant && !used_by_format {
             return Err(malformed(
                 Invariant::InvalidRecord,
                 RecordKind::StringValue,
@@ -1724,6 +1761,66 @@ fn verify_node_and_edge_references(program: &RawProgram) -> Result<(), VerifyErr
                             field,
                         ));
                     }
+                }
+            }
+            NodeKind::Format {
+                template,
+                template_origin,
+                keyword_origin,
+            } => {
+                if !in_bounds(template.0, program.string_values.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "template",
+                    ));
+                }
+                if !in_bounds(template_origin.0, program.origins.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "template_origin",
+                    ));
+                }
+                if !in_bounds(keyword_origin.0, program.origins.len()) {
+                    return Err(malformed(
+                        Invariant::IndexOutOfBounds,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "keyword_origin",
+                    ));
+                }
+                let expression = program.origins.get(node.origin.0 as usize);
+                let template = program.origins.get(template_origin.0 as usize);
+                let keyword = program.origins.get(keyword_origin.0 as usize);
+                let keyword_end_offset =
+                    keyword.and_then(|origin| origin.span.begin.offset.checked_add(6));
+                let keyword_end_column =
+                    keyword.and_then(|origin| origin.span.begin.column.checked_add(6));
+                if expression.is_none()
+                    || template.is_none()
+                    || keyword.is_none()
+                    || keyword_origin == template_origin
+                    || keyword.is_some_and(|keyword| {
+                        expression.is_none_or(|expression| {
+                            keyword.source_unit != expression.source_unit
+                                || keyword.span.begin != expression.span.begin
+                        }) || template.is_none_or(|template| {
+                            keyword.source_unit != template.source_unit
+                                || keyword.span.end.offset > template.span.begin.offset
+                        }) || keyword.span.end.offset != keyword_end_offset.unwrap_or(u32::MAX)
+                            || keyword.span.end.line != keyword.span.begin.line
+                            || keyword.span.end.column != keyword_end_column.unwrap_or(u32::MAX)
+                    })
+                {
+                    return Err(malformed(
+                        Invariant::InvalidRecord,
+                        RecordKind::Node,
+                        Some(node_index),
+                        "keyword_origin",
+                    ));
                 }
             }
             NodeKind::FanOut {
@@ -2179,6 +2276,35 @@ fn verify_node(
                 || edges[0].cardinality != node.cardinality
             {
                 return Err(inconsistent("binding_borrow"));
+            }
+        }
+        NodeKind::Format { template, .. } => {
+            let Some(template) = program.string_values.get(template.0 as usize) else {
+                return Err(inconsistent("template"));
+            };
+            if crate::value::format_template_placeholder_count(template).ok() != Some(edges.len())
+                || type_record(program, node.result_type)
+                    != Some(TypeRecord::Scalar(ScalarType::String))
+                || node.cardinality != Some(Cardinality::StaticScalar)
+            {
+                return Err(inconsistent("format"));
+            }
+            for edge in edges {
+                if edge.conversion != Conversion::Identity
+                    || !matches!(
+                        edge.access,
+                        ValueAccess::WholeValue
+                            | ValueAccess::BindingBorrowWhole
+                            | ValueAccess::FanOutOperandBorrow
+                            | ValueAccess::ConnectedBindingWhole
+                    )
+                    || !matches!(
+                        edge.ownership,
+                        OwnershipMode::OwnedInput | OwnershipMode::ImmutableBorrow
+                    )
+                {
+                    return Err(inconsistent("format_edge"));
+                }
             }
         }
         NodeKind::SelectedApply {
@@ -3174,6 +3300,10 @@ fn verify_semantic_ownership(
                         ValueAccess::BindingBorrowWhole | ValueAccess::BindingBorrowElement(_),
                         OwnershipMode::ImmutableBorrow
                     ) | (
+                        NodeKind::Format { .. },
+                        ValueAccess::BindingBorrowWhole,
+                        OwnershipMode::ImmutableBorrow
+                    ) | (
                         NodeKind::PrefixSpreadPrepare
                             | NodeKind::ConnectedBinding
                             | NodeKind::BindingBorrow
@@ -3193,6 +3323,10 @@ fn verify_semantic_ownership(
                         NodeKind::SelectedApply { .. },
                         ValueAccess::ConnectedBindingWhole
                             | ValueAccess::ConnectedBindingElement(_),
+                        OwnershipMode::ImmutableBorrow
+                    ) | (
+                        NodeKind::Format { .. },
+                        ValueAccess::ConnectedBindingWhole,
                         OwnershipMode::ImmutableBorrow
                     )
                 )
@@ -3251,6 +3385,20 @@ fn verify_semantic_ownership(
                         } else {
                             edge.ownership == OwnershipMode::OwnedInput
                         }
+                    }
+                    (NodeKind::Format { .. }, ValueAccess::WholeValue) => {
+                        if parameter {
+                            edge.ownership == OwnershipMode::ImmutableBorrow
+                        } else {
+                            edge.ownership == OwnershipMode::OwnedInput
+                        }
+                    }
+                    (NodeKind::Format { .. }, ValueAccess::FanOutOperandBorrow) => {
+                        edge.ownership == OwnershipMode::ImmutableBorrow
+                            && fan_out_borrow_context
+                                .get(edge_index)
+                                .copied()
+                                .unwrap_or(false)
                     }
                     (NodeKind::SelectedApply { .. }, ValueAccess::TupleElement(_)) => false,
                     (
@@ -3417,8 +3565,10 @@ fn verify_connected_binding_owners(
             if !matches!(
                 program.nodes.get(producer).map(|node| node.kind),
                 Some(NodeKind::ConnectedBinding)
-            ) || !matches!(node.kind, NodeKind::SelectedApply { .. })
-            {
+            ) || !matches!(
+                node.kind,
+                NodeKind::SelectedApply { .. } | NodeKind::Format { .. }
+            ) {
                 return Err(malformed(
                     Invariant::AmbiguousOwnership,
                     RecordKind::Edge,
@@ -3648,6 +3798,20 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
                 "origin",
             ));
         }
+        if root.presentation == RootPresentation::RawString {
+            let raw_node = program.nodes.get(root.node.0 as usize);
+            if raw_node.is_none_or(|node| !matches!(node.kind, NodeKind::Format { .. }))
+                || raw_node.and_then(|node| type_record(program, node.result_type))
+                    != Some(TypeRecord::Scalar(ScalarType::String))
+            {
+                return Err(malformed(
+                    Invariant::InconsistentResultMetadata,
+                    RecordKind::Root,
+                    checked_index(index),
+                    "presentation",
+                ));
+            }
+        }
     }
     let needs_ids = program
         .nodes
@@ -3752,7 +3916,19 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
         || program
             .constant_elements
             .iter()
-            .any(|constant| matches!(constant, ScalarConstant::String(_)));
+            .any(|constant| matches!(constant, ScalarConstant::String(_)))
+        || program
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, NodeKind::Format { .. }));
+    let needs_value_formatting = program
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::Format { .. }))
+        || program
+            .roots
+            .iter()
+            .any(|root| root.presentation == RootPresentation::RawString);
     for (required, needed, field) in [
         (Feature::StableSemanticIds, needs_ids, "stable_semantic_ids"),
         (Feature::Tuples, needs_tuples, "tuples"),
@@ -3784,6 +3960,11 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             "immutable_bindings",
         ),
         (Feature::Strings, needs_strings, "strings"),
+        (
+            Feature::ValueFormatting,
+            needs_value_formatting,
+            "value_formatting",
+        ),
     ] {
         if needed && !has_feature(program, required) {
             return Err(malformed(
@@ -3816,6 +3997,14 @@ fn verify_roots_and_features(program: &RawProgram) -> Result<(), VerifyError> {
             RecordKind::Module,
             None,
             "superfluous_strings",
+        ));
+    }
+    if has_feature(program, Feature::ValueFormatting) && !needs_value_formatting {
+        return Err(malformed(
+            Invariant::InvalidRecord,
+            RecordKind::Module,
+            None,
+            "superfluous_value_formatting",
         ));
     }
     Ok(())
@@ -3870,7 +4059,11 @@ mod tests {
             owner: node,
             release_after: ReleaseAfter::Root(RootIndex(0)),
         }));
-        must(builder.push_root(Root { node, origin }));
+        must(builder.push_root(Root {
+            node,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(builder.finish())
     }
 
@@ -3910,7 +4103,11 @@ mod tests {
             edges: IndexRange::default(),
             origin,
         }));
-        must(builder.push_root(Root { node, origin }));
+        must(builder.push_root(Root {
+            node,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(builder.finish())
     }
 
@@ -3978,6 +4175,7 @@ mod tests {
         must(builder.push_root(Root {
             node: tuple,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4056,6 +4254,7 @@ mod tests {
         must(builder.push_root(Root {
             node: apply,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4111,7 +4310,11 @@ mod tests {
             owner: iota,
             release_after: ReleaseAfter::Root(RootIndex(0)),
         }));
-        must(builder.push_root(Root { node: iota, origin }));
+        must(builder.push_root(Root {
+            node: iota,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(builder.finish())
     }
 
@@ -4333,6 +4536,7 @@ mod tests {
         must(builder.push_root(Root {
             node: apply,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4466,6 +4670,7 @@ mod tests {
         program.roots.push(Root {
             node: NodeIndex(5),
             origin: OriginIndex(0),
+            presentation: RootPresentation::CanonicalValue,
         });
         program.module.ranges.nodes.count = 6;
         program.module.ranges.edges.count = 7;
@@ -4560,6 +4765,7 @@ mod tests {
         must(builder.push_root(Root {
             node: fan_out,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4793,6 +4999,7 @@ mod tests {
         must(builder.push_root(Root {
             node: outer_fan_out,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -4885,6 +5092,7 @@ mod tests {
             must(builder.push_root(Root {
                 node: fan_out,
                 origin,
+                presentation: RootPresentation::CanonicalValue,
             }));
         }
         must(builder.finish())
@@ -5049,6 +5257,7 @@ mod tests {
         must(builder.push_root(Root {
             node: fan_out,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -6440,6 +6649,7 @@ mod tests {
         must(builder.push_root(Root {
             node: apply,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -6699,6 +6909,7 @@ mod tests {
         must(builder.push_root(Root {
             node: current_node,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -6762,6 +6973,7 @@ mod tests {
         must(builder.push_root(Root {
             node: current,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -6878,6 +7090,7 @@ mod tests {
         must(builder.push_root(Root {
             node: fan_out,
             origin,
+            presentation: RootPresentation::CanonicalValue,
         }));
         must(builder.finish())
     }
@@ -7043,6 +7256,7 @@ mod tests {
         cross_call.roots.push(Root {
             node: bindings[1],
             origin: cross_call.roots[0].origin,
+            presentation: RootPresentation::CanonicalValue,
         });
         cross_call.module.ranges.roots.count += 1;
         verify_error(cross_call, Invariant::AmbiguousOwnership);
@@ -7068,6 +7282,7 @@ mod tests {
         escaped.roots.push(Root {
             node: displaced,
             origin: escaped.roots[0].origin,
+            presentation: RootPresentation::CanonicalValue,
         });
         escaped.module.ranges.roots.count += 1;
         verify_error(escaped, Invariant::InconsistentResultMetadata);
@@ -7185,6 +7400,160 @@ mod tests {
     }
 
     #[test]
+    fn value_formatting_provenance_whole_access_and_raw_root_invariants_are_verified() {
+        let fixture = || {
+            crate::lowering::compile_source_with_name(
+                "format[\"{}\" 1]\n",
+                "format-verifier.faraweave",
+            )
+            .map(|program| program.raw)
+            .unwrap_or_else(|error| panic!("Format fixture: {error:?}"))
+        };
+        let format_index = |program: &RawProgram| {
+            program
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, NodeKind::Format { .. }))
+                .unwrap_or(usize::MAX)
+        };
+
+        let mut invalid_keyword_origin = fixture();
+        let format = format_index(&invalid_keyword_origin);
+        assert_ne!(format, usize::MAX);
+        let NodeKind::Format {
+            ref mut keyword_origin,
+            ..
+        } = invalid_keyword_origin.nodes[format].kind
+        else {
+            panic!("missing Format node");
+        };
+        *keyword_origin = OriginIndex(u32::MAX);
+        verify_error(invalid_keyword_origin, Invariant::IndexOutOfBounds);
+        let mut duplicate_keyword_origin = fixture();
+        let format = format_index(&duplicate_keyword_origin);
+        let NodeKind::Format {
+            template_origin,
+            ref mut keyword_origin,
+            ..
+        } = duplicate_keyword_origin.nodes[format].kind
+        else {
+            panic!("missing Format node");
+        };
+        *keyword_origin = template_origin;
+        verify_error(duplicate_keyword_origin, Invariant::InvalidRecord);
+
+        for access in [
+            ValueAccess::TupleElement(0),
+            ValueAccess::BindingBorrowElement(0),
+            ValueAccess::ConnectedBindingElement(0),
+        ] {
+            let mut invalid = fixture();
+            let format = format_index(&invalid);
+            let edge = invalid.nodes[format].edges.start as usize;
+            invalid.edges[edge].access = access;
+            let node = invalid.nodes[format];
+            let bounds = node.edges.start as usize
+                ..node.edges.checked_end().unwrap_or(node.edges.start) as usize;
+            assert!(matches!(
+                verify_node(
+                    &invalid,
+                    format as u32,
+                    node,
+                    &invalid.edges[bounds],
+                    VerifyAllocationFailureInjection::none(),
+                ),
+                Err(VerifyError::MalformedProgram(MalformedProgram {
+                    invariant: Invariant::InconsistentResultMetadata,
+                    field: "format_edge",
+                    ..
+                }))
+            ));
+            assert!(invalid.verify().is_err());
+        }
+
+        let binding = crate::lowering::compile_source_with_name(
+            "let value = [1 \"x\"]\nformat[\"{}\" value]\n",
+            "format-binding.faraweave",
+        )
+        .map(|program| program.raw)
+        .unwrap_or_else(|error| panic!("Format binding fixture: {error:?}"));
+        let format = format_index(&binding);
+        let edge = binding.nodes[format].edges.start as usize;
+        assert_eq!(binding.edges[edge].access, ValueAccess::BindingBorrowWhole);
+        assert!(binding.verify().is_ok());
+
+        let mut connected = connected_program("inc[_] 1\n");
+        let format = connected
+            .nodes
+            .iter()
+            .position(|node| matches!(node.kind, NodeKind::SelectedApply { .. }))
+            .unwrap_or(usize::MAX);
+        assert_ne!(format, usize::MAX);
+        let format_origin = connected.nodes[format].origin;
+        connected.source_units[0].byte_length = 32;
+        let expression_origin = connected.origins[format_origin.0 as usize];
+        let mut keyword_record = expression_origin;
+        keyword_record.span.end = OriginPosition {
+            offset: keyword_record.span.begin.offset + 6,
+            line: keyword_record.span.begin.line,
+            column: keyword_record.span.begin.column + 6,
+        };
+        let keyword_origin = OriginIndex(connected.origins.len() as u32);
+        connected.origins.push(keyword_record);
+        let mut template_record = keyword_record;
+        template_record.span.begin = OriginPosition {
+            offset: keyword_record.span.end.offset + 1,
+            line: keyword_record.span.end.line,
+            column: keyword_record.span.end.column + 1,
+        };
+        template_record.span.end = OriginPosition {
+            offset: template_record.span.begin.offset + 4,
+            line: template_record.span.begin.line,
+            column: template_record.span.begin.column + 4,
+        };
+        let template_origin = OriginIndex(connected.origins.len() as u32);
+        connected.origins.push(template_record);
+        connected.module.ranges.origins.count += 2;
+        let template = StringValueIndex(connected.string_values.len() as u32);
+        connected.string_values.push("{}".to_owned());
+        connected.module.ranges.string_values.count += 1;
+        let string_type = TypeIndex(connected.types.len() as u32);
+        connected.types.push(TypeRecord::Scalar(ScalarType::String));
+        connected.module.ranges.types.count += 1;
+        connected.nodes[format].kind = NodeKind::Format {
+            template,
+            template_origin,
+            keyword_origin,
+        };
+        connected.nodes[format].result_type = string_type;
+        connected.nodes[format].cardinality = Some(Cardinality::StaticScalar);
+        connected
+            .features
+            .retain(|feature| *feature == Feature::ConnectedApplicationBindings.numeric());
+        connected.features.extend([
+            Feature::Strings.numeric(),
+            Feature::ValueFormatting.numeric(),
+        ]);
+        connected.features.sort_unstable();
+        connected.module.ranges.features.count = connected.features.len() as u32;
+        connected.module.semantic_minor = 5;
+        assert_eq!(
+            connected.edges[connected.nodes[format].edges.start as usize].access,
+            ValueAccess::ConnectedBindingWhole
+        );
+        assert!(connected.verify().is_ok());
+
+        let mut raw_non_format = crate::lowering::compile_source_with_name(
+            "format[\"x\"]\n\"plain\"\n",
+            "format-root.faraweave",
+        )
+        .map(|program| program.raw)
+        .unwrap_or_else(|error| panic!("Format root fixture: {error:?}"));
+        raw_non_format.roots[1].presentation = RootPresentation::RawString;
+        verify_error(raw_non_format, Invariant::InconsistentResultMetadata);
+    }
+
+    #[test]
     fn immutable_binding_cycles_access_moves_and_missing_consumers_are_rejected() {
         let mut cycle = immutable_binding_program("let value = iota[3]\nsum[value]\n");
         let binding = cycle
@@ -7281,6 +7650,7 @@ mod tests {
         cross_binding.roots.push(Root {
             node: bindings[1],
             origin: cross_binding.roots[0].origin,
+            presentation: RootPresentation::CanonicalValue,
         });
         cross_binding.module.ranges.roots.count += 1;
         verify_error(cross_binding, Invariant::AmbiguousOwnership);

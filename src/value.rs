@@ -367,6 +367,115 @@ fn formatted_value_length(value: &Value) -> Result<usize, Error> {
     Ok(output.length)
 }
 
+pub(crate) fn format_template_placeholder_count(template: &str) -> Result<usize, Error> {
+    let bytes = template.as_bytes();
+    let mut index = 0usize;
+    let mut placeholders = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' if bytes.get(index + 1) == Some(&b'{') => index += 2,
+            b'}' if bytes.get(index + 1) == Some(&b'}') => index += 2,
+            b'{' if bytes.get(index + 1) == Some(&b'}') => {
+                placeholders = placeholders
+                    .checked_add(1)
+                    .ok_or_else(formatting_size_error)?;
+                index += 2;
+            }
+            b'{' | b'}' => {
+                return Err(Error::new(
+                    ErrorKind::FormattingError,
+                    SourceLocation::start(),
+                    "malformed format template brace",
+                ));
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(placeholders)
+}
+
+pub(crate) fn measure_interpolation(template: &str, arguments: &[&Value]) -> Result<usize, Error> {
+    let mut output = LengthWriter { length: 0 };
+    write_interpolation(template, arguments, &mut output)?;
+    Ok(output.length)
+}
+
+pub(crate) fn render_interpolation(
+    template: &str,
+    arguments: &[&Value],
+    output: &mut String,
+) -> Result<(), Error> {
+    write_interpolation(template, arguments, output)
+}
+
+fn write_interpolation(
+    template: &str,
+    arguments: &[&Value],
+    output: &mut impl Write,
+) -> Result<(), Error> {
+    let bytes = template.as_bytes();
+    let mut index = 0usize;
+    let mut literal_start = 0usize;
+    let mut argument = 0usize;
+    while index < bytes.len() {
+        let replacement = match (bytes[index], bytes.get(index + 1).copied()) {
+            (b'{', Some(b'{')) => Some('{'),
+            (b'}', Some(b'}')) => Some('}'),
+            (b'{', Some(b'}')) => {
+                output
+                    .write_str(&template[literal_start..index])
+                    .map_err(formatting_error)?;
+                let value = arguments.get(argument).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::FormattingError,
+                        SourceLocation::start(),
+                        "format placeholder count does not match interpolation arguments",
+                    )
+                })?;
+                match value {
+                    Value::String(value) => {
+                        output.write_str(value).map_err(formatting_error)?;
+                    }
+                    value => write_value(value, output)?,
+                }
+                argument = argument.checked_add(1).ok_or_else(formatting_size_error)?;
+                index += 2;
+                literal_start = index;
+                continue;
+            }
+            (b'{' | b'}', _) => {
+                return Err(Error::new(
+                    ErrorKind::FormattingError,
+                    SourceLocation::start(),
+                    "malformed format template brace",
+                ));
+            }
+            _ => None,
+        };
+        if let Some(character) = replacement {
+            output
+                .write_str(&template[literal_start..index])
+                .map_err(formatting_error)?;
+            output.write_char(character).map_err(formatting_error)?;
+            index += 2;
+            literal_start = index;
+        } else {
+            index += 1;
+        }
+    }
+    output
+        .write_str(&template[literal_start..])
+        .map_err(formatting_error)?;
+    if argument != arguments.len() {
+        return Err(Error::new(
+            ErrorKind::FormattingError,
+            SourceLocation::start(),
+            "format placeholder count does not match interpolation arguments",
+        ));
+    }
+    Ok(())
+}
+
 fn write_value(output_value: &Value, output: &mut impl Write) -> Result<(), Error> {
     let mut pending = Vec::new();
     reserve_format_tasks(&mut pending, 1)?;
@@ -653,5 +762,31 @@ mod tests {
             })
             .expect("spawn reduced-stack test");
         thread.join().expect("wide/deep tuple test");
+    }
+
+    #[test]
+    fn interpolation_measure_and_render_are_identical_for_deep_values_and_raw_strings() {
+        let raw = Value::String("Málaga\0🦀".to_owned());
+        let raw_arguments = [&raw];
+        let raw_length = measure_interpolation("{{{}}}", &raw_arguments).expect("measure raw");
+        let mut raw_output = String::new();
+        raw_output
+            .try_reserve_exact(raw_length)
+            .expect("reserve raw");
+        render_interpolation("{{{}}}", &raw_arguments, &mut raw_output).expect("render raw");
+        assert_eq!(raw_output.as_bytes(), b"{M\xc3\xa1laga\0\xf0\x9f\xa6\x80}");
+        assert_eq!(raw_output.len(), raw_length);
+
+        let mut deep = raw;
+        for _ in 0..10_000 {
+            deep = Value::Tuple(vec![deep].into());
+        }
+        let arguments = [&deep];
+        let required = measure_interpolation("{}", &arguments).expect("measure deep");
+        let mut output = String::new();
+        output.try_reserve_exact(required).expect("reserve deep");
+        render_interpolation("{}", &arguments, &mut output).expect("render deep");
+        assert_eq!(output.len(), required);
+        assert_eq!(output, format_value(&deep).expect("canonical deep"));
     }
 }

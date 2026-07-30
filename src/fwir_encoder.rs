@@ -1,6 +1,6 @@
 use crate::{
     Cardinality, ConstantRecord, Conversion, LiftMode, NodeKind, OwnershipMode, ReleaseAfter,
-    ScalarConstant, ScalarType, TypeRecord, ValueAccess, VerifiedProgram,
+    RootPresentation, ScalarConstant, ScalarType, TypeRecord, ValueAccess, VerifiedProgram,
 };
 use std::collections::TryReserveError;
 use std::io::{self, Write};
@@ -362,7 +362,31 @@ fn preflight(
         (13, 20, fixed_length(raw.branches.len(), 20, "branches")?),
         (14, 56, fixed_length(raw.nodes.len(), 56, "nodes")?),
         (15, 12, fixed_length(raw.ownership.len(), 12, "ownership")?),
-        (16, 8, fixed_length(raw.roots.len(), 8, "roots")?),
+        (
+            16,
+            if raw
+                .features
+                .binary_search(&crate::Feature::ValueFormatting.numeric())
+                .is_ok()
+            {
+                12
+            } else {
+                8
+            },
+            fixed_length(
+                raw.roots.len(),
+                if raw
+                    .features
+                    .binary_search(&crate::Feature::ValueFormatting.numeric())
+                    .is_ok()
+                {
+                    12
+                } else {
+                    8
+                },
+                "roots",
+            )?,
+        ),
         (
             17,
             8,
@@ -434,6 +458,12 @@ fn preflight(
         string_reference_count,
         total_size,
         format_minor: if raw
+            .features
+            .binary_search(&crate::Feature::ValueFormatting.numeric())
+            .is_ok()
+        {
+            5
+        } else if raw
             .features
             .binary_search(&crate::Feature::Strings.numeric())
             .is_ok()
@@ -838,6 +868,32 @@ fn encode_sections(
             ),
             NodeKind::BindingMove => (9, 0, 0, [0; 8]),
             NodeKind::BindingBorrow => (10, 0, 0, [0; 8]),
+            NodeKind::Format {
+                template,
+                template_origin,
+                keyword_origin,
+            } => {
+                let template = raw.string_values.get(template.0 as usize).ok_or(
+                    FwirEncodeError::CountOverflow {
+                        field: "node.template",
+                    },
+                )?;
+                (
+                    11,
+                    0,
+                    0,
+                    [
+                        string_index(strings, template)?,
+                        template_origin.0,
+                        keyword_origin.0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+            }
             NodeKind::FanOut {
                 branches,
                 keyword_origin,
@@ -888,6 +944,20 @@ fn encode_sections(
     for root in &raw.roots {
         put_u32(output, root.node.0);
         put_u32(output, root.origin.0);
+        if raw
+            .features
+            .binary_search(&crate::Feature::ValueFormatting.numeric())
+            .is_ok()
+        {
+            put_u8(
+                output,
+                match root.presentation {
+                    RootPresentation::CanonicalValue => 1,
+                    RootPresentation::RawString => 2,
+                },
+            );
+            output.extend_from_slice(&[0; 3]);
+        }
     }
     if raw
         .features
@@ -1006,7 +1076,11 @@ mod tests {
             owner: node,
             release_after: ReleaseAfter::Root(crate::RootIndex(0)),
         }));
-        must(builder.push_root(Root { node, origin }));
+        must(builder.push_root(Root {
+            node,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(must(builder.finish()).verify())
     }
 
@@ -1052,7 +1126,11 @@ mod tests {
             owner: node,
             release_after: ReleaseAfter::Root(crate::RootIndex(0)),
         }));
-        must(builder.push_root(Root { node, origin }));
+        must(builder.push_root(Root {
+            node,
+            origin,
+            presentation: RootPresentation::CanonicalValue,
+        }));
         must(must(builder.finish()).verify())
     }
 

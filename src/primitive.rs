@@ -73,6 +73,11 @@ fn validate_names(expression: &Expr) -> Result<(), Error> {
                 validate_names(element)?;
             }
         }
+        ExprKind::Format { arguments, .. } => {
+            for argument in arguments {
+                validate_names(argument)?;
+            }
+        }
         ExprKind::DeepTuple { .. } => {}
         ExprKind::UnaryChain { steps, .. } => {
             for step in steps {

@@ -154,3 +154,7 @@ canonical.byte_identity	canonical-complete	corpus-hash
 canonical.host_neutral	canonical-complete	corpus-host-neutral
 surfaces.source_memory_decoded	canonical-complete	differential-runtime
 surfaces.resources_faults_cleanup	canonical-complete	differential-resource-faults
+formatting.feature_version	value-formatting	value-formatting-feature-version
+formatting.node_template	value-formatting	value-formatting-node-template
+formatting.root_presentation	value-formatting	value-formatting-root-presentation
+formatting.roundtrip	value-formatting	value-formatting-roundtrip
