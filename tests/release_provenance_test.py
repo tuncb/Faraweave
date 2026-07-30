@@ -44,7 +44,7 @@ def main() -> None:
         fragments.mkdir()
         executable_name = "faraweave.exe" if target == "windows-x64" else "faraweave"
         extension = "zip" if target == "windows-x64" else "tar.gz"
-        archive = assets / f"faraweave-v0.1.0-{target}.{extension}"
+        archive = assets / f"faraweave-v0.2.0-{target}.{extension}"
         if target == "windows-x64":
             with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
                 output.write(executable, executable_name)
@@ -67,7 +67,7 @@ def main() -> None:
         ]
         invoke(base)
         document = json.loads(fragment.read_text())
-        require(document["version"] == "0.1.0", "Cargo version was not canonical")
+        require(document["version"] == "0.2.0", "Cargo version was not canonical")
         require(document["source_commit"] == COMMIT, "commit mismatch")
 
         crlf_directory = root / "crlf"
@@ -83,7 +83,7 @@ def main() -> None:
         crlf_command[crlf_command.index(str(fragment))] = str(crlf_fragment)
         invoke(crlf_command)
         require(
-            json.loads(crlf_fragment.read_text())["version"] == "0.1.0",
+            json.loads(crlf_fragment.read_text())["version"] == "0.2.0",
             "CRLF Cargo version was not canonical",
         )
 

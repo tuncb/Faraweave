@@ -1,8 +1,8 @@
-name: Faraweave initial v0.1.0 release
+name: Faraweave v0.2.0 release
 
 on:
   push:
-    tags: [v0.1.0]
+    tags: [v0.2.0]
   workflow_dispatch:
 
 permissions:
@@ -15,11 +15,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with: {fetch-depth: 0, persist-credentials: false}
       - run: |
-          test "${GITHUB_REF_NAME}" = v0.1.0
-          test "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = 0.1.0
-          test "$(git cat-file -t refs/tags/v0.1.0)" = tag
-          test "$(git rev-parse refs/tags/v0.1.0^{commit})" = "$GITHUB_SHA"
-          ! gh release view v0.1.0
+          test "${GITHUB_REF_NAME}" = v0.2.0
+          test "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = 0.2.0
+          test "$(git cat-file -t refs/tags/v0.2.0)" = tag
+          test "$(git rev-parse refs/tags/v0.2.0^{commit})" = "$GITHUB_SHA"
+          ! gh release view v0.2.0
         env: {GH_TOKEN: "${{ github.token }}"}
   publish:
     needs: gate

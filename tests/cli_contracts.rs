@@ -29,7 +29,7 @@ fn cli_help_version_and_unknown_contracts() {
         .output()
         .expect("version");
     assert!(version.status.success());
-    assert_eq!(version.stdout, b"faraweave 0.1.0\n");
+    assert_eq!(version.stdout, b"faraweave 0.2.0\n");
     assert!(version.stderr.is_empty());
 
     let help = Command::new(binary()).arg("--help").output().expect("help");
