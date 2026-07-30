@@ -183,6 +183,7 @@ def validate_release_workflows() -> None:
         "publish.sh",
     ]:
         require(needle in future, f"future release missing {needle}")
+    validate_future_release_fragment_lifecycle(future)
     for needle in [
         'notes="doc/releases/${tag}.md"',
         'test -f "${notes}"',
@@ -191,6 +192,43 @@ def validate_release_workflows() -> None:
         require(needle in publish, f"release publisher missing {needle}")
     notes = ROOT / f"doc/releases/v{VERSION}.md"
     require(notes.is_file(), f"release notes missing: {notes.relative_to(ROOT)}")
+
+
+def validate_future_release_fragment_lifecycle(future: str) -> None:
+    target_template = "artifacts/${{ matrix.target }}.fragment.json"
+    producer_outputs = re.findall(r'--output "(artifacts/\$\{\{ matrix\.target \}\}[^"]+)"', future)
+    require(
+        producer_outputs == [target_template],
+        f"future release fragment producer must write {target_template}",
+    )
+
+    targets = ["linux-x64", "windows-x64", "macos-arm64"]
+    expected = [
+        target_template.replace("${{ matrix.target }}", target)
+        for target in targets
+    ]
+    merge_inputs = re.findall(
+        r"--fragment (artifacts/[a-z0-9.-]+\.json)", future
+    )
+    require(
+        merge_inputs == expected,
+        "future release fragment merge inputs do not match producer outputs",
+    )
+
+    cleanup_lines = re.findall(
+        r"^[ \t]*rm ((?:artifacts/[a-z0-9.-]+\.json(?:[ \t]+|$))+)$",
+        future,
+        re.MULTILINE,
+    )
+    require(
+        len(cleanup_lines) == 1,
+        "future release must have exactly one fragment cleanup command",
+    )
+    cleanup_inputs = cleanup_lines[0].split()
+    require(
+        cleanup_inputs == expected,
+        "future release fragment cleanup inputs do not match producer outputs",
+    )
 
 
 def fnv1a64(data: bytes) -> int:
